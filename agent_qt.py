@@ -3317,6 +3317,7 @@ class ChatBubble(QFrame):
         super().__init__(parent)
         self.role = role
         self.content = content
+        self.display_content = content
         self.show_copy = show_copy
         self.copy_text = copy_text
         self.show_paste_ai = show_paste_ai
@@ -3521,7 +3522,10 @@ class ChatBubble(QFrame):
         layout.addWidget(self.content_label)
 
     def clear_markdown_widgets(self):
+        layout = self.layout()
         for widget in self.markdown_widgets:
+            if layout is not None:
+                layout.removeWidget(widget)
             widget.setParent(None)
             widget.deleteLater()
         self.markdown_widgets = []
@@ -3673,7 +3677,7 @@ class ChatBubble(QFrame):
             return
         code_scroll_states = self.capture_markdown_code_scroll_state()
         self.clear_markdown_widgets()
-        for part in split_markdown_fenced_blocks(self.content):
+        for part in split_markdown_fenced_blocks(self.visible_content()):
             if part["type"] == "code":
                 self.add_markdown_code_widget(part.get("lang", ""), part.get("text", ""), layout)
             else:
@@ -3682,8 +3686,11 @@ class ChatBubble(QFrame):
         self.restore_markdown_code_scroll_state(code_scroll_states)
         QTimer.singleShot(0, lambda states=code_scroll_states: self.restore_markdown_code_scroll_state(states))
 
-    def update_content(self, text: str):
-        self.content = text
+    def visible_content(self) -> str:
+        return str(getattr(self, "display_content", self.content) or "")
+
+    def update_display_content(self, text: str):
+        self.display_content = text
         if self.compact_user:
             self.content_label.setText(text)
         elif self.markdown and self.expand_to_content:
@@ -3694,6 +3701,10 @@ class ChatBubble(QFrame):
             self.content_label.setPlainText(text)
         self.adjust_content_height()
         self.schedule_content_height_adjustment()
+
+    def update_content(self, text: str):
+        self.content = text
+        self.update_display_content(text)
 
     def copy_content(self):
         if self.role == "user" and hasattr(self, "prompt_input"):
@@ -3753,11 +3764,11 @@ class ChatBubble(QFrame):
         if self.compact_user:
             available_width = max(120, self.content_label.width() - 8)
             metrics = self.content_label.fontMetrics()
-            target_height = max(26, estimate_wrapped_text_height(self.content or " ", metrics, available_width))
+            target_height = max(26, estimate_wrapped_text_height(self.visible_content() or " ", metrics, available_width))
             if self.content_label.height() != target_height:
                 self.content_label.setFixedHeight(target_height)
             return
-        text = self.content or self.content_label.toPlainText() or " "
+        text = self.visible_content() or self.content_label.toPlainText() or " "
         available_width = max(120, self.content_label.viewport().width() - 10)
         metrics = self.content_label.fontMetrics()
         line_spacing = max(1, metrics.lineSpacing())
@@ -5482,7 +5493,7 @@ class ChatPage(QWidget):
             widget = self.chat_layout.itemAt(idx).widget()
             if isinstance(widget, ChatBubble) and getattr(widget, "role", "") == "user":
                 widget.max_content_height = 90 if self.automation_enabled else 180
-                widget.update_content(self.prompt_bubble_display_text(widget.content))
+                widget.update_display_content(self.prompt_bubble_display_text(widget.content))
                 paste_btn = getattr(widget, "paste_ai_btn", None)
                 if paste_btn is not None:
                     paste_btn.setVisible(not self.automation_enabled)
@@ -5729,6 +5740,8 @@ class ChatPage(QWidget):
         user_text = self.prompt_text_from_system_prompt(full_prompt).strip()
         if user_text:
             return user_text
+        if PROMPT_BUBBLE_MARKER not in full_prompt:
+            return str(full_prompt or "").strip()
         return ""
 
     def compact_automation_entry_text(self, text: str, limit: int = AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT) -> str:
@@ -5800,8 +5813,8 @@ class ChatPage(QWidget):
                 prompt_input.setFocus()
             return
         full_prompt = self.build_system_prompt(user_text)
-        bubble.update_content(self.prompt_bubble_display_text(full_prompt))
         bubble.content = full_prompt
+        bubble.update_display_content(self.prompt_bubble_display_text(full_prompt))
         if self.automation_enabled:
             self.update_prompt_history_entry(getattr(bubble, "history_entry_id", ""), full_prompt)
             self.send_prompt_bubble_to_provider(bubble, full_prompt)
