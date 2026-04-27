@@ -16,7 +16,13 @@ import html
 import json
 import base64
 import shutil
+import shlex
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
+import venv
+import time
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -24,11 +30,11 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QLabel, QScrollArea, QFrame,
     QFileDialog, QMessageBox, QLineEdit, QTreeWidget, QTreeWidgetItem,
-    QMenu, QToolButton, QStyle, QPlainTextEdit, QStackedWidget,
+    QMenu, QToolButton, QStyle, QPlainTextEdit, QTextBrowser, QStackedWidget,
     QGridLayout, QSizePolicy, QGraphicsOpacityEffect, QAbstractItemView,
-    QSpacerItem
+    QSpacerItem, QWidgetAction, QAbstractButton
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, Property
 from PySide6.QtGui import QFont, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QKeySequence
 from PySide6.QtCore import QUrl
 
@@ -38,6 +44,338 @@ except ImportError:
     QSvgRenderer = None
 
 PROMPT_BUBBLE_MARKER = "<!-- agent_qt_user_prompt:"
+AUTOMATION_DONE_MARKER = "AGENT_QT_DONE"
+COMPLETION_LINE_RE = re.compile(r"^\s*(?:FINAL\s*:|AGENT_QT_DONE\b)", re.I)
+AGENT_HOME_DIR = os.path.expanduser(os.environ.get("AGENT_QT_HOME", "~/.agent_qt"))
+_AGENT_RUNTIME_PYTHON: Optional[str] = None
+_AGENT_RUNTIME_ERROR = ""
+_APP_SETTINGS: Optional[Dict[str, object]] = None
+_AGENT_RUNTIME_ENABLED: Optional[bool] = None
+PYTHON_RUNTIME_PACKAGES = (
+    "pypdf",
+    "python-docx",
+    "openpyxl",
+    "pillow",
+    "pandas",
+)
+DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+
+def app_settings_path() -> str:
+    return os.path.join(AGENT_HOME_DIR, "settings.json")
+
+
+def load_app_settings() -> Dict[str, object]:
+    global _APP_SETTINGS
+    if _APP_SETTINGS is not None:
+        return _APP_SETTINGS
+    path = app_settings_path()
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            _APP_SETTINGS = payload if isinstance(payload, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            _APP_SETTINGS = {}
+    else:
+        _APP_SETTINGS = {}
+    return _APP_SETTINGS
+
+
+def save_app_settings(settings: Dict[str, object]) -> bool:
+    global _APP_SETTINGS
+    _APP_SETTINGS = dict(settings)
+    try:
+        os.makedirs(AGENT_HOME_DIR, exist_ok=True)
+        path = app_settings_path()
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(_APP_SETTINGS, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+        return True
+    except OSError:
+        return False
+
+
+def agent_runtime_enabled() -> bool:
+    global _AGENT_RUNTIME_ENABLED
+    if _AGENT_RUNTIME_ENABLED is not None:
+        return _AGENT_RUNTIME_ENABLED
+    env_value = os.environ.get("AGENT_QT_USE_RUNTIME", "").strip().lower()
+    if env_value:
+        _AGENT_RUNTIME_ENABLED = env_value not in {"0", "false", "no", "off"}
+        return _AGENT_RUNTIME_ENABLED
+    settings = load_app_settings()
+    _AGENT_RUNTIME_ENABLED = bool(settings.get("agent_runtime_enabled", True))
+    return _AGENT_RUNTIME_ENABLED
+
+
+def set_agent_runtime_enabled(enabled: bool):
+    global _AGENT_RUNTIME_ENABLED
+    _AGENT_RUNTIME_ENABLED = bool(enabled)
+    settings = load_app_settings()
+    settings["agent_runtime_enabled"] = _AGENT_RUNTIME_ENABLED
+    save_app_settings(settings)
+
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def runtime_cache_root() -> str:
+    return os.path.abspath(os.path.expanduser(os.environ.get("AGENT_QT_RUNTIME_DIR", os.path.join(AGENT_HOME_DIR, "runtime"))))
+
+
+def runtime_venv_root() -> str:
+    return os.path.join(runtime_cache_root(), "python")
+
+
+def runtime_shim_dir() -> str:
+    return os.path.join(runtime_cache_root(), "shims")
+
+
+def runtime_bin_dir(root: str) -> str:
+    return os.path.join(root, "Scripts" if platform.system() == "Windows" else "bin")
+
+
+def runtime_python_in_root(root: str) -> str:
+    name = "python.exe" if platform.system() == "Windows" else "python"
+    return os.path.join(runtime_bin_dir(root), name)
+
+
+def bundled_runtime_roots() -> List[str]:
+    roots = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        roots.extend([
+            os.path.join(exe_dir, "runtime", "python"),
+            os.path.join(exe_dir, "_internal", "runtime", "python"),
+            os.path.abspath(os.path.join(exe_dir, "..", "Resources", "runtime", "python")),
+        ])
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            roots.append(os.path.join(meipass, "runtime", "python"))
+    else:
+        source_dir = os.path.dirname(os.path.abspath(__file__))
+        roots.append(os.path.join(source_dir, "runtime", "python"))
+    return roots
+
+
+def find_existing_runtime_python() -> str:
+    explicit = os.path.expanduser(os.environ.get("AGENT_QT_PYTHON", ""))
+    candidates = [explicit] if explicit else []
+    candidates.append(runtime_python_in_root(runtime_venv_root()))
+    for root in bundled_runtime_roots():
+        candidates.append(runtime_python_in_root(root))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return ""
+
+
+def write_text_executable(path: str, content: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    try:
+        os.chmod(path, 0o755)
+    except OSError:
+        pass
+
+
+def ensure_runtime_shims(python_bin: str):
+    shim_dir = runtime_shim_dir()
+    os.makedirs(shim_dir, exist_ok=True)
+    if platform.system() == "Windows":
+        quoted = f'"{python_bin}"'
+        scripts = {
+            "python.cmd": f"@echo off\r\n{quoted} %*\r\n",
+            "python3.cmd": f"@echo off\r\n{quoted} %*\r\n",
+            "pip.cmd": f"@echo off\r\n{quoted} -m pip %*\r\n",
+            "pip3.cmd": f"@echo off\r\n{quoted} -m pip %*\r\n",
+        }
+        for name, content in scripts.items():
+            with open(os.path.join(shim_dir, name), "w", encoding="utf-8", newline="\r\n") as f:
+                f.write(content)
+        return
+    quoted = shlex.quote(python_bin)
+    scripts = {
+        "python": f"#!/bin/sh\nexec {quoted} \"$@\"\n",
+        "python3": f"#!/bin/sh\nexec {quoted} \"$@\"\n",
+        "pip": f"#!/bin/sh\nexec {quoted} -m pip \"$@\"\n",
+        "pip3": f"#!/bin/sh\nexec {quoted} -m pip \"$@\"\n",
+    }
+    for name, content in scripts.items():
+        write_text_executable(os.path.join(shim_dir, name), content)
+
+
+def ensure_agent_runtime(create: bool = True) -> str:
+    global _AGENT_RUNTIME_PYTHON, _AGENT_RUNTIME_ERROR
+    if not agent_runtime_enabled():
+        return ""
+    if _AGENT_RUNTIME_PYTHON and os.path.isfile(_AGENT_RUNTIME_PYTHON):
+        return _AGENT_RUNTIME_PYTHON
+    existing = find_existing_runtime_python()
+    if existing:
+        _AGENT_RUNTIME_PYTHON = existing
+        _AGENT_RUNTIME_ERROR = ""
+        ensure_runtime_shims(existing)
+        return existing
+    if not create:
+        return ""
+    root = runtime_venv_root()
+    try:
+        os.makedirs(runtime_cache_root(), exist_ok=True)
+        venv.EnvBuilder(with_pip=True, clear=False).create(root)
+        python_bin = runtime_python_in_root(root)
+        if not os.path.isfile(python_bin):
+            raise FileNotFoundError(python_bin)
+        _AGENT_RUNTIME_PYTHON = python_bin
+        _AGENT_RUNTIME_ERROR = ""
+        ensure_runtime_shims(python_bin)
+        return python_bin
+    except Exception as exc:
+        _AGENT_RUNTIME_ERROR = str(exc)
+        return ""
+
+
+def agent_runtime_env(create: bool = True) -> Dict[str, str]:
+    env = os.environ.copy()
+    python_bin = ensure_agent_runtime(create=create)
+    path_parts = []
+    if python_bin:
+        env["AGENT_QT_RUNTIME_PYTHON"] = python_bin
+        env["VIRTUAL_ENV"] = os.path.dirname(os.path.dirname(python_bin))
+        path_parts.extend([runtime_shim_dir(), os.path.dirname(python_bin)])
+    if env.get("PATH"):
+        path_parts.append(env["PATH"])
+    env["PATH"] = os.pathsep.join(part for part in path_parts if part)
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    return env
+
+
+def agent_qprocess_environment(create: bool = True) -> QProcessEnvironment:
+    env_dict = agent_runtime_env(create=create)
+    qenv = QProcessEnvironment()
+    for key, value in env_dict.items():
+        qenv.insert(str(key), str(value))
+    return qenv
+
+
+def agent_runtime_description() -> str:
+    if not agent_runtime_enabled():
+        return "系统 Python/PATH（Agent 缓存 Python 已关闭）"
+    python_bin = ensure_agent_runtime(create=False)
+    if python_bin:
+        return f"Agent 缓存 Python ({python_bin})；python/python3/pip/pip3 会优先指向该环境"
+    return f"系统 Python/PATH（未安装 Agent 缓存 Python；可在设置里安装到 {runtime_venv_root()}）"
+
+
+def pip_index_args() -> List[str]:
+    index_url = os.environ.get("AGENT_QT_PIP_INDEX_URL", DEFAULT_PIP_INDEX_URL).strip()
+    if not index_url:
+        return []
+    args = ["-i", index_url]
+    parsed_host = urllib.parse.urlparse(index_url).hostname
+    if parsed_host:
+        args.extend(["--trusted-host", parsed_host])
+    return args
+
+
+def run_runtime_command(command: List[str], cwd: str, timeout: int = 900) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=agent_runtime_env(create=False),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return False, str(exc)
+    output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+    return result.returncode == 0, output
+
+
+def installed_runtime_modules_status() -> Dict[str, object]:
+    if not agent_runtime_enabled():
+        return {
+            "ready": False,
+            "python": "",
+            "missing": [],
+            "message": "Agent Python 运行环境已关闭，当前 bash 默认使用系统 PATH。",
+        }
+    python_bin = ensure_agent_runtime(create=False)
+    if not python_bin:
+        return {
+            "ready": False,
+            "python": "",
+            "missing": list(PYTHON_RUNTIME_PACKAGES),
+            "message": "未安装 Agent Python 运行环境，当前 bash 默认使用系统 PATH。",
+        }
+    module_names = ["pypdf", "docx", "openpyxl", "PIL", "pandas"]
+    code = (
+        "import importlib.util, json\n"
+        f"mods = {module_names!r}\n"
+        "missing = [m for m in mods if importlib.util.find_spec(m) is None]\n"
+        "print(json.dumps({'missing': missing}, ensure_ascii=False))\n"
+        "raise SystemExit(1 if missing else 0)\n"
+    )
+    ok, output = run_runtime_command([python_bin, "-c", code], runtime_cache_root(), timeout=60)
+    missing = []
+    try:
+        payload = json.loads((output or "{}").splitlines()[-1])
+        if isinstance(payload.get("missing"), list):
+            missing = payload["missing"]
+    except Exception:
+        missing = module_names
+    return {
+        "ready": ok,
+        "python": python_bin,
+        "missing": missing,
+        "message": "文档处理库可用。" if ok else (output or "文档处理库缺失。"),
+    }
+
+
+def agent_runtime_status_text() -> str:
+    status = installed_runtime_modules_status()
+    lines = [
+        f"运行策略: {'优先使用 Agent 缓存 Python' if status.get('python') else '使用系统 PATH'}",
+        f"缓存目录: {runtime_cache_root()}",
+        f"Python: {status.get('python') or '未安装'}",
+        f"pip 源: {os.environ.get('AGENT_QT_PIP_INDEX_URL', DEFAULT_PIP_INDEX_URL)}",
+    ]
+    if status.get("missing"):
+        lines.append("缺失模块: " + ", ".join(str(x) for x in status["missing"]))
+    if status.get("message"):
+        lines.append(str(status["message"])[-800:])
+    return "\n".join(lines)
+
+
+def install_agent_python_runtime(status_callback=None) -> str:
+    os.makedirs(runtime_cache_root(), exist_ok=True)
+    set_agent_runtime_enabled(True)
+    python_bin = ensure_agent_runtime(create=True)
+    if not python_bin:
+        raise RuntimeError(_AGENT_RUNTIME_ERROR or "无法创建 Agent Python 运行环境。")
+    commands = [
+        [python_bin, "-m", "pip", "install", "--upgrade", "pip", *pip_index_args()],
+        [python_bin, "-m", "pip", "install", *pip_index_args(), *PYTHON_RUNTIME_PACKAGES],
+    ]
+    for command in commands:
+        if status_callback:
+            status_callback("运行: " + " ".join(command[1:]))
+        ok, output = run_runtime_command(command, runtime_cache_root(), timeout=1200)
+        if not ok:
+            raise RuntimeError((output or f"命令失败: {' '.join(command)}")[-3000:])
+    ensure_runtime_shims(python_bin)
+    return python_bin
 
 # ============================================================
 # 系统提示词
@@ -54,6 +392,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 平台标识: {platform_id}
 - 默认 Shell: {shell_name}
 - 路径风格: {path_style}
+- Python 运行时: {python_runtime}
 - **重要：所有 Bash/命令行指令必须匹配当前操作系统，不要输出其他系统的命令。**
 
 ## 推理要求
@@ -61,17 +400,19 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 输出时不要展开隐藏思考链；只给出关键判断、可验证依据、最终方案和必要的执行指令。
 
 ## 输出规则
-1. **所有 Bash 指令放在一个 ```bash 代码块中**，不要拆分多个 Bash 块。
+1. **所有 Bash 指令放在一个 Markdown fenced bash 代码块中**，不要拆分多个 Bash 块。
+   - 不要输出 JSON 对象，不要输出 content/tool_calls 包装，不要使用结构化工具调用协议。
+   - 不要把 `bash` 作为普通正文单独输出；语言标识只能写在 Markdown 代码围栏里。
 2. 大段文件内容用占位符替代，支持的占位符：
-   - <!-- HTML block --> 对应 ```html
-   - <!-- CSS block --> 对应 ```css
-   - <!-- JS block --> 对应 ```js 或 ```javascript
-   - <!-- Python block --> 或 # Python block 对应 ```python
-   - <!-- SVG block --> 对应 ```svg
-   - <!-- JSON block --> 对应 ```json
-   - <!-- YAML block --> 对应 ```yaml
-   - <!-- TypeScript block --> 对应 ```typescript 或 ```ts
-   - <!-- 其他任意类型 block --> 对应 ```类型名（如 ```svg ```xml ```toml 等）
+   - <!-- HTML block --> 对应 html 代码块
+   - <!-- CSS block --> 或 /* CSS block */ 对应 css 代码块
+   - <!-- JS block --> 或 // JS block 对应 js/javascript 代码块
+   - <!-- Python block --> 或 # Python block 对应 python 代码块
+   - <!-- SVG block --> 对应 svg 代码块
+   - <!-- JSON block --> 对应 json 代码块
+   - <!-- YAML block --> 对应 yaml 代码块
+   - <!-- TypeScript block --> 对应 typescript/ts 代码块
+   - <!-- 其他任意类型 block --> 对应该类型名的代码块（如 svg/xml/toml 等）
 3. 各代码块在 Bash 块之后单独给出。
 4. 指令按顺序排列，先创建目录再写文件，确保可直接执行。
 5. 项目根目录: {project_root}，所有路径使用绝对路径。
@@ -79,6 +420,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 7. **重要：二选一的操作只保留一种**（如启动服务器 OR 手动打开，选前者）。
 8. 安装依赖用 pip install，启动后端用 python server.py 或 python3 -m http.server。
 9. 常驻进程命令（python server.py 等）会自动进入后台终端，不要加 & 或 nohup。
+10. 自动化循环中，如果根据执行日志判断任务已经完成，不要再输出 Bash，回复 `{done_marker}` 加简短总结即可；如果未完成，继续输出下一轮完整 Bash 指令。
 
 ---
 
@@ -91,6 +433,7 @@ HISTORY_DIR_NAME = ".agent_qt"
 HISTORY_FILE_NAME = "history.json"
 THREADS_DIR_NAME = "threads"
 THREADS_INDEX_FILE_NAME = "threads.json"
+WORKSPACE_STATE_FILE_NAME = "workspace.json"
 DEFAULT_THREAD_ID = "default"
 HISTORY_VERSION = 1
 
@@ -234,6 +577,189 @@ def show_chinese_edit_menu(widget, global_pos):
         menu.addAction(action)
     menu.exec(global_pos)
 
+def estimate_wrapped_text_height(text: str, metrics, available_width: int, max_visual_lines: Optional[int] = None) -> int:
+    visual_lines = 0
+    avg_char_width = max(1, metrics.averageCharWidth())
+    for line in (text or " ").splitlines() or [""]:
+        expanded = line.replace("\t", "    ")
+        if len(expanded) > 320:
+            line_width = avg_char_width * len(expanded)
+        else:
+            line_width = metrics.horizontalAdvance(expanded)
+        visual_lines += max(1, (line_width + available_width - 1) // available_width)
+        if max_visual_lines is not None and visual_lines >= max_visual_lines:
+            visual_lines = max_visual_lines
+            break
+    return visual_lines * max(1, metrics.lineSpacing()) + 36
+
+# ============================================================
+# 设置面板控件
+# ============================================================
+class ToggleSwitch(QAbstractButton):
+    def __init__(self, checked: bool = False, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setChecked(checked)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(50, 30)
+        self._offset = 1.0 if checked else 0.0
+        self._animation = QPropertyAnimation(self, b"offset", self)
+        self._animation.setDuration(150)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.toggled.connect(self._animate_to_state)
+
+    def sizeHint(self) -> QSize:
+        return QSize(50, 30)
+
+    def get_offset(self) -> float:
+        return self._offset
+
+    def set_offset(self, value: float):
+        self._offset = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    offset = Property(float, get_offset, set_offset)
+
+    def _animate_to_state(self, checked: bool):
+        self._animation.stop()
+        self._animation.setStartValue(self._offset)
+        self._animation.setEndValue(1.0 if checked else 0.0)
+        self._animation.start()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(1, 1, self.width() - 2, self.height() - 2)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#2f9bff" if self.isChecked() else "#d8deea"))
+        painter.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+        knob_size = 24
+        knob_x = 3 + self._offset * (self.width() - knob_size - 6)
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(QRectF(knob_x, 3, knob_size, knob_size))
+
+
+class SettingsToggleRow(QWidget):
+    toggled = Signal(bool)
+
+    def __init__(self, title: str, subtitle: str, checked: bool = False, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumWidth(292)
+        self.setStyleSheet(f"""
+            QWidget {{
+                background: {COLORS['surface']};
+                border-radius: 12px;
+            }}
+            QWidget:hover {{
+                background: #f8fbff;
+            }}
+            QLabel {{
+                background: transparent;
+                border: none;
+            }}
+        """)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 9, 10, 9)
+        layout.setSpacing(12)
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(2)
+        title_label = QLabel(title)
+        title_label.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900;")
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; font-weight: 700;")
+        text_layout.addWidget(title_label)
+        text_layout.addWidget(subtitle_label)
+        layout.addLayout(text_layout, 1)
+        self.switch = ToggleSwitch(checked)
+        self.switch.toggled.connect(self.toggled.emit)
+        layout.addWidget(self.switch, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.switch.toggle()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def setChecked(self, checked: bool):
+        previous = self.switch.blockSignals(True)
+        self.switch.setChecked(checked)
+        self.switch.set_offset(1.0 if checked else 0.0)
+        self.switch.blockSignals(previous)
+
+    def isChecked(self) -> bool:
+        return self.switch.isChecked()
+
+def split_markdown_fenced_blocks(text: str) -> List[Dict[str, str]]:
+    parts: List[Dict[str, str]] = []
+    lines = (text or "").splitlines(keepends=True)
+    buffer: List[str] = []
+    code_buffer: List[str] = []
+    in_code = False
+    code_lang = ""
+    fence_char = ""
+    fence_len = 0
+
+    def flush_markdown():
+        nonlocal buffer
+        if buffer:
+            parts.append({"type": "markdown", "text": "".join(buffer)})
+            buffer = []
+
+    def flush_code():
+        nonlocal code_buffer, code_lang, fence_char, fence_len
+        parts.append({
+            "type": "code",
+            "lang": code_lang.strip(),
+            "text": "".join(code_buffer).rstrip("\n"),
+        })
+        code_buffer = []
+        code_lang = ""
+        fence_char = ""
+        fence_len = 0
+
+    def opening_fence(line: str) -> Optional[re.Match]:
+        return re.match(r"^\s{0,3}([`~]{3,})([^\r\n]*)\s*$", line.rstrip("\n\r"))
+
+    def is_closing_fence(line: str) -> bool:
+        if not fence_char or fence_len <= 0:
+            return False
+        pattern = rf"^\s{{0,3}}{re.escape(fence_char)}{{{fence_len},}}\s*$"
+        return re.match(pattern, line.rstrip("\n\r")) is not None
+
+    for line in lines:
+        if in_code:
+            if is_closing_fence(line):
+                flush_code()
+                in_code = False
+                continue
+            if COMPLETION_LINE_RE.match(line):
+                flush_code()
+                in_code = False
+                buffer.append(line)
+                continue
+            code_buffer.append(line)
+            continue
+
+        match = opening_fence(line)
+        if match:
+            flush_markdown()
+            in_code = True
+            fence = match.group(1)
+            fence_char = fence[0]
+            fence_len = len(fence)
+            code_lang = (match.group(2) or "").strip().split(maxsplit=1)[0] if (match.group(2) or "").strip() else ""
+            continue
+        buffer.append(line)
+
+    if in_code:
+        flush_code()
+    else:
+        flush_markdown()
+    return [part for part in parts if part.get("text", "").strip()]
+
 def styled_confirm(parent, title: str, text: str, confirm_text: str = "确定", destructive: bool = False) -> bool:
     dialog = QMessageBox(parent)
     dialog.setWindowTitle(title)
@@ -297,6 +823,14 @@ def line_icon(kind: str, color: str = "#172033", size: int = 18) -> QIcon:
     elif kind == "plus":
         painter.drawLine(int(size / 2), 4, int(size / 2), size - 4)
         painter.drawLine(4, int(size / 2), size - 4, int(size / 2))
+    elif kind == "send":
+        cx = size / 2
+        painter.drawLine(int(cx), size - 4, int(cx), 4)
+        painter.drawLine(4, int(cx), int(cx), 4)
+        painter.drawLine(size - 4, int(cx), int(cx), 4)
+    elif kind == "pause":
+        painter.drawLine(int(size * 0.38), 4, int(size * 0.38), size - 4)
+        painter.drawLine(int(size * 0.62), 4, int(size * 0.62), size - 4)
     painter.end()
     return QIcon(pixmap)
 
@@ -339,6 +873,7 @@ def runtime_environment() -> Dict[str, str]:
         "platform_id": sys.platform,
         "shell_name": os.environ.get("SHELL") or os.environ.get("COMSPEC") or "unknown",
         "path_style": path_style,
+        "python_runtime": agent_runtime_description(),
     }
 
 LANG_ALIASES = {
@@ -368,12 +903,57 @@ def canonical_lang(lang: str) -> str:
 
 def scan_all_code_blocks(text: str) -> Dict[str, List[str]]:
     """扫描所有 Markdown 代码块，返回 {lang: [code1, code2, ...]}"""
-    pattern = r'```(\S*)\n(.*?)```'
-    matches = re.findall(pattern, text, re.DOTALL)
-    blocks = {}
-    for lang, code in matches:
-        lang = canonical_lang(lang)
-        blocks.setdefault(lang, []).append(code.strip())
+    blocks: Dict[str, List[str]] = {}
+    lines = (text or "").splitlines(keepends=True)
+    in_code = False
+    fence_char = ""
+    fence_len = 0
+    lang = ""
+    code_lines: List[str] = []
+
+    def opening_fence(line: str) -> Optional[re.Match]:
+        return re.match(r"^\s{0,3}([`~]{3,})([^\r\n]*)\s*$", line.rstrip("\n\r"))
+
+    def is_closing_fence(line: str) -> bool:
+        if not fence_char or fence_len <= 0:
+            return False
+        pattern = rf"^\s{{0,3}}{re.escape(fence_char)}{{{fence_len},}}\s*$"
+        return re.match(pattern, line.rstrip("\n\r")) is not None
+
+    for line in lines:
+        if in_code:
+            if is_closing_fence(line):
+                code = "".join(code_lines)
+                key = canonical_lang(lang)
+                blocks.setdefault(key, []).append(code.strip())
+                in_code = False
+                fence_char = ""
+                fence_len = 0
+                lang = ""
+                code_lines = []
+            else:
+                code_lines.append(line)
+            continue
+        match = opening_fence(line)
+        if not match:
+            continue
+        fence = match.group(1)
+        raw_info = (match.group(2) or "").strip()
+        lang = raw_info.split(maxsplit=1)[0] if raw_info else ""
+        fence_char = fence[0]
+        fence_len = len(fence)
+        in_code = True
+        code_lines = []
+    return blocks
+
+def scan_inline_protocol_examples(text: str) -> Dict[str, List[str]]:
+    blocks: Dict[str, List[str]] = {}
+    pattern = re.compile(r"对应\s+```(?P<lang>[A-Za-z0-9_+-]+)(?:\s|$)")
+    for match in pattern.finditer(text or ""):
+        lang = canonical_lang(match.group("lang"))
+        if lang in blocks and blocks[lang]:
+            continue
+        blocks.setdefault(lang, []).append("")
     return blocks
 
 def get_code_block(blocks: Dict[str, List[str]], lang: str, index: int = 0) -> Optional[str]:
@@ -402,14 +982,29 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
     其中 XXX 对应 blocks 中的 key（html/css/js/python/svg/json/yaml/typescript/ts...）
     """
     counters: Dict[str, int] = {}
-    placeholder_pattern = re.compile(r'<!--\s*(?P<html>\w+)\s+block\s*-->|#\s*(?P<hash>\w+)\s+block')
+    missing: List[str] = []
+    placeholder_pattern = re.compile(
+        r'<!--\s*(?P<html>\w+)\s+block\s*-->'
+        r'|/\*\s*(?P<css>\w+)\s+block\s*\*/'
+        r'|//\s*(?P<slash>\w+)\s+block\b'
+        r'|#\s*(?P<hash>\w+)\s+block\b'
+    )
 
     def replace(match: re.Match) -> str:
-        lang = (match.group('html') or match.group('hash') or '').lower()
+        lang = (match.group('html') or match.group('css') or match.group('slash') or match.group('hash') or '').lower()
         code = get_next_code_block(blocks, counters, lang)
-        return code if code is not None else match.group(0)
+        if code is None:
+            missing.append(canonical_lang(lang))
+            return match.group(0)
+        return code
 
-    return placeholder_pattern.sub(replace, bash_text)
+    resolved = placeholder_pattern.sub(replace, bash_text)
+    if missing:
+        unique_missing = ", ".join(sorted(set(missing)))
+        raise ValueError(f"缺少占位符对应的代码块：{unique_missing}。为避免覆盖文件，本轮已停止执行。")
+    if placeholder_pattern.search(resolved):
+        raise ValueError("仍有未替换的占位符。为避免覆盖文件，本轮已停止执行。")
+    return resolved
 
 def find_heredoc_tags(line: str) -> List[str]:
     """提取一行 Bash 命令里的 heredoc 结束标记，如 EOF。"""
@@ -452,12 +1047,85 @@ def has_unclosed_shell_quote(text: str) -> bool:
             double = not double
     return single or double
 
+
+def is_interactive_shell_command(cmd: str) -> bool:
+    normalized = " ".join((cmd or "").strip().split()).lower()
+    return normalized in {
+        "bash",
+        "sh",
+        "zsh",
+        "fish",
+        "python",
+        "python3",
+        "node",
+        "cmd",
+        "powershell",
+        "pwsh",
+    }
+
+
+def looks_like_raw_shell_script(text: str) -> bool:
+    """仅在用户粘贴的是纯命令片段时，才允许无 fenced bash 的兼容模式。"""
+    stripped = (text or "").strip()
+    if not stripped or "```" in stripped:
+        return False
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if lines[0].lower() in {"bash", "sh", "shell", "zsh"}:
+        return False
+    shell_starters = (
+        "$ ",
+        "cd ",
+        "mkdir ",
+        "touch ",
+        "cat ",
+        "tee ",
+        "echo ",
+        "printf ",
+        "python ",
+        "python3 ",
+        "node ",
+        "npm ",
+        "pnpm ",
+        "yarn ",
+        "npx ",
+        "pip ",
+        "uv ",
+        "git ",
+        "cp ",
+        "mv ",
+        "rm ",
+        "chmod ",
+        "open ",
+        "curl ",
+        "cat >",
+    )
+    commandish = 0
+    for line in lines:
+        lowered = line.lower()
+        if lowered.startswith(("#", "//")):
+            commandish += 1
+            continue
+        if lowered.startswith(shell_starters) or any(token in line for token in (" && ", " | ", " > ", " <<")):
+            commandish += 1
+            continue
+        return False
+    return commandish > 0
+
 def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
     """提取 Bash 命令并替换占位符"""
     bash_text = get_code_block(blocks, 'bash') or ''
     if not bash_text:
-        # 没有 ```bash 块，尝试用全文
-        bash_text = text
+        plain_block = get_code_block(blocks, "text") or ""
+        if plain_block and looks_like_raw_shell_script(plain_block):
+            bash_text = plain_block
+        elif not looks_like_raw_shell_script(text):
+            return []
+        else:
+            bash_text = text
+    if not bash_text:
+        return []
     bash_text = resolve_all_placeholders(bash_text, blocks)
     lines = bash_text.strip().splitlines()
     cmds = []
@@ -470,6 +1138,8 @@ def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
             continue
         if line.startswith('$ '):
             line = line[2:]
+        if is_interactive_shell_command(line):
+            continue
 
         command_lines = [line]
         for tag in find_heredoc_tags(line):
@@ -704,6 +1374,101 @@ def format_change_summary(records: List[Dict[str, object]], include_diff: bool =
             lines.append(str(record["diff"]))
     return "\n".join(lines)
 
+
+AUTOMATION_LOOP_MAX_ROUNDS = env_int("AGENT_QT_AUTOMATION_MAX_ROUNDS", 20, minimum=1)
+AUTOMATION_FEEDBACK_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_FEEDBACK_CHARS", 14000, minimum=4000)
+AUTOMATION_CONTEXT_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_CHARS", 26000, minimum=8000)
+AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 7000, minimum=1200)
+
+
+def is_automation_done_response(text: str) -> bool:
+    return AUTOMATION_DONE_MARKER in (text or "")
+
+
+def looks_like_automation_context_payload(text: str) -> bool:
+    content = str(text or "")
+    markers = (
+        "第一段：系统提示词",
+        "第二段：历史对话",
+        "第三段：当前指令",
+    )
+    marker_count = sum(1 for marker in markers if marker in content)
+    if marker_count >= 2:
+        return True
+    return "第三段：当前指令" in content and re.search(r"```+plaintext", content, re.I) is not None
+
+
+def truncate_middle(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    marker = "\n\n... 中间日志已截断，保留开头和结尾 ...\n\n"
+    head_len = max(1200, limit // 3)
+    tail_len = max(1200, limit - head_len - len(marker))
+    return text[:head_len] + marker + text[-tail_len:]
+
+
+def build_automation_feedback_prompt(project_root: str, goal: str, execution_log: str, round_number: int, max_rounds: int) -> str:
+    goal_text = goal.strip() or "用户没有填写一句话需求，请根据前文、执行日志和当前项目状态继续判断。"
+    clipped_log = truncate_middle(execution_log.strip(), AUTOMATION_FEEDBACK_CHAR_LIMIT)
+    return f"""你正在 Agent Qt 的自动化循环中，这是第 {round_number}/{max_rounds} 轮。
+
+原始用户需求：
+{goal_text}
+
+项目根目录：
+{project_root}
+
+上一轮本地执行结果如下：
+```text
+{clipped_log}
+```
+
+请基于日志和 diff 判断下一步：
+- 如果任务已经完成，只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出 Bash。
+- 如果任务还没有完成，继续输出一个完整的 ```bash 代码块，并按既有“占位符 + 后续代码块”协议补齐需要写入的大段文件内容。
+- 不要重复已经成功完成的步骤；优先修复日志里的错误、补齐缺失文件或做必要验证。
+- 不要输出 JSON，不要输出 content/tool_calls 包装；这里需要的是普通 Markdown 文本和 fenced bash。
+"""
+
+
+def plaintext_fence(title: str, content: str) -> str:
+    safe_content = str(content or "").strip()
+    longest = max((len(match.group(0)) for match in re.finditer(r"`{3,}", safe_content)), default=2)
+    fence = "`" * max(3, longest + 1)
+    return f"{title}\n{fence}plaintext\n{safe_content}\n{fence}"
+
+
+def unwrap_provider_text(text: str) -> str:
+    """Recover the actual assistant text if a provider still returns a JSON envelope."""
+    current = (text or "").strip()
+    for _ in range(3):
+        candidate = current
+        fence_match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.S | re.I)
+        if fence_match:
+            candidate = fence_match.group(1).strip()
+        if not candidate.startswith("{"):
+            return current
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            return current
+        if not isinstance(payload, dict):
+            return current
+        next_text = None
+        if isinstance(payload.get("content"), str):
+            next_text = payload["content"]
+        elif isinstance(payload.get("message"), dict) and isinstance(payload["message"].get("content"), str):
+            next_text = payload["message"]["content"]
+        else:
+            try:
+                next_text = payload["choices"][0]["message"]["content"]
+            except Exception:
+                next_text = None
+        if not isinstance(next_text, str) or next_text.strip() == current:
+            return current
+        current = next_text.strip()
+    return current
+
 def render_diff_html(record: Dict[str, object]) -> str:
     rows = record.get("diff_rows") or []
     if not rows:
@@ -836,6 +1601,9 @@ def history_dir(root: str, thread_id: str = DEFAULT_THREAD_ID) -> str:
 def threads_index_path(root: str) -> str:
     return os.path.join(root, HISTORY_DIR_NAME, THREADS_INDEX_FILE_NAME)
 
+def workspace_state_path(root: str) -> str:
+    return os.path.join(root, HISTORY_DIR_NAME, WORKSPACE_STATE_FILE_NAME)
+
 def history_path(root: str, thread_id: str = DEFAULT_THREAD_ID) -> str:
     return os.path.join(history_dir(root, thread_id), HISTORY_FILE_NAME)
 
@@ -896,6 +1664,40 @@ def save_workspace_threads(root: str, threads: List[Dict[str, object]]) -> bool:
             "version": HISTORY_VERSION,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "threads": normalize_threads(threads),
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+        return True
+    except OSError:
+        return False
+
+def load_last_thread_id(root: str, threads: List[Dict[str, object]]) -> str:
+    valid_thread_ids = {str(thread.get("id")) for thread in normalize_threads(threads)}
+    path = workspace_state_path(root)
+    if not os.path.isfile(path):
+        return DEFAULT_THREAD_ID
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_THREAD_ID
+    if payload.get("version") != HISTORY_VERSION:
+        return DEFAULT_THREAD_ID
+    thread_id = safe_thread_id(str(payload.get("last_thread_id", DEFAULT_THREAD_ID)))
+    return thread_id if thread_id in valid_thread_ids else DEFAULT_THREAD_ID
+
+def save_last_thread_id(root: str, thread_id: str) -> bool:
+    if not root:
+        return False
+    try:
+        os.makedirs(os.path.join(root, HISTORY_DIR_NAME), exist_ok=True)
+        path = workspace_state_path(root)
+        tmp_path = path + ".tmp"
+        payload = {
+            "version": HISTORY_VERSION,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "last_thread_id": safe_thread_id(thread_id),
         }
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -1409,9 +2211,7 @@ class ManagedProcess(QWidget):
         self.process = QProcess()
         self.process.setWorkingDirectory(self.cwd)
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        env = QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONUNBUFFERED", "1")
-        self.process.setProcessEnvironment(env)
+        self.process.setProcessEnvironment(agent_qprocess_environment(create=False))
         self.process.readyReadStandardOutput.connect(self.read_output)
         self.process.started.connect(self.on_started)
         self.process.errorOccurred.connect(self.on_error)
@@ -1690,6 +2490,8 @@ class TerminalPanel(QWidget):
         return name
     
     def add_process(self, cmd: str, cwd: str, name: str = "", interactive: bool = False):
+        if not interactive and (not cmd.strip() or is_interactive_shell_command(cmd)):
+            return None
         label = self.terminal_title(cwd, len(self.processes) + 1)
         proc = ManagedProcess(cmd, cwd, label, interactive=interactive)
         proc.remove_requested.connect(self.remove_process)
@@ -1823,13 +2625,25 @@ class ExecuteWorker(QThread):
                 outputs.append(f"[{i}] ⛔ 拒绝: {display_cmd}")
                 self.output_signal.emit(outputs[-1])
                 continue
+            if is_interactive_shell_command(cmd):
+                outputs.append(f"[{i}] ⚠️ 跳过交互式 Shell: {display_cmd}")
+                self.output_signal.emit(outputs[-1])
+                continue
             if is_long_running(cmd):
                 outputs.append(f"[{i}] 🔵 后台: {display_cmd}")
                 self.long_running_signal.emit(cmd, cwd, display_cmd.splitlines()[0][:40])
                 self.output_signal.emit(outputs[-1])
                 continue
             try:
-                r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=30)
+                r = subprocess.run(
+                    cmd,
+                    shell=True,
+                    cwd=cwd,
+                    env=agent_runtime_env(create=False),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
                 out = r.stdout.strip()
                 if r.stderr.strip():
                     out += "\n" + r.stderr.strip()
@@ -1837,12 +2651,463 @@ class ExecuteWorker(QThread):
                     out += f"\n[退出码: {r.returncode}]"
                 outputs.append(f"[{i}] 💻 {display_cmd}\n📤 {out or '(无输出)'}")
             except subprocess.TimeoutExpired:
-                outputs.append(f"[{i}] ⏱️ 超时 → 后台: {display_cmd}")
-                self.long_running_signal.emit(cmd, cwd, display_cmd.splitlines()[0][:40])
+                if is_interactive_shell_command(cmd):
+                    outputs.append(f"[{i}] ⚠️ 交互式 Shell 已超时，未创建后台终端: {display_cmd}")
+                else:
+                    outputs.append(f"[{i}] ⏱️ 超时 → 后台: {display_cmd}")
+                    self.long_running_signal.emit(cmd, cwd, display_cmd.splitlines()[0][:40])
             except Exception as e:
                 outputs.append(f"[{i}] ❌ {e}")
             self.output_signal.emit(outputs[-1])
         self.finished_signal.emit('\n\n'.join(outputs))
+
+# ============================================================
+# 可选网页 Provider 自动化插件
+# ============================================================
+AUTOMATION_MODELS = [
+    ("DeepSeek V4", "DeepSeekV4"),
+    ("DeepSeek V4 Thinking", "DeepSeekV4-thinking"),
+    ("MiMo V2.5 Pro", "xiaomi-mimo-v2.5-pro"),
+    ("MiMo V2.5", "xiaomi-mimo-v2.5"),
+]
+AUTOMATION_DEFAULT_MODEL = "DeepSeekV4"
+AUTOMATION_REQUIRED_MODULES = (
+    "fastapi",
+    "uvicorn",
+    "playwright",
+    "langchain_core",
+    "jsonschema",
+    "pydantic",
+)
+
+
+def automation_plugin_root() -> str:
+    return os.path.expanduser(os.environ.get("AGENT_QT_AUTOMATION_PLUGIN_DIR", "~/.agent_qt/plugins/web_provider"))
+
+
+def automation_venv_python(root: str) -> str:
+    if platform.system() == "Windows":
+        return os.path.join(root, ".venv", "Scripts", "python.exe")
+    return os.path.join(root, ".venv", "bin", "python")
+
+
+def find_automation_backend() -> str:
+    candidates = [
+        os.environ.get("AGENT_QT_WEB_PROVIDER_BACKEND", ""),
+        "/Users/pippo/Downloads/freechat/deepseekwithdeerflow2.0/deer-flow/backend",
+        os.path.expanduser("~/Downloads/freechat/deepseekwithdeerflow2.0/deer-flow/backend"),
+        os.path.expanduser("~/Downloads/freechat/deepseekwithdeerflow2.0/deer-flow-gha/backend"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        backend = os.path.abspath(os.path.expanduser(candidate))
+        if (
+            os.path.isfile(os.path.join(backend, "app", "deepseek_local_provider.py"))
+            and os.path.isfile(os.path.join(backend, "packages", "harness", "deerflow", "models", "deepseek_web_bridge.py"))
+        ):
+            return backend
+    return ""
+
+
+class AutomationProviderManager:
+    """Thin adapter around the optional deer-flow web provider process."""
+
+    def __init__(self):
+        self.plugin_root = automation_plugin_root()
+        self.backend_dir = find_automation_backend()
+        self.host = os.environ.get("AGENT_QT_AUTOMATION_HOST", "127.0.0.1")
+        self.port = int(os.environ.get("AGENT_QT_AUTOMATION_PORT", "8765"))
+        self.base_url = f"http://{self.host}:{self.port}"
+        self.log_dir = os.path.join(self.plugin_root, "logs")
+        self.pid_file = os.path.join(self.plugin_root, "provider.pid")
+        self.log_file = os.path.join(self.log_dir, "provider.log")
+
+    def has_backend(self) -> bool:
+        return bool(self.backend_dir and os.path.isdir(self.backend_dir))
+
+    def harness_path(self) -> str:
+        return os.path.join(self.backend_dir, "packages", "harness")
+
+    def candidate_pythons(self) -> List[str]:
+        plugin_python = automation_venv_python(self.plugin_root)
+        backend_python = os.path.join(
+            self.backend_dir,
+            ".venv",
+            "Scripts" if platform.system() == "Windows" else "bin",
+            "python.exe" if platform.system() == "Windows" else "python",
+        )
+        candidates = [plugin_python, backend_python, sys.executable, shutil.which("python3") or ""]
+        seen = set()
+        result = []
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            if os.path.exists(candidate) or os.path.basename(candidate).startswith("python"):
+                result.append(candidate)
+        return result
+
+    def provider_env(self) -> Dict[str, str]:
+        env = os.environ.copy()
+        pythonpath_parts = [self.harness_path(), self.backend_dir]
+        if env.get("PYTHONPATH"):
+            pythonpath_parts.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+        env["DEEPSEEK_LOCAL_PROVIDER_HOST"] = self.host
+        env["DEEPSEEK_LOCAL_PROVIDER_PORT"] = str(self.port)
+        env["DEEPSEEK_LOCAL_INTERFACE_MODE"] = "both"
+        env.setdefault("DEEPSEEK_LOCAL_EXPERT_MODE", "1")
+        # Daily automation should stay in the background. The explicit login action still opens a visible page.
+        headless_value = os.environ.get("AGENT_QT_WEB_HEADLESS", "1")
+        env["DEEPSEEK_WEB_HEADLESS"] = headless_value
+        env["XIAOMI_MIMO_WEB_HEADLESS"] = headless_value
+        env.setdefault("DEEPSEEK_WEB_RESPONSE_TIMEOUT_MS", "600000")
+        env.setdefault("DEEPSEEK_WEB_MAX_CONTINUE_CLICKS", "12")
+        env.setdefault("DEEPSEEK_WEB_COPY_PROBE_MAX_MS", "1500")
+        env.setdefault("XIAOMI_MIMO_RESPONSE_TIMEOUT_MS", "300000")
+        profile_root = os.path.join(self.plugin_root, "profiles")
+        env.setdefault("DEEPSEEK_WEB_PROFILE_DEERFLOW", os.path.join(profile_root, "deepseek"))
+        env.setdefault("DEEPSEEK_WEB_SESSION_STATE_DEERFLOW", os.path.join(profile_root, "deepseek-session.json"))
+        env.setdefault("XIAOMI_MIMO_WEB_PROFILE", os.path.join(profile_root, "mimo"))
+        env.setdefault("XIAOMI_MIMO_WEB_SESSION_STATE", os.path.join(profile_root, "mimo-session.json"))
+        env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
+        env.setdefault("no_proxy", env["NO_PROXY"])
+        return env
+
+    def run_python_probe(self, python_bin: str, code: str, timeout: int = 20) -> tuple[bool, str]:
+        if not self.has_backend():
+            return False, "未找到 freechat deer-flow backend。"
+        try:
+            result = subprocess.run(
+                [python_bin, "-c", code],
+                cwd=self.backend_dir,
+                env=self.provider_env(),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+        return result.returncode == 0, output
+
+    def dependency_status(self) -> Dict[str, object]:
+        if not self.has_backend():
+            return {
+                "ready": False,
+                "python": "",
+                "missing": [],
+                "message": "未找到 freechat/deer-flow/backend provider 源码。",
+            }
+        probe = f"""
+import importlib.util, json
+missing = [name for name in {list(AUTOMATION_REQUIRED_MODULES)!r} if importlib.util.find_spec(name) is None]
+try:
+    import app.deepseek_local_provider  # noqa: F401
+except Exception as exc:
+    print(json.dumps({{"missing": missing, "provider_error": str(exc)}}, ensure_ascii=False))
+    raise
+print(json.dumps({{"missing": missing, "provider_error": ""}}, ensure_ascii=False))
+raise SystemExit(1 if missing else 0)
+"""
+        last_output = ""
+        for python_bin in self.candidate_pythons():
+            ok, output = self.run_python_probe(python_bin, probe)
+            last_output = output or last_output
+            if ok:
+                return {
+                    "ready": True,
+                    "python": python_bin,
+                    "missing": [],
+                    "message": "依赖可用。",
+                }
+        missing = list(AUTOMATION_REQUIRED_MODULES)
+        try:
+            payload = json.loads((last_output or "{}").splitlines()[-1])
+            if isinstance(payload.get("missing"), list):
+                missing = payload["missing"]
+        except Exception:
+            pass
+        return {
+            "ready": False,
+            "python": "",
+            "missing": missing,
+            "message": last_output or "依赖检查失败。",
+        }
+
+    def browser_status(self, python_bin: str) -> tuple[bool, str]:
+        probe = """
+from playwright.sync_api import sync_playwright
+p = sync_playwright().start()
+try:
+    browser = p.chromium.launch(headless=True)
+    browser.close()
+finally:
+    p.stop()
+print("chromium ok")
+"""
+        return self.run_python_probe(python_bin, probe, timeout=20)
+
+    def install_dependencies(self, status_callback=None) -> str:
+        os.makedirs(self.plugin_root, exist_ok=True)
+        python_bin = automation_venv_python(self.plugin_root)
+        if not os.path.exists(python_bin):
+            if status_callback:
+                status_callback("创建插件虚拟环境...")
+            venv.EnvBuilder(with_pip=True).create(os.path.join(self.plugin_root, ".venv"))
+        commands = [
+            [python_bin, "-m", "pip", "install", *pip_index_args(), "--upgrade", "pip"],
+            [
+                python_bin,
+                "-m",
+                "pip",
+                "install",
+                *pip_index_args(),
+                "fastapi>=0.115.0",
+                "uvicorn[standard]>=0.34.0",
+                "pydantic>=2",
+                "jsonschema",
+                "langchain-core",
+                "playwright",
+                "httpx",
+            ],
+            [python_bin, "-m", "playwright", "install", "chromium"],
+        ]
+        for command in commands:
+            if status_callback:
+                status_callback("运行: " + " ".join(command[1:]))
+            result = subprocess.run(
+                command,
+                cwd=self.plugin_root,
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                raise RuntimeError(detail[-2000:] or f"命令失败: {' '.join(command)}")
+        return python_bin
+
+    def active_python(self) -> str:
+        status = self.dependency_status()
+        if status.get("ready"):
+            return str(status.get("python") or "")
+        plugin_python = automation_venv_python(self.plugin_root)
+        return plugin_python if os.path.exists(plugin_python) else ""
+
+    def request_json(self, method: str, path: str, payload: Optional[dict] = None, timeout: int = 30) -> dict:
+        data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(f"{self.base_url}{path}", data=data, method=method)
+        if payload is not None:
+            request.add_header("Content-Type", "application/json")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            message = detail.strip() or f"HTTP {exc.code}"
+            try:
+                payload_detail = json.loads(detail)
+                if isinstance(payload_detail, dict) and payload_detail.get("detail"):
+                    message = str(payload_detail["detail"])
+            except Exception:
+                pass
+            if "input box not found" in message.lower() or "please login" in message.lower():
+                message = (
+                    "网页登录还没有准备好，provider 没找到聊天输入框。\n\n"
+                    "请在设置里点击“打开网页登录”，完成登录后保持页面在聊天界面，再重新发送。"
+                )
+            raise RuntimeError(message) from exc
+
+    def health(self) -> bool:
+        try:
+            payload = self.request_json("GET", "/health", timeout=3)
+            return payload.get("status") == "ok"
+        except Exception:
+            return False
+
+    def start_provider(self) -> str:
+        if self.health():
+            return f"provider 已运行: {self.base_url}"
+        status = self.dependency_status()
+        if not status.get("ready"):
+            raise RuntimeError("插件依赖未就绪，请先安装/修复插件依赖。\n" + str(status.get("message", "")))
+        python_bin = str(status["python"])
+        os.makedirs(self.log_dir, exist_ok=True)
+        log = open(self.log_file, "a", encoding="utf-8")
+        process = subprocess.Popen(
+            [
+                python_bin,
+                "-m",
+                "uvicorn",
+                "app.deepseek_local_provider:app",
+                "--host",
+                self.host,
+                "--port",
+                str(self.port),
+                "--log-level",
+                "warning",
+            ],
+            cwd=self.backend_dir,
+            env=self.provider_env(),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        os.makedirs(self.plugin_root, exist_ok=True)
+        with open(self.pid_file, "w", encoding="utf-8") as f:
+            f.write(str(process.pid))
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            if self.health():
+                return f"provider 已启动: {self.base_url}"
+            time.sleep(0.5)
+        tail = ""
+        try:
+            with open(self.log_file, "r", encoding="utf-8", errors="replace") as f:
+                tail = f.read()[-2000:]
+        except OSError:
+            pass
+        raise RuntimeError(f"provider 启动超时: {self.base_url}\n{tail}")
+
+    def open_login(self, model: str) -> str:
+        self.start_provider()
+        payload = self.request_json("POST", f"/debug/open-login?model={urllib.parse.quote(model)}", timeout=60)
+        return f"已打开登录页: {payload.get('url', self.base_url)}"
+
+    def chat(self, messages: List[Dict[str, str]], model: str, thread_id: str) -> str:
+        self.start_provider()
+        payload = self.request_json(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": model,
+                "messages": messages,
+                "temperature": 0,
+                "user": thread_id,
+                "output_protocol": "plain",
+                "extra_body": {"output_protocol": "plain"},
+            },
+            timeout=900,
+        )
+        try:
+            return unwrap_provider_text(str(payload["choices"][0]["message"].get("content") or ""))
+        except Exception as exc:
+            raise RuntimeError(f"provider 返回格式异常: {payload}") from exc
+
+    def response_preview(self, model: str, thread_id: str) -> dict:
+        self.start_provider()
+        return self.request_json(
+            "GET",
+            f"/debug/response-preview?model={urllib.parse.quote(model)}&user={urllib.parse.quote(thread_id)}",
+            timeout=5,
+        )
+
+    def status_text(self) -> str:
+        dep = self.dependency_status()
+        lines = [
+            f"源码: {self.backend_dir or '未找到'}",
+            f"服务: {self.base_url} ({'运行中' if self.health() else '未运行'})",
+            f"依赖: {'可用' if dep.get('ready') else '缺失'}",
+        ]
+        if dep.get("python"):
+            lines.append(f"Python: {dep['python']}")
+        if dep.get("missing"):
+            lines.append("缺失模块: " + ", ".join(str(x) for x in dep["missing"]))
+        if dep.get("message") and not dep.get("ready"):
+            lines.append(str(dep["message"])[-600:])
+        return "\n".join(lines)
+
+
+class AutomationSetupWorker(QThread):
+    status_signal = Signal(str)
+    finished_signal = Signal(bool, str)
+
+    def __init__(self, manager: AutomationProviderManager, action: str, model: str):
+        super().__init__()
+        self.manager = manager
+        self.action = action
+        self.model = model
+
+    def run(self):
+        try:
+            if self.action == "install":
+                self.manager.install_dependencies(self.status_signal.emit)
+                message = "插件依赖安装完成。"
+            elif self.action == "start":
+                message = self.manager.start_provider()
+            elif self.action == "login":
+                message = self.manager.open_login(self.model)
+            else:
+                message = self.manager.status_text()
+            self.finished_signal.emit(True, message)
+        except Exception as exc:
+            self.finished_signal.emit(False, str(exc))
+
+
+class PythonRuntimeSetupWorker(QThread):
+    status_signal = Signal(str)
+    finished_signal = Signal(bool, str)
+
+    def __init__(self, action: str):
+        super().__init__()
+        self.action = action
+
+    def run(self):
+        try:
+            if self.action == "install":
+                python_bin = install_agent_python_runtime(self.status_signal.emit)
+                message = f"Python 运行环境安装完成：{python_bin}"
+            else:
+                message = agent_runtime_status_text()
+            self.finished_signal.emit(True, message)
+        except Exception as exc:
+            self.finished_signal.emit(False, str(exc))
+
+
+class AutomationChatWorker(QThread):
+    finished_signal = Signal(str, str)
+
+    def __init__(self, manager: AutomationProviderManager, messages: List[Dict[str, str]], model: str, thread_id: str):
+        super().__init__()
+        self.manager = manager
+        self.messages = messages
+        self.model = model
+        self.thread_id = thread_id
+
+    def run(self):
+        try:
+            self.finished_signal.emit(self.manager.chat(self.messages, self.model, self.thread_id), "")
+        except Exception as exc:
+            self.finished_signal.emit("", str(exc))
+
+
+class AutomationPreviewWorker(QThread):
+    preview_signal = Signal(dict)
+
+    def __init__(self, manager: AutomationProviderManager, model: str, thread_id: str):
+        super().__init__()
+        self.manager = manager
+        self.model = model
+        self.thread_id = thread_id
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        while self._running:
+            try:
+                preview = self.manager.response_preview(self.model, self.thread_id)
+                self.preview_signal.emit(preview)
+            except Exception:
+                pass
+            for _ in range(8):
+                if not self._running:
+                    return
+                self.msleep(150)
 
 # ============================================================
 # 对话气泡
@@ -1862,6 +3127,11 @@ class ChatBubble(QFrame):
         prompt_input_text: str = "",
         scrollable: bool = False,
         max_content_height: int = 220,
+        markdown: bool = False,
+        expand_to_content: bool = False,
+        flat: bool = False,
+        show_prompt_input: bool = True,
+        compact_user: bool = False,
     ):
         super().__init__(parent)
         self.role = role
@@ -1872,7 +3142,15 @@ class ChatBubble(QFrame):
         self.prompt_input_text = prompt_input_text
         self.scrollable = scrollable
         self.max_content_height = max_content_height
-        self.min_content_height = 58
+        self.markdown = markdown
+        self.expand_to_content = expand_to_content
+        self.flat = flat
+        self.show_prompt_input = show_prompt_input
+        self.compact_user = compact_user
+        self.code_max_height = 260
+        self.markdown_widgets: List[QWidget] = []
+        self.markdown_code_widgets: List[QPlainTextEdit] = []
+        self.min_content_height = 34 if compact_user else 58
         self._height_adjust_scheduled = False
         self._last_content_width = 0
         self.setup_ui()
@@ -1887,11 +3165,48 @@ class ChatBubble(QFrame):
         setattr(self, '_bg', bg)
         setattr(self, '_border', border)
         
-        self.setStyleSheet(f"QFrame {{ background: {bg}; border: 1px solid {border}; border-radius: 18px; margin: 4px 0; }}")
+        if self.flat:
+            self.setStyleSheet("QFrame { background: transparent; border: none; margin: 2px 0; }")
+        elif self.compact_user:
+            self.setStyleSheet(f"""
+                QFrame {{
+                    background: #edf5ff;
+                    border: 1px solid #cfe0ff;
+                    border-radius: 18px;
+                    margin: 4px 0;
+                }}
+            """)
+        else:
+            self.setStyleSheet(f"QFrame {{ background: {bg}; border: 1px solid {border}; border-radius: 18px; margin: 4px 0; }}")
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
+        if self.flat:
+            layout.setContentsMargins(2, 10, 2, 10)
+        elif self.compact_user:
+            layout.setContentsMargins(14, 10, 14, 10)
+        else:
+            layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(6 if self.compact_user else (8 if self.flat else 10))
+        
+        if self.compact_user:
+            self.content_label = QLabel(self.content)
+            self.content_label.setWordWrap(True)
+            self.content_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+            self.content_label.setStyleSheet(f"""
+                QLabel {{
+                    background: transparent;
+                    color: {COLORS['text']};
+                    border: none;
+                    padding: 0;
+                    font-size: 13px;
+                    line-height: 1.35;
+                }}
+            """)
+            self.content_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            layout.addWidget(self.content_label)
+            return
         
         header = QHBoxLayout()
         role_label = QLabel(label_text)
@@ -1942,7 +3257,7 @@ class ChatBubble(QFrame):
             header.addWidget(self.paste_ai_btn)
         layout.addLayout(header)
 
-        if self.role == "user":
+        if self.role == "user" and self.show_prompt_input:
             prompt_row = QHBoxLayout()
             prompt_row.setSpacing(8)
             self.prompt_input = QLineEdit()
@@ -1965,20 +3280,121 @@ class ChatBubble(QFrame):
             prompt_row.addWidget(self.prompt_input)
             layout.addLayout(prompt_row)
         
-        self.content_label = QPlainTextEdit()
+        if self.markdown and self.expand_to_content:
+            self.content_label = None
+            self.render_markdown_parts(layout)
+            return
+
+        self.content_label = QTextBrowser() if self.markdown else QPlainTextEdit()
         self.content_label.setReadOnly(True)
-        self.content_label.setPlainText(self.content)
-        self.content_label.setMaximumBlockCount(20000)
+        if self.markdown:
+            self.content_label.setOpenExternalLinks(False)
+            self.content_label.setMarkdown(self.content)
+        else:
+            self.content_label.setPlainText(self.content)
+            self.content_label.setMaximumBlockCount(20000)
         self.content_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.content_label.customContextMenuRequested.connect(
             lambda pos, editor=self.content_label: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
         )
+        editor_type = "QTextBrowser" if self.markdown else "QPlainTextEdit"
+        font_family = "" if self.markdown else "font-family: 'SF Mono', 'Menlo', monospace;"
+        content_bg = "transparent" if self.flat else COLORS["code_bg"]
+        content_border = "transparent" if self.flat else COLORS["border"]
+        content_radius = 0 if self.flat else 12
         self.content_label.setStyleSheet(f"""
+            {editor_type} {{
+                background: {content_bg};
+                color: {COLORS['text']};
+                border: 1px solid {content_border};
+                border-radius: {content_radius}px;
+                padding: {'2px 0' if self.flat else '10px 12px'};
+                {font_family}
+                font-size: 12px;
+                selection-background-color: #d8e6ff;
+                selection-color: {COLORS['text']};
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 8px;
+                margin: 4px 2px 4px 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {COLORS['border_strong']};
+                border-radius: 4px;
+                min-height: 28px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+        """)
+        if not self.markdown:
+            self.content_label.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.content_label.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.content_label.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if self.expand_to_content else Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.content_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.adjust_content_height()
+        self.schedule_content_height_adjustment()
+        layout.addWidget(self.content_label)
+
+    def clear_markdown_widgets(self):
+        for widget in self.markdown_widgets:
+            widget.setParent(None)
+            widget.deleteLater()
+        self.markdown_widgets = []
+        self.markdown_code_widgets = []
+
+    def capture_markdown_code_scroll_state(self) -> List[Dict[str, object]]:
+        states: List[Dict[str, object]] = []
+        for widget in self.markdown_code_widgets:
+            vertical = widget.verticalScrollBar()
+            horizontal = widget.horizontalScrollBar()
+            states.append({
+                "value": vertical.value(),
+                "maximum": vertical.maximum(),
+                "at_bottom": vertical.value() >= vertical.maximum() - 4,
+                "h_value": horizontal.value(),
+            })
+        return states
+
+    def restore_markdown_code_scroll_state(self, states: List[Dict[str, object]]):
+        if not states:
+            return
+        code_index = 0
+        for widget in self.markdown_code_widgets:
+            if code_index >= len(states):
+                break
+            state = states[code_index]
+            vertical = widget.verticalScrollBar()
+            horizontal = widget.horizontalScrollBar()
+            if bool(state.get("at_bottom")):
+                vertical.setValue(vertical.maximum())
+            else:
+                vertical.setValue(min(int(state.get("value") or 0), vertical.maximum()))
+            horizontal.setValue(min(int(state.get("h_value") or 0), horizontal.maximum()))
+            code_index += 1
+
+    def markdown_text_style(self) -> str:
+        return f"""
+            QTextBrowser {{
+                background: transparent;
+                color: {COLORS['text']};
+                border: 1px solid transparent;
+                border-radius: 0;
+                padding: 2px 0;
+                font-size: 12px;
+            }}
+        """
+
+    def markdown_code_style(self) -> str:
+        return f"""
             QPlainTextEdit {{
                 background: {COLORS['code_bg']};
                 color: {COLORS['text']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 12px;
+                border: none;
+                border-radius: 0;
                 padding: 10px 12px;
                 font-family: 'SF Mono', 'Menlo', monospace;
                 font-size: 12px;
@@ -1998,18 +3414,103 @@ class ChatBubble(QFrame):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
                 height: 0;
             }}
-        """)
-        self.content_label.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self.content_label.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.content_label.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.content_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        """
+
+    def markdown_code_frame_style(self) -> str:
+        return f"""
+            QFrame {{
+                background: {COLORS['code_bg']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+            }}
+        """
+
+    def markdown_code_header_style(self) -> str:
+        return f"""
+            QLabel {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text_secondary']};
+                border: none;
+                border-bottom: 1px solid {COLORS['border']};
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+                padding: 6px 10px;
+                font-size: 11px;
+                font-weight: 800;
+                letter-spacing: 0;
+            }}
+        """
+
+    def add_markdown_text_widget(self, text: str, layout: QVBoxLayout):
+        viewer = QTextBrowser()
+        viewer.setOpenExternalLinks(False)
+        viewer.setReadOnly(True)
+        viewer.setMarkdown(text)
+        viewer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        viewer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        viewer.setStyleSheet(self.markdown_text_style())
+        layout.addWidget(viewer)
+        self.markdown_widgets.append(viewer)
+        return viewer
+
+    def add_markdown_code_widget(self, lang: str, code: str, layout: QVBoxLayout):
+        code_frame = QFrame()
+        code_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        code_frame.setStyleSheet(self.markdown_code_frame_style())
+        code_layout = QVBoxLayout(code_frame)
+        code_layout.setContentsMargins(0, 0, 0, 0)
+        code_layout.setSpacing(0)
+
+        lang_label = QLabel((lang or "text").strip().lower() or "text")
+        lang_label.setFixedHeight(28)
+        lang_label.setStyleSheet(self.markdown_code_header_style())
+        code_layout.addWidget(lang_label)
+
+        code_box = QPlainTextEdit()
+        code_box.setReadOnly(True)
+        code_box.setPlainText(code)
+        code_box.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        code_box.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        code_box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        code_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        code_box.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        code_box.customContextMenuRequested.connect(
+            lambda pos, editor=code_box: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
+        )
+        code_box.setStyleSheet(self.markdown_code_style())
+        code_layout.addWidget(code_box)
+        layout.addWidget(code_frame)
+        self.markdown_widgets.append(code_frame)
+        self.markdown_code_widgets.append(code_box)
+        return code_box
+
+    def render_markdown_parts(self, layout: Optional[QVBoxLayout] = None):
+        if layout is None:
+            layout = self.layout()
+        if layout is None:
+            return
+        code_scroll_states = self.capture_markdown_code_scroll_state()
+        self.clear_markdown_widgets()
+        for part in split_markdown_fenced_blocks(self.content):
+            if part["type"] == "code":
+                self.add_markdown_code_widget(part.get("lang", ""), part.get("text", ""), layout)
+            else:
+                self.add_markdown_text_widget(part.get("text", ""), layout)
         self.adjust_content_height()
-        self.schedule_content_height_adjustment()
-        layout.addWidget(self.content_label)
-        
+        self.restore_markdown_code_scroll_state(code_scroll_states)
+        QTimer.singleShot(0, lambda states=code_scroll_states: self.restore_markdown_code_scroll_state(states))
+
     def update_content(self, text: str):
         self.content = text
-        self.content_label.setPlainText(text)
+        if self.compact_user:
+            self.content_label.setText(text)
+        elif self.markdown and self.expand_to_content:
+            self.render_markdown_parts()
+        elif self.markdown:
+            self.content_label.setMarkdown(text)
+        else:
+            self.content_label.setPlainText(text)
         self.adjust_content_height()
         self.schedule_content_height_adjustment()
 
@@ -2026,9 +3527,12 @@ class ChatBubble(QFrame):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if not hasattr(self, "content_label"):
+        if not hasattr(self, "content_label") and not self.markdown_widgets:
             return
-        width = self.content_label.viewport().width()
+        reference = self.content_label or (self.markdown_widgets[0] if self.markdown_widgets else None)
+        if reference is None:
+            return
+        width = reference.viewport().width() if hasattr(reference, "viewport") else reference.width()
         if abs(width - self._last_content_width) >= 18:
             self._last_content_width = width
             self.schedule_content_height_adjustment(delay=70)
@@ -2040,28 +3544,47 @@ class ChatBubble(QFrame):
         QTimer.singleShot(delay, self.adjust_content_height)
 
     def adjust_content_height(self):
-        if not hasattr(self, "content_label"):
+        if self.markdown and self.expand_to_content and self.markdown_widgets:
+            self._height_adjust_scheduled = False
+            for widget in self.markdown_widgets:
+                if not isinstance(widget, QTextBrowser):
+                    continue
+                available_width = max(120, widget.viewport().width() - 10)
+                metrics = widget.fontMetrics()
+                text = widget.toPlainText()
+                target_height = max(34, estimate_wrapped_text_height(text, metrics, available_width))
+                if widget.height() != target_height:
+                    widget.setFixedHeight(target_height)
+            for code_box in self.markdown_code_widgets:
+                available_width = max(120, code_box.viewport().width() - 10)
+                metrics = code_box.fontMetrics()
+                text = code_box.toPlainText()
+                target_height = min(
+                    self.code_max_height,
+                    max(70, estimate_wrapped_text_height(text, metrics, available_width)),
+                )
+                if code_box.height() != target_height:
+                    code_box.setFixedHeight(target_height)
+            return
+        if not hasattr(self, "content_label") or self.content_label is None:
             return
         self._height_adjust_scheduled = False
-        text = self.content_label.toPlainText() or " "
+        if self.compact_user:
+            available_width = max(120, self.content_label.width() - 8)
+            metrics = self.content_label.fontMetrics()
+            target_height = max(26, estimate_wrapped_text_height(self.content or " ", metrics, available_width))
+            if self.content_label.height() != target_height:
+                self.content_label.setFixedHeight(target_height)
+            return
+        text = self.content or self.content_label.toPlainText() or " "
         available_width = max(120, self.content_label.viewport().width() - 10)
         metrics = self.content_label.fontMetrics()
         line_spacing = max(1, metrics.lineSpacing())
-        max_visual_lines = max(1, (self.max_content_height - 36 + line_spacing - 1) // line_spacing)
-        avg_char_width = max(1, metrics.averageCharWidth())
-        visual_lines = 0
-        for line in text.splitlines() or [""]:
-            expanded = line.replace("\t", "    ")
-            if len(expanded) > 320:
-                line_width = avg_char_width * len(expanded)
-            else:
-                line_width = metrics.horizontalAdvance(expanded)
-            visual_lines += max(1, (line_width + available_width - 1) // available_width)
-            if visual_lines >= max_visual_lines:
-                visual_lines = max_visual_lines
-                break
-        natural_height = visual_lines * line_spacing + 36
-        target_height = min(self.max_content_height, max(self.min_content_height, int(natural_height)))
+        max_visual_lines = None if self.expand_to_content else max(1, (self.max_content_height - 36 + line_spacing - 1) // line_spacing)
+        natural_height = estimate_wrapped_text_height(text, metrics, available_width, max_visual_lines)
+        target_height = max(self.min_content_height, int(natural_height))
+        if not self.expand_to_content:
+            target_height = min(self.max_content_height, target_height)
         if self.content_label.height() != target_height:
             self.content_label.setFixedHeight(target_height)
 
@@ -2371,6 +3894,7 @@ class Sidebar(QFrame):
     thread_selected = Signal(str)
     new_thread_requested = Signal()
     delete_thread_requested = Signal(str)
+    delete_path_requested = Signal(str)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2691,12 +4215,24 @@ class Sidebar(QFrame):
         if not item:
             return
         path = item.data(0, Qt.UserRole)
+        if not path:
+            return
         menu = QMenu(self)
-        menu.addAction("打开文件", lambda: self.file_opened.emit(path))
+        is_dir = os.path.isdir(path)
+        if os.path.isfile(path):
+            menu.addAction("打开文件", lambda: self.file_opened.emit(path))
+        elif is_dir:
+            menu.addAction("展开/折叠", lambda: item.setExpanded(not item.isExpanded()))
         target = path if os.path.isdir(path) else os.path.dirname(path)
         menu.addAction("打开目录", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(target)))
-        if os.path.isfile(path):
-            menu.addAction("复制路径", lambda: QApplication.clipboard().setText(path))
+        menu.addAction("复制路径", lambda: QApplication.clipboard().setText(path))
+        root_path = os.path.abspath(self._root_path) if self._root_path else ""
+        if os.path.abspath(path) != root_path:
+            menu.addSeparator()
+            delete_label = "删除文件夹" if is_dir else "删除文件"
+            delete_action = QAction(delete_label, self)
+            delete_action.triggered.connect(lambda _checked=False, p=path: self.delete_path_requested.emit(p))
+            menu.addAction(delete_action)
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     def on_item_click(self, item, col):
@@ -2708,15 +4244,22 @@ class Sidebar(QFrame):
         path = item.data(0, Qt.UserRole)
         if os.path.isfile(path):
             self.file_opened.emit(path)
+
+    def expand(self):
+        self._collapsed = False
+        self.setVisible(True)
+        self.setFixedWidth(self._expanded_width)
+
+    def collapse(self):
+        self._collapsed = True
+        self.setVisible(False)
+        self.setFixedWidth(0)
     
     def toggle(self):
-        self._collapsed = not self._collapsed
         if self._collapsed:
-            self.setVisible(False)
-            self.setFixedWidth(0)
+            self.expand()
         else:
-            self.setVisible(True)
-            self.setFixedWidth(self._expanded_width)
+            self.collapse()
 
     def set_expanded_width(self, width: int):
         self._expanded_width = max(self._min_width, min(width, self._max_width))
@@ -2951,7 +4494,25 @@ class ChatPage(QWidget):
         self.history_entries: List[Dict[str, object]] = []
         self.result_bubble: Optional[ChatBubble] = None
         self.worker: Optional[ExecuteWorker] = None
+        self.automation_manager = AutomationProviderManager()
+        self.automation_enabled = False
+        self.automation_model = AUTOMATION_DEFAULT_MODEL
+        self.automation_worker: Optional[AutomationChatWorker] = None
+        self.automation_preview_worker: Optional[AutomationPreviewWorker] = None
+        self.automation_preview_bubble: Optional[QFrame] = None
+        self.automation_setup_worker: Optional[AutomationSetupWorker] = None
+        self.python_runtime_setup_worker: Optional[PythonRuntimeSetupWorker] = None
+        self.automation_loop_active = False
+        self.automation_loop_round = 0
+        self.automation_loop_max_rounds = AUTOMATION_LOOP_MAX_ROUNDS
+        self.automation_loop_goal = ""
         self._ensure_ai_entry_pending = False
+        self.automation_composer: Optional[QFrame] = None
+        self.automation_input: Optional[QTextEdit] = None
+        self.automation_send_btn: Optional[QToolButton] = None
+        self.chat_column_max_width = 1480
+        self.chat_column_width_ratio = 0.94
+        self.user_bubble_width_ratio = 0.75
         self.setup_ui()
     
     def setup_ui(self):
@@ -2970,6 +4531,7 @@ class ChatPage(QWidget):
         self.sidebar.thread_selected.connect(self.switch_thread)
         self.sidebar.new_thread_requested.connect(self.create_thread)
         self.sidebar.delete_thread_requested.connect(self.delete_thread)
+        self.sidebar.delete_path_requested.connect(self.delete_project_path)
         self.sidebar_btn = QToolButton()
         self.sidebar_btn.setText("›")
         self.sidebar_btn.setFixedSize(22, 34)
@@ -3100,6 +4662,9 @@ class ChatPage(QWidget):
                                                border: 1px solid {COLORS['border']};
                                                border-radius: 18px;
                                            }}
+                                           QScrollArea QWidget#qt_scrollarea_viewport {{
+                                               background: {COLORS['surface']};
+                                           }}
                                            QScrollArea > QWidget > QWidget {{
                                                background: {COLORS['surface']};
                                            }}
@@ -3118,13 +4683,81 @@ class ChatPage(QWidget):
                                            }}
                                        """)
         self.chat_container = QWidget()
+        self.chat_container.setStyleSheet(f"background: {COLORS['surface']};")
         self.chat_layout = QVBoxLayout(self.chat_container)
-        self.chat_layout.setAlignment(Qt.AlignTop)
-        self.chat_layout.setSpacing(10)
-        self.chat_layout.setContentsMargins(14, 14, 14, 14)
+        self.chat_root_layout = self.chat_layout
+        self.chat_root_layout.setAlignment(Qt.AlignTop)
+        self.chat_root_layout.setSpacing(0)
+        self.chat_layout.setContentsMargins(0, 0, 0, 0)
+        self.chat_column = QWidget()
+        self.chat_column.setStyleSheet(f"background: {COLORS['surface']};")
+        self.chat_column.setMaximumWidth(self.chat_column_max_width)
+        self.chat_column.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Maximum)
+        self.chat_column_layout = QVBoxLayout(self.chat_column)
+        self.chat_column_layout.setAlignment(Qt.AlignTop)
+        self.chat_column_layout.setSpacing(10)
+        self.chat_column_layout.setContentsMargins(14, 14, 14, 14)
+        self.chat_root_layout.addWidget(self.chat_column, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self.chat_layout = self.chat_column_layout
         self.scroll_area.setWidget(self.chat_container)
+        self.scroll_area.viewport().setStyleSheet(f"background: {COLORS['surface']};")
+        self.scroll_area.viewport().installEventFilter(self)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self.on_chat_scroll_changed)
         right_layout.addWidget(self.scroll_area, 1)
+
+        self.automation_composer = QFrame()
+        self.automation_composer.setObjectName("automationComposer")
+        self.automation_composer.setVisible(False)
+        self.automation_composer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.automation_composer.setStyleSheet(f"""
+            QFrame#automationComposer {{
+                background: {COLORS['surface']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 18px;
+            }}
+        """)
+        composer_layout = QHBoxLayout(self.automation_composer)
+        composer_layout.setContentsMargins(10, 8, 8, 8)
+        composer_layout.setSpacing(8)
+        self.automation_input = QTextEdit()
+        self.automation_input.setPlaceholderText("输入下一步需求...")
+        self.automation_input.setFixedHeight(54)
+        self.automation_input.setAcceptRichText(False)
+        self.automation_input.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.automation_input.customContextMenuRequested.connect(
+            lambda pos, editor=self.automation_input: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
+        )
+        self.automation_input.setStyleSheet(f"""
+            QTextEdit {{
+                background: transparent;
+                color: {COLORS['text']};
+                border: none;
+                padding: 3px 4px;
+                font-size: 13px;
+            }}
+            QScrollBar:vertical {{
+                width: 0;
+                background: transparent;
+            }}
+        """)
+        composer_layout.addWidget(self.automation_input, 1)
+        self.automation_send_btn = QToolButton(cursor=Qt.CursorShape.PointingHandCursor)
+        self.automation_send_btn.setFixedSize(42, 42)
+        self.automation_send_btn.setIcon(line_icon("send", "white", 20))
+        self.automation_send_btn.setIconSize(QSize(20, 20))
+        self.automation_send_btn.clicked.connect(self.on_automation_composer_action)
+        self.automation_send_btn.setStyleSheet(f"""
+            QToolButton {{
+                background: {COLORS['accent']};
+                border: none;
+                border-radius: 21px;
+            }}
+            QToolButton:hover {{
+                background: {COLORS['accent_dark']};
+            }}
+        """)
+        composer_layout.addWidget(self.automation_send_btn, 0, Qt.AlignmentFlag.AlignBottom)
+        right_layout.addWidget(self.automation_composer, 0)
 
         self.empty_state = QLabel("新会话会先生成提示词气泡；点击气泡右上角的跳过继续。", alignment=Qt.AlignCenter)
         self.empty_state.setStyleSheet(f"""
@@ -3171,13 +4804,15 @@ class ChatPage(QWidget):
         self.terminal_panel.close_all_processes()
         self.terminal_panel.collapse()
         self.project_root = path
-        self.thread_id = DEFAULT_THREAD_ID
         self.threads = load_workspace_threads(path)
         save_workspace_threads(path, self.threads)
+        self.thread_id = load_last_thread_id(path, self.threads)
         self.path_label.setText(f"📁 {path}")
         self.terminal_panel.set_project_root(path)
         self.sidebar.refresh_tree(path)
         self.sidebar.set_threads(self.threads, self.thread_id)
+        self.sidebar.set_tab("threads")
+        self.expand_sidebar()
         self.load_history()
         self.update_prompt_tools_responsive()
         self.update_status_bar()
@@ -3194,7 +4829,65 @@ class ChatPage(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self.update_chat_column_width()
         self.update_prompt_tools_responsive()
+
+    def eventFilter(self, watched, event):
+        if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
+            self.update_chat_column_width()
+        return super().eventFilter(watched, event)
+
+    def update_chat_column_width(self):
+        if not hasattr(self, "chat_column") or not hasattr(self, "scroll_area"):
+            return
+        viewport_width = self.scroll_area.viewport().width()
+        if viewport_width <= 0:
+            return
+        desired = int(viewport_width * self.chat_column_width_ratio)
+        desired = max(620, min(self.chat_column_max_width, desired))
+        if viewport_width < desired:
+            desired = max(320, viewport_width - 2)
+        if self.chat_column.width() != desired:
+            self.chat_column.setFixedWidth(desired)
+        self.update_user_bubble_widths()
+
+    def user_bubble_width(self) -> int:
+        if not hasattr(self, "chat_column"):
+            return 560
+        margins = self.chat_column_layout.contentsMargins() if hasattr(self, "chat_column_layout") else None
+        horizontal_margin = (margins.left() + margins.right()) if margins is not None else 0
+        available = max(320, self.chat_column.width() - horizontal_margin)
+        return max(320, int(available * self.user_bubble_width_ratio))
+
+    def prepare_chat_widget(self, widget: QWidget):
+        if isinstance(widget, ChatBubble) and getattr(widget, "role", "") == "user":
+            widget.setFixedWidth(self.user_bubble_width())
+            widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def add_chat_widget(self, widget: QWidget, *, animate: bool = False):
+        self.prepare_chat_widget(widget)
+        if isinstance(widget, ChatBubble) and getattr(widget, "role", "") == "user":
+            self.chat_layout.addWidget(widget, 0, Qt.AlignmentFlag.AlignRight)
+        else:
+            self.chat_layout.addWidget(widget)
+        if animate:
+            animate_widget_in(widget)
+
+    def insert_chat_widget(self, index: int, widget: QWidget, *, animate: bool = False):
+        self.prepare_chat_widget(widget)
+        alignment = Qt.AlignmentFlag.AlignRight if isinstance(widget, ChatBubble) and getattr(widget, "role", "") == "user" else Qt.Alignment()
+        self.chat_layout.insertWidget(index, widget, 0, alignment)
+        if animate:
+            animate_widget_in(widget)
+
+    def update_user_bubble_widths(self):
+        if not hasattr(self, "chat_layout"):
+            return
+        width = self.user_bubble_width()
+        for idx in range(self.chat_layout.count()):
+            widget = self.chat_layout.itemAt(idx).widget()
+            if isinstance(widget, ChatBubble) and getattr(widget, "role", "") == "user":
+                widget.setFixedWidth(width)
 
     def update_prompt_tools_responsive(self):
         if not hasattr(self, "copy_prompt_btn"):
@@ -3212,6 +4905,12 @@ class ChatPage(QWidget):
         self.sidebar.toggle()
         self.sidebar_btn.setText("‹" if not self.sidebar._collapsed else "›")
         self.sidebar_resize_handle.set_grip_visible(not self.sidebar._collapsed)
+        self.update_sidebar_wrapper_width()
+
+    def expand_sidebar(self):
+        self.sidebar.expand()
+        self.sidebar_btn.setText("‹")
+        self.sidebar_resize_handle.set_grip_visible(True)
         self.update_sidebar_wrapper_width()
 
     def resize_sidebar(self, width: int):
@@ -3238,11 +4937,38 @@ class ChatPage(QWidget):
     def is_execution_running(self) -> bool:
         return bool(self.worker and self.worker.isRunning())
 
+    def is_automation_request_running(self) -> bool:
+        return bool(self.automation_worker and self.automation_worker.isRunning())
+
+    def is_automation_busy(self) -> bool:
+        return self.automation_loop_active or self.is_automation_request_running()
+
+    def begin_automation_loop(self, goal: str):
+        self.automation_loop_active = True
+        self.automation_loop_round = 1
+        self.automation_loop_goal = goal.strip()
+        self.refresh_prompt_bubble_buttons()
+        self.update_automation_composer_state()
+
+    def stop_automation_loop(self, message: str = "", ensure_manual_entry: bool = False):
+        self.automation_loop_active = False
+        self.automation_loop_round = 0
+        self.automation_loop_goal = ""
+        self.refresh_prompt_bubble_buttons()
+        self.update_automation_composer_state()
+        if message:
+            self.add_status_bubble(message)
+        if ensure_manual_entry:
+            if self.automation_enabled:
+                self.show_automation_composer(focus=False)
+            else:
+                self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
+    
     def on_chat_scroll_changed(self, _value: int):
         return
 
     def schedule_ensure_ai_response_entry(self):
-        if self._ensure_ai_entry_pending or self.is_execution_running():
+        if self.automation_enabled or self._ensure_ai_entry_pending or self.is_execution_running():
             return
         self._ensure_ai_entry_pending = True
 
@@ -3254,7 +4980,7 @@ class ChatPage(QWidget):
         QTimer.singleShot(0, run)
 
     def ensure_ai_response_entry(self, focus: bool = False, animate: bool = True, keep_visible: bool = True):
-        if self.is_execution_running():
+        if self.automation_enabled or self.is_execution_running():
             return
         existing_frame = self.find_open_ai_response_frame()
         if existing_frame is None:
@@ -3266,7 +4992,7 @@ class ChatPage(QWidget):
                 QTimer.singleShot(60, ai_input.setFocus)
 
     def keep_ai_response_visible(self):
-        if self.find_open_ai_response_frame() is None:
+        if self.automation_enabled or self.find_open_ai_response_frame() is None:
             return
         for delay in (0, 80, 180):
             QTimer.singleShot(delay, self.scroll_to_bottom_now)
@@ -3276,20 +5002,474 @@ class ChatPage(QWidget):
 
     def show_settings_menu(self):
         menu = QMenu(self)
-        for title in (
-            "字号大小（待实现）",
-            "主题颜色（待实现）",
-            "语言设置（待实现）",
-            "自动化插件（待实现）",
-        ):
+        runtime_toggle = SettingsToggleRow(
+            "Python 运行环境",
+            "优先使用 Agent 缓存 Python",
+            agent_runtime_enabled(),
+            parent=menu,
+        )
+        runtime_toggle.toggled.connect(self.set_python_runtime_enabled)
+        runtime_toggle_action = QWidgetAction(menu)
+        runtime_toggle_action.setDefaultWidget(runtime_toggle)
+        menu.addAction(runtime_toggle_action)
+
+        automation_toggle = SettingsToggleRow(
+            "自动化插件",
+            "后台自动复制与执行循环",
+            self.automation_enabled,
+            parent=menu,
+        )
+        automation_toggle.toggled.connect(lambda enabled, row=automation_toggle: self.set_automation_enabled(enabled, row))
+        automation_toggle_action = QWidgetAction(menu)
+        automation_toggle_action.setDefaultWidget(automation_toggle)
+        menu.addAction(automation_toggle_action)
+        menu.addSeparator()
+
+        runtime_menu = menu.addMenu("Python 运行环境")
+        runtime_status_action = QAction("检查运行环境", self)
+        runtime_status_action.triggered.connect(self.show_python_runtime_status)
+        runtime_menu.addAction(runtime_status_action)
+        runtime_install_action = QAction("安装/修复文档处理环境", self)
+        runtime_install_action.triggered.connect(lambda: self.run_python_runtime_setup("install"))
+        runtime_menu.addAction(runtime_install_action)
+        runtime_open_action = QAction("打开运行环境目录", self)
+        runtime_open_action.triggered.connect(self.open_python_runtime_dir)
+        runtime_menu.addAction(runtime_open_action)
+        runtime_copy_action = QAction("复制 Python 路径", self)
+        runtime_copy_action.triggered.connect(self.copy_python_runtime_path)
+        runtime_menu.addAction(runtime_copy_action)
+
+        automation_menu = menu.addMenu("自动化插件")
+
+        model_menu = automation_menu.addMenu("模型")
+        for label, model_id in AUTOMATION_MODELS:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(self.automation_model == model_id)
+            action.triggered.connect(lambda _checked=False, value=model_id: self.set_automation_model(value))
+            model_menu.addAction(action)
+
+        rounds_menu = automation_menu.addMenu("自动化最大轮数")
+        for rounds in (8, 12, 20, 50, 100):
+            action = QAction(f"{rounds} 轮", self)
+            action.setCheckable(True)
+            action.setChecked(self.automation_loop_max_rounds == rounds)
+            action.triggered.connect(lambda _checked=False, value=rounds: self.set_automation_max_rounds(value))
+            rounds_menu.addAction(action)
+
+        automation_menu.addSeparator()
+        status_action = QAction("检查插件状态", self)
+        status_action.triggered.connect(self.show_automation_status)
+        automation_menu.addAction(status_action)
+        install_action = QAction("安装/修复插件依赖", self)
+        install_action.triggered.connect(lambda: self.run_automation_setup("install"))
+        automation_menu.addAction(install_action)
+        login_action = QAction("打开网页登录", self)
+        login_action.triggered.connect(lambda: self.run_automation_setup("login"))
+        automation_menu.addAction(login_action)
+        open_plugin_dir_action = QAction("打开插件目录", self)
+        open_plugin_dir_action.triggered.connect(self.open_automation_plugin_dir)
+        automation_menu.addAction(open_plugin_dir_action)
+        copy_plugin_dir_action = QAction("复制插件目录路径", self)
+        copy_plugin_dir_action.triggered.connect(self.copy_automation_plugin_dir)
+        automation_menu.addAction(copy_plugin_dir_action)
+
+        menu.addSeparator()
+        for title in ("字号大小（待实现）", "主题颜色（待实现）", "语言设置（待实现）"):
             action = QAction(title, self)
             action.setEnabled(False)
             menu.addAction(action)
-        menu.addSeparator()
-        note = QAction("自动化将作为可选扩展下载", self)
-        note.setEnabled(False)
-        menu.addAction(note)
         menu.exec(self.settings_btn.mapToGlobal(self.settings_btn.rect().bottomRight()))
+
+    def set_automation_model(self, model_id: str):
+        self.automation_model = model_id
+
+    def set_automation_max_rounds(self, rounds: int):
+        self.automation_loop_max_rounds = max(1, int(rounds))
+
+    def set_python_runtime_enabled(self, enabled: bool):
+        set_agent_runtime_enabled(enabled)
+        self.refresh_prompt_bubble_buttons()
+
+    def set_automation_enabled(self, enabled: bool, toggle_row: Optional[SettingsToggleRow] = None):
+        if not enabled:
+            self.automation_enabled = False
+            self.automation_loop_active = False
+            self.automation_loop_round = 0
+            self.automation_loop_goal = ""
+            self.hide_automation_composer()
+            self.refresh_prompt_bubble_buttons()
+            return
+        status = self.automation_manager.dependency_status()
+        if not status.get("ready"):
+            self.automation_enabled = False
+            if toggle_row is not None:
+                toggle_row.setChecked(False)
+            styled_warning(
+                self,
+                "自动化插件未就绪",
+                "插件依赖还没有准备好。请先在设置里点击“安装/修复插件依赖”。\n\n" + str(status.get("message", ""))[-800:],
+            )
+            return
+        self.automation_enabled = True
+        self.remove_ai_response_frame()
+        self.remove_empty_automation_prompt_bubbles()
+        self.show_automation_composer(focus=False)
+        self.refresh_prompt_bubble_buttons()
+        self.run_automation_setup("start")
+
+    def show_automation_status(self):
+        styled_warning(self, "自动化插件状态", self.automation_manager.status_text())
+
+    def open_automation_plugin_dir(self):
+        path = self.automation_manager.plugin_root
+        os.makedirs(path, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        self.add_status_bubble(f"插件目录：{path}")
+
+    def copy_automation_plugin_dir(self):
+        path = self.automation_manager.plugin_root
+        os.makedirs(path, exist_ok=True)
+        QApplication.clipboard().setText(path)
+        self.add_status_bubble(f"已复制插件目录路径：{path}")
+
+    def show_python_runtime_status(self):
+        styled_warning(self, "Python 运行环境", agent_runtime_status_text())
+
+    def open_python_runtime_dir(self):
+        path = runtime_cache_root()
+        os.makedirs(path, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        self.add_status_bubble(f"Python 运行环境目录：{path}")
+
+    def copy_python_runtime_path(self):
+        python_bin = ensure_agent_runtime(create=False)
+        text = python_bin or "未安装 Agent Python 运行环境，当前使用系统 PATH。"
+        QApplication.clipboard().setText(text)
+        self.add_status_bubble(f"已复制 Python 路径：{text}")
+
+    def run_python_runtime_setup(self, action: str):
+        if self.python_runtime_setup_worker and self.python_runtime_setup_worker.isRunning():
+            styled_warning(self, "Python 运行环境", "已有 Python 环境任务正在运行。")
+            return
+        worker = PythonRuntimeSetupWorker(action)
+        self.python_runtime_setup_worker = worker
+
+        def on_status(_message: str):
+            self.copy_prompt_btn.setText("Python处理中")
+
+        def on_finished(ok: bool, message: str):
+            self.python_runtime_setup_worker = None
+            self.copy_prompt_btn.setText("复制系统提示词")
+            if ok:
+                self.add_status_bubble(message)
+            else:
+                styled_warning(self, "Python 运行环境", message)
+            worker.deleteLater()
+
+        worker.status_signal.connect(on_status)
+        worker.finished_signal.connect(on_finished)
+        worker.start()
+
+    def run_automation_setup(self, action: str):
+        if self.automation_setup_worker and self.automation_setup_worker.isRunning():
+            styled_warning(self, "自动化插件", "已有插件任务正在运行。")
+            return
+        worker = AutomationSetupWorker(self.automation_manager, action, self.automation_model)
+        self.automation_setup_worker = worker
+
+        def on_status(message: str):
+            self.copy_prompt_btn.setText("插件处理中")
+
+        def on_finished(ok: bool, message: str):
+            self.automation_setup_worker = None
+            self.copy_prompt_btn.setText("复制系统提示词")
+            if ok:
+                if action == "start":
+                    self.automation_enabled = True
+                    self.remove_ai_response_frame()
+                    self.remove_empty_automation_prompt_bubbles()
+                    self.show_automation_composer(focus=False)
+                    self.refresh_prompt_bubble_buttons()
+                if action != "start":
+                    self.add_status_bubble(message)
+            else:
+                self.automation_enabled = False if action == "start" else self.automation_enabled
+                self.refresh_prompt_bubble_buttons()
+                styled_warning(self, "自动化插件", message)
+            worker.deleteLater()
+
+        worker.status_signal.connect(on_status)
+        worker.finished_signal.connect(on_finished)
+        worker.start()
+
+    def delete_project_path(self, path: str):
+        if not self.project_root:
+            return
+        if self.is_execution_running() or self.is_automation_busy():
+            styled_warning(self, "正在执行", "当前还有本地命令或自动化任务在运行，先等它结束后再删除文件。")
+            return
+
+        root = os.path.abspath(self.project_root)
+        target = os.path.abspath(path)
+        try:
+            inside_workspace = os.path.commonpath([root, target]) == root
+        except ValueError:
+            inside_workspace = False
+        if not inside_workspace:
+            styled_warning(self, "删除失败", "只能删除当前工作区内部的文件或文件夹。")
+            return
+        if target == root:
+            styled_warning(self, "删除失败", "不能从文件树里删除整个工作区。")
+            return
+        if not os.path.lexists(target):
+            styled_warning(self, "删除失败", "这个路径已经不存在。")
+            self.sidebar.refresh_tree(self.project_root)
+            return
+
+        rel_path = os.path.relpath(target, root)
+        is_dir = os.path.isdir(target) and not os.path.islink(target)
+        text = (
+            f"确定删除文件夹「{rel_path}」吗？\n\n文件夹内的内容会一起删除。"
+            if is_dir
+            else f"确定删除文件「{rel_path}」吗？"
+        )
+        ok = styled_confirm(
+            self,
+            "删除文件夹" if is_dir else "删除文件",
+            text,
+            confirm_text="删除",
+            destructive=True,
+        )
+        if not ok:
+            return
+
+        try:
+            if is_dir:
+                shutil.rmtree(target)
+            else:
+                os.remove(target)
+        except OSError as exc:
+            styled_warning(self, "删除失败", str(exc))
+            return
+        self.sidebar.refresh_tree(self.project_root)
+        self.add_status_bubble(f"已删除：{rel_path}")
+
+    def refresh_prompt_bubble_buttons(self):
+        for idx in range(self.chat_layout.count()):
+            widget = self.chat_layout.itemAt(idx).widget()
+            if isinstance(widget, ChatBubble) and getattr(widget, "role", "") == "user":
+                widget.max_content_height = 90 if self.automation_enabled else 180
+                widget.update_content(self.prompt_bubble_display_text(widget.content))
+                paste_btn = getattr(widget, "paste_ai_btn", None)
+                if paste_btn is not None:
+                    paste_btn.setVisible(not self.automation_enabled)
+                button = getattr(widget, "copy_btn", None)
+                if button is not None:
+                    if self.automation_loop_active:
+                        widget.copy_text = "自动执行中"
+                        button.setEnabled(False)
+                    else:
+                        widget.copy_text = "发送给 AI" if self.automation_enabled else "复制提示词"
+                        button.setEnabled(True)
+                    button.setText(widget.copy_text)
+
+    def add_status_bubble(self, text: str):
+        self.hide_empty_state()
+        bubble = ChatBubble(
+            "system",
+            text,
+            parent=self.chat_container,
+            scrollable=False,
+            max_content_height=120,
+        )
+        self.add_chat_widget(bubble, animate=True)
+        self.scroll_to_bottom()
+
+    def show_automation_composer(self, focus: bool = False):
+        if self.automation_composer is None:
+            return
+        self.automation_composer.setVisible(bool(self.automation_enabled))
+        self.update_automation_composer_state()
+        if focus and self.automation_input is not None:
+            QTimer.singleShot(60, self.automation_input.setFocus)
+
+    def hide_automation_composer(self):
+        if self.automation_composer is not None:
+            self.automation_composer.setVisible(False)
+
+    def update_automation_composer_state(self):
+        if self.automation_send_btn is None or self.automation_input is None:
+            return
+        busy = self.is_automation_request_running()
+        self.automation_input.setEnabled(not busy and not self.is_execution_running())
+        if busy:
+            self.automation_send_btn.setIcon(line_icon("pause", "white", 20))
+            self.automation_send_btn.setStyleSheet(f"""
+                QToolButton {{
+                    background: #8b95aa;
+                    border: none;
+                    border-radius: 21px;
+                }}
+                QToolButton:hover {{
+                    background: #6f7788;
+                }}
+            """)
+        else:
+            self.automation_send_btn.setIcon(line_icon("send", "white", 20))
+            self.automation_send_btn.setStyleSheet(f"""
+                QToolButton {{
+                    background: {COLORS['accent']};
+                    border: none;
+                    border-radius: 21px;
+                }}
+                QToolButton:hover {{
+                    background: {COLORS['accent_dark']};
+                }}
+            """)
+
+    def on_automation_composer_action(self):
+        if self.is_automation_request_running():
+            self.cancel_automation_request()
+            return
+        self.submit_automation_prompt_from_composer()
+
+    def cancel_automation_request(self):
+        worker = self.automation_worker
+        if worker is not None:
+            worker.requestInterruption()
+            worker.terminate()
+            if worker.wait(1200):
+                worker.deleteLater()
+            else:
+                worker.finished.connect(worker.deleteLater)
+            self.automation_worker = None
+        self.stop_automation_preview(remove_bubble=True)
+        self.stop_automation_loop("", ensure_manual_entry=True)
+
+    def submit_automation_prompt_from_composer(self):
+        if not self.automation_enabled:
+            return
+        if self.automation_loop_active or self.is_automation_request_running():
+            styled_warning(self, "自动化执行中", "当前自动化循环还没有结束。")
+            return
+        if self.is_execution_running():
+            styled_warning(self, "正在执行", "当前本地命令还没有执行完成。")
+            return
+        text = self.automation_input.toPlainText().strip() if self.automation_input is not None else ""
+        if not text:
+            styled_warning(self, "缺少需求", "请先输入一句你想让 Agent 完成的需求。")
+            if self.automation_input is not None:
+                self.automation_input.setFocus()
+            return
+        if self.automation_input is not None:
+            self.automation_input.clear()
+        full_prompt = self.build_system_prompt(text)
+        prompt_entry_id = self.add_automation_user_prompt_bubble(full_prompt, animate=True)
+        self.begin_automation_loop(text)
+        self.start_automation_worker(
+            text,
+            "",
+            None,
+            None,
+            prompt_entry_id,
+        )
+
+    def add_automation_user_prompt_bubble(self, full_prompt: str, animate: bool = True) -> str:
+        self.hide_empty_state()
+        entry_id = uuid.uuid4().hex
+        bubble = ChatBubble(
+            "user",
+            self.prompt_bubble_display_text(full_prompt),
+            parent=self.chat_container,
+            show_copy=False,
+            show_prompt_input=False,
+            scrollable=False,
+            max_content_height=90,
+            compact_user=True,
+        )
+        bubble.content = full_prompt
+        bubble.history_entry_id = entry_id
+        self.add_chat_widget(bubble, animate=animate)
+        self.append_history({
+            "id": entry_id,
+            "type": "prompt",
+            "content": full_prompt,
+        })
+        self.scroll_to_bottom()
+        return entry_id
+
+    def remove_empty_automation_prompt_bubbles(self):
+        for idx in range(self.chat_layout.count() - 1, -1, -1):
+            widget = self.chat_layout.itemAt(idx).widget()
+            if not isinstance(widget, ChatBubble) or getattr(widget, "role", "") != "user":
+                continue
+            content = getattr(widget, "content", "")
+            if self.prompt_text_from_system_prompt(content).strip():
+                continue
+            self.chat_layout.removeWidget(widget)
+            widget.deleteLater()
+
+    def create_automation_preview_bubble(self) -> QFrame:
+        self.hide_empty_state()
+        frame = ChatBubble(
+            "ai",
+            "等待模型输出...",
+            parent=self.chat_container,
+            markdown=True,
+            expand_to_content=True,
+            flat=True,
+        )
+        role_label = frame.findChild(QLabel)
+        if role_label is not None:
+            role_label.setText("AI 正在回复")
+        status = QLabel("等待网页开始生成...")
+        status.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; background: transparent;")
+        frame.layout().insertWidget(1, status)
+        frame.preview_status = status
+        self.add_chat_widget(frame, animate=True)
+        self.scroll_to_bottom()
+        return frame
+
+    def start_automation_preview(self):
+        self.stop_automation_preview(remove_bubble=True)
+        self.automation_preview_bubble = self.create_automation_preview_bubble()
+        worker = AutomationPreviewWorker(self.automation_manager, self.automation_model, self.thread_id)
+        self.automation_preview_worker = worker
+        worker.preview_signal.connect(self.update_automation_preview)
+        worker.start()
+
+    def stop_automation_preview(self, remove_bubble: bool = False):
+        worker = self.automation_preview_worker
+        if worker is not None:
+            worker.stop()
+            if worker.wait(1500):
+                worker.deleteLater()
+            else:
+                worker.finished.connect(worker.deleteLater)
+            self.automation_preview_worker = None
+        if remove_bubble and self.automation_preview_bubble is not None:
+            bubble = self.automation_preview_bubble
+            self.automation_preview_bubble = None
+            self.chat_layout.removeWidget(bubble)
+            bubble.deleteLater()
+
+    def update_automation_preview(self, preview: dict):
+        bubble = self.automation_preview_bubble
+        if bubble is None:
+            return
+        should_follow_bottom = self.is_chat_at_bottom()
+        text = str(preview.get("text") or "").strip()
+        chars = int(preview.get("chars") or len(text))
+        status = getattr(bubble, "preview_status", None)
+        if status is not None:
+            status.setText(f"已生成约 {chars} 字，最终执行会等待完整复制结果")
+        if text:
+            if looks_like_automation_context_payload(text):
+                return
+            bubble.update_content(text)
+        if should_follow_bottom:
+            self.scroll_to_bottom()
 
     def build_system_prompt(self, user_text: str) -> str:
         raw_prompt = user_text.strip()
@@ -3297,8 +5477,17 @@ class ChatPage(QWidget):
         return SYSTEM_PROMPT.format(
             project_root=self.project_root,
             user_prompt=prompt,
+            done_marker=AUTOMATION_DONE_MARKER,
             **runtime_environment(),
         ) + f"\n{PROMPT_BUBBLE_MARKER}{base64.b64encode(raw_prompt.encode('utf-8')).decode('ascii')} -->"
+
+    def build_automation_system_text(self) -> str:
+        return SYSTEM_PROMPT.format(
+            project_root=self.project_root,
+            user_prompt="当前指令见第三段 plaintext，不要把本段当作用户需求重复执行。",
+            done_marker=AUTOMATION_DONE_MARKER,
+            **runtime_environment(),
+        )
 
     def prompt_text_from_system_prompt(self, full_prompt: str) -> str:
         match = re.search(r"<!-- agent_qt_user_prompt:([A-Za-z0-9+/=]*) -->\s*$", full_prompt)
@@ -3312,7 +5501,68 @@ class ChatPage(QWidget):
     def display_prompt_text(self, full_prompt: str) -> str:
         return re.sub(r"\n?<!-- agent_qt_user_prompt:[A-Za-z0-9+/=]* -->\s*$", "", full_prompt)
 
+    def prompt_bubble_display_text(self, full_prompt: str) -> str:
+        if not self.automation_enabled:
+            return self.display_prompt_text(full_prompt)
+        user_text = self.prompt_text_from_system_prompt(full_prompt).strip()
+        if user_text:
+            return user_text
+        return ""
+
+    def compact_automation_entry_text(self, text: str, limit: int = AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT) -> str:
+        return truncate_middle(str(text or "").strip(), limit)
+
+    def automation_history_text_for_entry(self, entry: Dict[str, object]) -> str:
+        entry_type = str(entry.get("type") or "")
+        content = str(entry.get("content") or "").strip()
+        if not content:
+            return ""
+        if entry_type == "prompt":
+            user_text = self.prompt_text_from_system_prompt(content).strip()
+            if not user_text:
+                return ""
+            return "【用户需求】\n" + self.compact_automation_entry_text(user_text, 2000)
+        if entry_type == "ai":
+            return "【AI 回复】\n" + self.compact_automation_entry_text(content)
+        if entry_type == "result":
+            return "【本地执行结果和文件变更】\n" + self.compact_automation_entry_text(content)
+        return ""
+
+    def build_automation_messages(self, current_prompt: str, skip_entry_id: str = "") -> List[Dict[str, str]]:
+        system_context = self.build_automation_system_text() + (
+            "\n\n补充说明：provider 每次可能会打开新的网页对话，所以第二段包含 Agent Qt 保存的本会话上下文。"
+            "请把这些上下文视为连续对话历史。上下文按纯文本给出，不是 JSON 或工具调用协议。"
+        )
+        current_prompt = str(current_prompt or "").strip()
+        budget = max(4000, AUTOMATION_CONTEXT_CHAR_LIMIT - len(current_prompt) - len(system_context))
+        selected: List[str] = []
+        used = 0
+        for entry in reversed(self.history_entries):
+            if skip_entry_id and str(entry.get("id") or "") == skip_entry_id:
+                continue
+            text = self.automation_history_text_for_entry(entry)
+            if not text:
+                continue
+            text_len = len(text)
+            if selected and used + text_len > budget:
+                break
+            if text_len > budget:
+                text = truncate_middle(text, max(1200, budget))
+                text_len = len(text)
+            selected.append(text)
+            used += text_len
+        history_text = "\n\n".join(reversed(selected)).strip() or "（暂无历史对话）"
+        combined = "\n\n".join([
+            plaintext_fence("第一段：系统提示词", system_context),
+            plaintext_fence("第二段：历史对话", history_text),
+            plaintext_fence("第三段：当前指令", current_prompt),
+        ])
+        return [{"role": "user", "content": combined}]
+
     def append_prompt_bubble_from_toolbar(self):
+        if self.automation_enabled:
+            self.show_automation_composer(focus=True)
+            return
         full_prompt = self.build_system_prompt("")
         self.copy_prompt_btn.setText("已添加")
         QTimer.singleShot(1200, lambda: self.copy_prompt_btn.setText("复制系统提示词"))
@@ -3322,15 +5572,90 @@ class ChatPage(QWidget):
     def copy_prompt_bubble(self, bubble: ChatBubble):
         prompt_input = getattr(bubble, "prompt_input", None)
         user_text = prompt_input.text() if prompt_input is not None else self.prompt_text_from_system_prompt(bubble.content)
+        if self.automation_enabled and not user_text.strip():
+            styled_warning(self, "缺少需求", "请先输入一句你想让 Agent 完成的需求。")
+            if prompt_input is not None:
+                prompt_input.setFocus()
+            return
         full_prompt = self.build_system_prompt(user_text)
-        bubble.update_content(self.display_prompt_text(full_prompt))
+        bubble.update_content(self.prompt_bubble_display_text(full_prompt))
         bubble.content = full_prompt
+        if self.automation_enabled:
+            self.update_prompt_history_entry(getattr(bubble, "history_entry_id", ""), full_prompt)
+            self.send_prompt_bubble_to_provider(bubble, full_prompt)
+            return
         QApplication.clipboard().setText(self.display_prompt_text(full_prompt))
         copy_btn = getattr(bubble, "copy_btn", None)
         if copy_btn is not None:
             copy_btn.setText("已复制")
             QTimer.singleShot(1000, lambda: copy_btn.setText(bubble.copy_text))
         self.update_prompt_history_entry(getattr(bubble, "history_entry_id", ""), full_prompt)
+
+    def send_prompt_bubble_to_provider(self, bubble: ChatBubble, full_prompt: str):
+        if self.automation_loop_active or self.is_automation_request_running():
+            styled_warning(self, "自动化执行中", "当前自动化循环还没有结束。")
+            return
+        if self.is_execution_running():
+            styled_warning(self, "正在执行", "当前本地命令还没有执行完成。")
+            return
+        goal = self.prompt_text_from_system_prompt(full_prompt).strip()
+        self.begin_automation_loop(goal)
+        self.start_automation_worker(
+            goal,
+            "",
+            getattr(bubble, "copy_btn", None),
+            bubble,
+            getattr(bubble, "history_entry_id", ""),
+        )
+
+    def start_automation_worker(
+        self,
+        prompt: str,
+        status_text: str,
+        copy_btn: Optional[QPushButton] = None,
+        source_bubble: Optional[ChatBubble] = None,
+        skip_entry_id: str = "",
+    ):
+        if self.is_automation_request_running():
+            styled_warning(self, "自动化执行中", "已有一轮 AI 自动化请求正在等待回复。")
+            return
+        if self.is_execution_running():
+            styled_warning(self, "正在执行", "当前本地命令还没有执行完成。")
+            return
+        if copy_btn is not None:
+            copy_btn.setEnabled(False)
+            copy_btn.setText("等待 AI...")
+        if status_text:
+            self.add_status_bubble(status_text)
+        messages = self.build_automation_messages(prompt, skip_entry_id=skip_entry_id)
+        worker = AutomationChatWorker(
+            self.automation_manager,
+            messages,
+            self.automation_model,
+            self.thread_id,
+        )
+        self.automation_worker = worker
+        self.update_automation_composer_state()
+        self.start_automation_preview()
+
+        def on_finished(text: str, error: str):
+            self.automation_worker = None
+            self.stop_automation_preview(remove_bubble=True)
+            self.update_automation_composer_state()
+            if copy_btn is not None and not self.automation_loop_active:
+                copy_btn.setEnabled(True)
+                copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
+            if error:
+                self.stop_automation_loop("自动化循环已暂停。", ensure_manual_entry=True)
+                if "网页登录还没有准备好" in error:
+                    self.add_status_bubble("需要先完成网页登录。请使用设置里的“打开网页登录”，登录后重新发送。")
+                styled_warning(self, "AI 自动化失败", error)
+            else:
+                self.handle_ai_response_text(text)
+            worker.deleteLater()
+
+        worker.finished_signal.connect(on_finished)
+        worker.start()
 
     def update_prompt_history_entry(self, entry_id: str, full_prompt: str):
         if not entry_id:
@@ -3342,6 +5667,9 @@ class ChatPage(QWidget):
                 return
 
     def copy_system_prompt(self):
+        if self.automation_enabled:
+            self.show_automation_composer(focus=True)
+            return
         full_prompt = self.build_system_prompt("")
         QApplication.clipboard().setText(self.display_prompt_text(full_prompt))
         self.copy_prompt_btn.setText("已复制")
@@ -3354,22 +5682,23 @@ class ChatPage(QWidget):
         history_entry_id = uuid.uuid4().hex if save else ""
         prompt_bubble = ChatBubble(
             "user",
-            self.display_prompt_text(full_prompt),
+            self.prompt_bubble_display_text(full_prompt),
             show_copy=True,
             parent=self.chat_container,
-            copy_text="复制提示词",
-            show_paste_ai=True,
+            copy_text="自动执行中" if self.automation_loop_active else ("发送给 AI" if self.automation_enabled else "复制提示词"),
+            show_paste_ai=not self.automation_enabled,
             prompt_input_text=self.prompt_text_from_system_prompt(full_prompt),
             scrollable=True,
-            max_content_height=180,
+            max_content_height=90 if self.automation_enabled else 180,
         )
         prompt_bubble.content = full_prompt
         prompt_bubble.history_entry_id = history_entry_id
         prompt_bubble.copy_requested.connect(lambda bubble=prompt_bubble: self.copy_prompt_bubble(bubble))
-        prompt_bubble.paste_ai_requested.connect(lambda: self.add_ai_response_frame(focus=True))
-        self.chat_layout.addWidget(prompt_bubble)
-        if animate:
-            animate_widget_in(prompt_bubble)
+        if not self.automation_enabled:
+            prompt_bubble.paste_ai_requested.connect(lambda: self.add_ai_response_frame(focus=True))
+        if self.automation_loop_active and getattr(prompt_bubble, "copy_btn", None) is not None:
+            prompt_bubble.copy_btn.setEnabled(False)
+        self.add_chat_widget(prompt_bubble, animate=animate)
         if save:
             self.append_history({
                 "id": history_entry_id,
@@ -3381,6 +5710,29 @@ class ChatPage(QWidget):
     def ensure_initial_prompt_bubble(self):
         full_prompt = self.build_system_prompt("")
         self.add_prompt_bubble(full_prompt, save=True, animate=False)
+
+    def last_chat_widget(self) -> Optional[QWidget]:
+        for idx in range(self.chat_layout.count() - 1, -1, -1):
+            widget = self.chat_layout.itemAt(idx).widget()
+            if widget is not None and widget is not self.empty_state:
+                return widget
+        return None
+
+    def ensure_prompt_input_entry(self, focus: bool = False, animate: bool = True):
+        last_widget = self.last_chat_widget()
+        if isinstance(last_widget, ChatBubble) and getattr(last_widget, "role", "") == "user":
+            prompt_input = getattr(last_widget, "prompt_input", None)
+            if focus and prompt_input is not None:
+                QTimer.singleShot(60, prompt_input.setFocus)
+            self.scroll_to_bottom()
+            return
+        self.add_prompt_bubble(self.build_system_prompt(""), save=True, animate=animate)
+        if focus:
+            new_widget = self.last_chat_widget()
+            prompt_input = getattr(new_widget, "prompt_input", None)
+            if prompt_input is not None:
+                QTimer.singleShot(60, prompt_input.setFocus)
+        self.scroll_to_bottom()
     
     def update_status_bar(self):
         n = self.terminal_panel.count()
@@ -3430,13 +5782,20 @@ class ChatPage(QWidget):
         try:
             self.clear_chat_widgets()
             if not self.history_entries:
-                self.ensure_initial_prompt_bubble()
+                if self.automation_enabled:
+                    self.show_automation_composer(focus=False)
+                else:
+                    self.ensure_initial_prompt_bubble()
                 self.scroll_to_bottom()
                 return
             self.hide_empty_state()
             for entry in self.history_entries:
                 self.restore_history_entry(entry)
-            if any(entry.get("type") != "prompt" for entry in self.history_entries):
+            if self.automation_enabled:
+                self.remove_ai_response_frame()
+                self.remove_empty_automation_prompt_bubbles()
+                self.show_automation_composer(focus=False)
+            elif any(entry.get("type") != "prompt" for entry in self.history_entries):
                 self.ensure_ai_response_entry(focus=False, animate=False, keep_visible=False)
             self.scroll_to_bottom()
         finally:
@@ -3444,9 +5803,10 @@ class ChatPage(QWidget):
 
     def switch_thread(self, thread_id: str):
         thread_id = safe_thread_id(thread_id)
-        if thread_id == self.thread_id or self.is_execution_running():
+        if thread_id == self.thread_id or self.is_execution_running() or self.is_automation_busy():
             return
         self.thread_id = thread_id
+        save_last_thread_id(self.project_root, self.thread_id)
         self.sidebar.set_active_thread(thread_id)
         self.load_history()
 
@@ -3456,6 +5816,7 @@ class ChatPage(QWidget):
         thread = create_workspace_thread(self.project_root, self.threads)
         self.threads = load_workspace_threads(self.project_root)
         self.thread_id = str(thread.get("id", DEFAULT_THREAD_ID))
+        save_last_thread_id(self.project_root, self.thread_id)
         self.sidebar.set_threads(self.threads, self.thread_id)
         self.sidebar.set_tab("threads")
         self.load_history()
@@ -3482,13 +5843,31 @@ class ChatPage(QWidget):
         if self.thread_id == thread_id:
             self.thread_id = DEFAULT_THREAD_ID
             self.load_history()
+        save_last_thread_id(self.project_root, self.thread_id)
         self.sidebar.set_threads(self.threads, self.thread_id)
         self.sidebar.set_tab("threads")
 
     def restore_history_entry(self, entry: Dict[str, object]):
         entry_type = entry.get("type")
         if entry_type == "prompt":
-            self.add_prompt_bubble(str(entry.get("content", "")), save=False, animate=False)
+            if self.automation_enabled:
+                full_prompt = str(entry.get("content", ""))
+                if self.prompt_text_from_system_prompt(full_prompt).strip():
+                    bubble = ChatBubble(
+                        "user",
+                        self.prompt_bubble_display_text(full_prompt),
+                        parent=self.chat_container,
+                        show_copy=False,
+                        show_prompt_input=False,
+                        scrollable=False,
+                        max_content_height=90,
+                        compact_user=True,
+                    )
+                    bubble.content = full_prompt
+                    bubble.history_entry_id = entry.get("id")
+                    self.add_chat_widget(bubble)
+            else:
+                self.add_prompt_bubble(str(entry.get("content", "")), save=False, animate=False)
         elif entry_type == "ai":
             bubble = ChatBubble(
                 "ai",
@@ -3498,8 +5877,11 @@ class ChatPage(QWidget):
                 copy_text="复制 AI 输出",
                 scrollable=True,
                 max_content_height=190,
+                markdown=self.automation_enabled,
+                expand_to_content=self.automation_enabled,
+                flat=self.automation_enabled,
             )
-            self.chat_layout.addWidget(bubble)
+            self.add_chat_widget(bubble)
         elif entry_type == "result":
             bubble = ChatBubble(
                 "system",
@@ -3510,7 +5892,7 @@ class ChatPage(QWidget):
                 scrollable=True,
                 max_content_height=210,
             )
-            self.chat_layout.addWidget(bubble)
+            self.add_chat_widget(bubble)
             records = []
             for raw_record in entry.get("changes", []) if isinstance(entry.get("changes"), list) else []:
                 record = deserialize_change_record(raw_record)
@@ -3523,7 +5905,7 @@ class ChatPage(QWidget):
                 change_card.redo_requested.connect(self.redo_changes)
                 if bool(entry.get("undone", False)):
                     change_card.mark_undone(len(records), 0)
-                self.chat_layout.addWidget(change_card)
+                self.add_chat_widget(change_card)
 
     def update_change_history_state(self, entry_id: str, undone: bool):
         if not entry_id:
@@ -3557,6 +5939,9 @@ class ChatPage(QWidget):
             styled_warning(self, "清空失败", "无法删除当前工作区的 .agent_qt 缓存目录。")
 
     def add_ai_response_frame(self, focus: bool = True, animate: bool = True, keep_visible: bool = True):
+        if self.automation_enabled:
+            self.show_automation_composer(focus=focus)
+            return
         self.hide_empty_state()
         existing_frame = self.find_open_ai_response_frame()
         if existing_frame is not None:
@@ -3636,9 +6021,7 @@ class ChatPage(QWidget):
         ai_frame.ai_input = ai_input
         ai_layout.addWidget(ai_input)
         
-        self.chat_layout.addWidget(ai_frame)
-        if animate:
-            animate_widget_in(ai_frame)
+        self.add_chat_widget(ai_frame, animate=animate)
         if keep_visible:
             self.keep_ai_response_visible()
         if focus:
@@ -3655,6 +6038,14 @@ class ChatPage(QWidget):
             ):
                 return widget
         return None
+
+    def remove_ai_response_frame(self):
+        frame = self.find_open_ai_response_frame()
+        if frame is None:
+            return
+        frame.is_closing = True
+        self.chat_layout.removeWidget(frame)
+        frame.deleteLater()
     
     def send_prompt(self):
         self.append_prompt_bubble_from_toolbar()
@@ -3676,7 +6067,24 @@ class ChatPage(QWidget):
             ai_frame.deleteLater()
 
         animate_widget_out(ai_frame, remove_input_frame)
-        
+        self.handle_ai_response_text(text, insert_index=idx)
+
+    def handle_ai_response_text(self, text: str, insert_index: Optional[int] = None):
+        text = (text or "").strip()
+        if not text:
+            return
+        if self.automation_enabled and looks_like_automation_context_payload(text):
+            self.stop_automation_loop(
+                "provider 返回了内部上下文包，自动化循环已暂停。请重新发送或检查 provider 页面复制结果。",
+                ensure_manual_entry=True,
+            )
+            self.scroll_to_bottom()
+            return
+        if self.automation_loop_active and is_automation_done_response(text):
+            self.stop_automation_loop("", ensure_manual_entry=True)
+            self.scroll_to_bottom()
+            return
+        self.hide_empty_state()
         ai_bubble = ChatBubble(
             "ai",
             text,
@@ -3685,8 +6093,14 @@ class ChatPage(QWidget):
             copy_text="复制 AI 输出",
             scrollable=True,
             max_content_height=190,
+            markdown=self.automation_enabled,
+            expand_to_content=self.automation_enabled,
+            flat=self.automation_enabled,
         )
-        self.chat_layout.insertWidget(idx, ai_bubble)
+        if insert_index is None:
+            self.add_chat_widget(ai_bubble)
+        else:
+            self.insert_chat_widget(insert_index, ai_bubble)
         animate_widget_in(ai_bubble)
         self.append_history({
             "type": "ai",
@@ -3694,9 +6108,30 @@ class ChatPage(QWidget):
         })
         
         blocks = scan_all_code_blocks(text)
-        commands = extract_bash_commands(text, blocks)
+        try:
+            commands = extract_bash_commands(text, blocks)
+        except ValueError as exc:
+            if self.automation_loop_active:
+                self.stop_automation_loop(str(exc), ensure_manual_entry=True)
+            warning_bubble = ChatBubble(
+                "system",
+                f"⚠️ {exc}",
+                parent=self.chat_container,
+                scrollable=False,
+                max_content_height=130,
+            )
+            self.add_chat_widget(warning_bubble, animate=True)
+            self.scroll_to_bottom()
+            return
         
         if not commands:
+            if self.automation_loop_active:
+                self.stop_automation_loop(
+                    f"AI 没有返回可执行命令，也没有返回完成标识 `{AUTOMATION_DONE_MARKER}`，自动化循环已暂停。",
+                    ensure_manual_entry=True,
+                )
+                self.scroll_to_bottom()
+                return
             warning_bubble = ChatBubble(
                 "system",
                 "⚠️ 未识别到可执行命令\n请确保 AI 输出包含 ```bash 代码块",
@@ -3704,11 +6139,12 @@ class ChatPage(QWidget):
                 scrollable=False,
                 max_content_height=110,
             )
-            self.chat_layout.addWidget(warning_bubble)
-            animate_widget_in(warning_bubble)
+            self.add_chat_widget(warning_bubble, animate=True)
             self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
             self.scroll_to_bottom()
             return
+        if self.automation_loop_active:
+            self.refresh_prompt_bubble_buttons()
         
         self.result_bubble = ChatBubble(
             "system",
@@ -3719,8 +6155,7 @@ class ChatPage(QWidget):
             scrollable=True,
             max_content_height=210,
         )
-        self.chat_layout.addWidget(self.result_bubble)
-        animate_widget_in(self.result_bubble)
+        self.add_chat_widget(self.result_bubble, animate=True)
         
         self.cmd_outputs = []
         self.pending_snapshot = snapshot_project(self.project_root)
@@ -3757,8 +6192,7 @@ class ChatPage(QWidget):
             change_card = ChangeSummaryCard(change_records, parent=self.chat_container)
             change_card.undo_requested.connect(self.undo_changes)
             change_card.redo_requested.connect(self.redo_changes)
-            self.chat_layout.addWidget(change_card)
-            animate_widget_in(change_card)
+            self.add_chat_widget(change_card, animate=True)
         result_entry = {
             "type": "result",
             "content": log_with_changes,
@@ -3771,8 +6205,36 @@ class ChatPage(QWidget):
         self.append_history(result_entry)
         self.sidebar.refresh_tree(self.project_root)
         self.update_status_bar()
-        self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
+        if self.automation_enabled and self.automation_loop_active:
+            self.request_next_automation_step(log_with_changes, skip_entry_id=str(result_entry.get("id") or ""))
+        elif self.automation_enabled:
+            self.show_automation_composer(focus=False)
+        else:
+            self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
         self.scroll_to_bottom()
+
+    def request_next_automation_step(self, log_with_changes: str, skip_entry_id: str = ""):
+        if not self.automation_loop_active:
+            return
+        if self.automation_loop_round >= self.automation_loop_max_rounds:
+            self.stop_automation_loop(
+                f"已达到自动化最大轮数 {self.automation_loop_max_rounds}，循环已暂停。你可以检查结果后继续发送。",
+                ensure_manual_entry=True,
+            )
+            return
+        self.automation_loop_round += 1
+        prompt = build_automation_feedback_prompt(
+            self.project_root,
+            self.automation_loop_goal,
+            log_with_changes,
+            self.automation_loop_round,
+            self.automation_loop_max_rounds,
+        )
+        self.start_automation_worker(
+            prompt,
+            "",
+            skip_entry_id=skip_entry_id,
+        )
 
     def hide_empty_state(self):
         if getattr(self, 'empty_state', None) and self.empty_state.isVisible():
