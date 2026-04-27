@@ -51,13 +51,6 @@ _AGENT_RUNTIME_PYTHON: Optional[str] = None
 _AGENT_RUNTIME_ERROR = ""
 _APP_SETTINGS: Optional[Dict[str, object]] = None
 _AGENT_RUNTIME_ENABLED: Optional[bool] = None
-PYTHON_RUNTIME_PACKAGES = (
-    "pypdf",
-    "python-docx",
-    "openpyxl",
-    "pillow",
-    "pandas",
-)
 DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 
@@ -106,7 +99,7 @@ def agent_runtime_enabled() -> bool:
         _AGENT_RUNTIME_ENABLED = env_value not in {"0", "false", "no", "off"}
         return _AGENT_RUNTIME_ENABLED
     settings = load_app_settings()
-    _AGENT_RUNTIME_ENABLED = bool(settings.get("agent_runtime_enabled", True))
+    _AGENT_RUNTIME_ENABLED = bool(settings.get("agent_runtime_enabled", False))
     return _AGENT_RUNTIME_ENABLED
 
 
@@ -301,9 +294,7 @@ def cmd_join(args: List[str]) -> str:
 
 def build_python_runtime_install_command() -> str:
     pip_args_posix = posix_join(pip_index_args())
-    package_args_posix = posix_join(list(PYTHON_RUNTIME_PACKAGES))
     pip_args_cmd = cmd_join(pip_index_args())
-    package_args_cmd = cmd_join(list(PYTHON_RUNTIME_PACKAGES))
     venv_dir = runtime_venv_root()
     python_bin = runtime_python_in_root(venv_dir)
     if platform.system() == "Windows":
@@ -314,7 +305,7 @@ set "PYTHONUNBUFFERED=1"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 set "VENV_DIR={venv_dir}"
 set "PYTHON_BIN={python_bin}"
-echo [Agent Qt] 安装/修复 Python 文档处理环境
+echo [Agent Qt] 创建/修复 Agent Python 环境
 echo 缓存目录: {runtime_cache_root()}
 if not exist "%VENV_DIR%" mkdir "%VENV_DIR%"
 if not exist "%PYTHON_BIN%" (
@@ -322,16 +313,14 @@ if not exist "%PYTHON_BIN%" (
   py -3 -m venv "%VENV_DIR%" || python -m venv "%VENV_DIR%" || exit /b 1
 )
 echo.
-echo [1/2] 升级 pip
+echo 升级 pip
 "%PYTHON_BIN%" -m pip install --upgrade pip {pip_args_cmd} || exit /b 1
 echo.
-echo [2/2] 安装文档处理库
-"%PYTHON_BIN%" -m pip install {pip_args_cmd} {package_args_cmd} || exit /b 1
-echo.
-echo 验证模块...
-"%PYTHON_BIN%" -c "import pypdf, docx, openpyxl, PIL, pandas; print('文档处理环境 OK')" || exit /b 1
+echo 验证 Python...
+"%PYTHON_BIN%" -c "import sys; print('Python OK:', sys.executable)" || exit /b 1
 echo.
 echo Python 运行环境安装完成: %PYTHON_BIN%
+echo 后续具体任务需要的库会由 Agent 按需 pip install 到这个环境。
 """
     return f"""set -e
 export PYTHONUTF8=1
@@ -339,7 +328,7 @@ export PYTHONUNBUFFERED=1
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 VENV_DIR={shlex.quote(venv_dir)}
 PYTHON_BIN={shlex.quote(python_bin)}
-echo "[Agent Qt] 安装/修复 Python 文档处理环境"
+echo "[Agent Qt] 创建/修复 Agent Python 环境"
 echo "缓存目录: {runtime_cache_root()}"
 mkdir -p "$VENV_DIR"
 if [ ! -x "$PYTHON_BIN" ]; then
@@ -355,16 +344,14 @@ if [ ! -x "$PYTHON_BIN" ]; then
   "$BASE_PYTHON" -m venv "$VENV_DIR"
 fi
 echo
-echo "[1/2] 升级 pip"
+echo "升级 pip"
 "$PYTHON_BIN" -m pip install --upgrade pip {pip_args_posix}
 echo
-echo "[2/2] 安装文档处理库"
-"$PYTHON_BIN" -m pip install {pip_args_posix} {package_args_posix}
-echo
-echo "验证模块..."
-"$PYTHON_BIN" -c "import pypdf, docx, openpyxl, PIL, pandas; print('文档处理环境 OK')"
+echo "验证 Python..."
+"$PYTHON_BIN" -c "import sys; print('Python OK:', sys.executable)"
 echo
 echo "Python 运行环境安装完成: $PYTHON_BIN"
+echo "后续具体任务需要的库会由 Agent 按需 pip install 到这个环境。"
 """
 
 
@@ -397,39 +384,32 @@ def installed_runtime_modules_status() -> Dict[str, object]:
         return {
             "ready": False,
             "python": "",
-            "missing": list(PYTHON_RUNTIME_PACKAGES),
+            "missing": [],
             "message": "未安装 Agent Python 运行环境，当前 bash 默认使用系统 PATH。",
         }
-    module_names = ["pypdf", "docx", "openpyxl", "PIL", "pandas"]
-    code = (
-        "import importlib.util, json\n"
-        f"mods = {module_names!r}\n"
-        "missing = [m for m in mods if importlib.util.find_spec(m) is None]\n"
-        "print(json.dumps({'missing': missing}, ensure_ascii=False))\n"
-        "raise SystemExit(1 if missing else 0)\n"
-    )
-    ok, output = run_runtime_command([python_bin, "-c", code], runtime_cache_root(), timeout=60)
-    missing = []
-    try:
-        payload = json.loads((output or "{}").splitlines()[-1])
-        if isinstance(payload.get("missing"), list):
-            missing = payload["missing"]
-    except Exception:
-        missing = module_names
     return {
-        "ready": ok,
+        "ready": True,
         "python": python_bin,
-        "missing": missing,
-        "message": "文档处理库可用。" if ok else (output or "文档处理库缺失。"),
+        "missing": [],
+        "message": "Agent Python 环境可用。具体任务需要的库会由 Agent 按需安装到该环境。",
     }
 
 
 def agent_runtime_status_text() -> str:
     status = installed_runtime_modules_status()
+    enabled = agent_runtime_enabled()
+    python_bin = str(status.get("python") or "")
+    if enabled and python_bin:
+        effective = "Agent 缓存 Python"
+    elif enabled:
+        effective = "系统 PATH（Agent Python 尚未创建）"
+    else:
+        effective = "系统 PATH（开关关闭）"
     lines = [
-        f"运行策略: {'优先使用 Agent 缓存 Python' if status.get('python') else '使用系统 PATH'}",
+        f"开关状态: {'已开启' if enabled else '已关闭'}",
+        f"当前生效: {effective}",
         f"缓存目录: {runtime_cache_root()}",
-        f"Python: {status.get('python') or '未安装'}",
+        f"Python: {python_bin or '未安装'}",
         f"pip 源: {os.environ.get('AGENT_QT_PIP_INDEX_URL', DEFAULT_PIP_INDEX_URL)}",
     ]
     if status.get("missing"):
@@ -447,7 +427,6 @@ def install_agent_python_runtime(status_callback=None) -> str:
         raise RuntimeError(_AGENT_RUNTIME_ERROR or "无法创建 Agent Python 运行环境。")
     commands = [
         [python_bin, "-m", "pip", "install", "--upgrade", "pip", *pip_index_args()],
-        [python_bin, "-m", "pip", "install", *pip_index_args(), *PYTHON_RUNTIME_PACKAGES],
     ]
     for command in commands:
         if status_callback:
@@ -5206,7 +5185,7 @@ class ChatPage(QWidget):
         menu = QMenu(self)
         runtime_toggle = SettingsToggleRow(
             "Python 运行环境",
-            "优先使用 Agent 缓存 Python",
+            "让 bash 优先使用 Agent 缓存 Python",
             agent_runtime_enabled(),
             parent=menu,
         )
@@ -5231,7 +5210,7 @@ class ChatPage(QWidget):
         runtime_status_action = QAction("检查运行环境", self)
         runtime_status_action.triggered.connect(self.show_python_runtime_status)
         runtime_menu.addAction(runtime_status_action)
-        runtime_install_action = QAction("安装/修复文档处理环境", self)
+        runtime_install_action = QAction("创建/修复 Agent Python 环境", self)
         runtime_install_action.triggered.connect(lambda: self.run_python_runtime_setup("install"))
         runtime_menu.addAction(runtime_install_action)
         runtime_open_action = QAction("打开运行环境目录", self)
