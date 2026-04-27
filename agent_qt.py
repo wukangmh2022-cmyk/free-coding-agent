@@ -2515,12 +2515,12 @@ class TerminalTabCard(QFrame):
 
     def setup_ui(self):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 5, 7, 5)
-        layout.setSpacing(7)
+        layout.setContentsMargins(8, 3, 5, 3)
+        layout.setSpacing(6)
 
         icon_label = QLabel()
-        icon_label.setPixmap(terminal_icon(COLORS["text"], 16).pixmap(16, 16))
-        icon_label.setFixedSize(18, 18)
+        icon_label.setPixmap(terminal_icon(COLORS["text_secondary"], 14).pixmap(14, 14))
+        icon_label.setFixedSize(16, 16)
         icon_label.setStyleSheet("background: transparent; border: none;")
         layout.addWidget(icon_label)
 
@@ -2530,8 +2530,8 @@ class TerminalTabCard(QFrame):
                 color: {COLORS['text']};
                 background: transparent;
                 border: none;
-                font-size: 13px;
-                font-weight: 900;
+                font-size: 12px;
+                font-weight: 500;
             }}
         """)
         self.title_label.setMinimumWidth(56)
@@ -2541,15 +2541,15 @@ class TerminalTabCard(QFrame):
         self.close_btn = QToolButton(self)
         self.close_btn.setCursor(Qt.PointingHandCursor)
         self.close_btn.setText("×")
-        self.close_btn.setFixedSize(20, 20)
+        self.close_btn.setFixedSize(18, 18)
         self.close_btn.setStyleSheet(f"""
             QToolButton {{
                 background: transparent;
                 color: {COLORS['text_secondary']};
                 border: none;
                 border-radius: 8px;
-                font-size: 16px;
-                font-weight: 900;
+                font-size: 15px;
+                font-weight: 600;
                 padding-bottom: 1px;
             }}
             QToolButton:hover {{
@@ -2561,16 +2561,16 @@ class TerminalTabCard(QFrame):
         layout.addWidget(self.close_btn)
 
     def apply_style(self):
-        background = "#eef1f6" if self.active else "#f4f5f8"
+        background = "#f2f5fa" if self.active else "#f7f8fb"
         border = COLORS["border"] if self.active else "transparent"
         self.setStyleSheet(f"""
             QFrame#terminalTabCard {{
                 background: {background};
                 border: 1px solid {border};
-                border-radius: 12px;
+                border-radius: 10px;
             }}
             QFrame#terminalTabCard:hover {{
-                background: #edf0f5;
+                background: #f2f5fa;
             }}
         """)
 
@@ -2648,19 +2648,19 @@ class TerminalPanel(QWidget):
         layout.addWidget(header_shell, 0, Qt.AlignmentFlag.AlignTop)
         
         self.tab_row_shell = QWidget(self)
-        self.tab_row_shell.setFixedHeight(34)
+        self.tab_row_shell.setFixedHeight(28)
         self.tab_row_shell.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.tab_row_shell.setStyleSheet("background: transparent; border: none;")
         self.tab_row = QHBoxLayout(self.tab_row_shell)
         self.tab_row.setContentsMargins(0, 0, 0, 0)
-        self.tab_row.setSpacing(8)
+        self.tab_row.setSpacing(6)
         self.tab_cards: Dict[ManagedProcess, TerminalTabCard] = {}
 
         self.add_btn = QToolButton(self)
         self.add_btn.setCursor(Qt.PointingHandCursor)
-        self.add_btn.setIcon(line_icon("plus", COLORS["text_secondary"], 20))
-        self.add_btn.setIconSize(QSize(18, 18))
-        self.add_btn.setFixedSize(32, 30)
+        self.add_btn.setIcon(line_icon("plus", COLORS["text_secondary"], 18))
+        self.add_btn.setIconSize(QSize(16, 16))
+        self.add_btn.setFixedSize(28, 26)
         self.add_btn.setStyleSheet(f"""
             QToolButton {{
                 background: transparent;
