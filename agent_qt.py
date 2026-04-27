@@ -2561,8 +2561,10 @@ class TerminalTabCard(QFrame):
         layout.addWidget(self.close_btn)
 
     def apply_style(self):
-        background = "#f2f5fa" if self.active else "#f7f8fb"
-        border = COLORS["border"] if self.active else "transparent"
+        background = COLORS["accent_light"] if self.active else "transparent"
+        border = "#d5c9ff" if self.active else "transparent"
+        hover_background = "#f5f2ff" if self.active else "#f7f5ff"
+        hover_border = "#d5c9ff" if self.active else "transparent"
         self.setStyleSheet(f"""
             QFrame#terminalTabCard {{
                 background: {background};
@@ -2570,7 +2572,8 @@ class TerminalTabCard(QFrame):
                 border-radius: 10px;
             }}
             QFrame#terminalTabCard:hover {{
-                background: #f2f5fa;
+                background: {hover_background};
+                border: 1px solid {hover_border};
             }}
         """)
 
@@ -2653,7 +2656,7 @@ class TerminalPanel(QWidget):
         self.tab_row_shell.setStyleSheet("background: transparent; border: none;")
         self.tab_row = QHBoxLayout(self.tab_row_shell)
         self.tab_row.setContentsMargins(0, 0, 0, 0)
-        self.tab_row.setSpacing(6)
+        self.tab_row.setSpacing(4)
         self.tab_cards: Dict[ManagedProcess, TerminalTabCard] = {}
 
         self.add_btn = QToolButton(self)
