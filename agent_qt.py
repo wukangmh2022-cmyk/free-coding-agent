@@ -287,6 +287,87 @@ def pip_index_args() -> List[str]:
     return args
 
 
+def posix_join(args: List[str]) -> str:
+    return " ".join(shlex.quote(str(arg)) for arg in args if str(arg))
+
+
+def cmd_arg(arg: str) -> str:
+    return '"' + str(arg).replace('"', r'\"') + '"'
+
+
+def cmd_join(args: List[str]) -> str:
+    return " ".join(cmd_arg(str(arg)) for arg in args if str(arg))
+
+
+def build_python_runtime_install_command() -> str:
+    pip_args_posix = posix_join(pip_index_args())
+    package_args_posix = posix_join(list(PYTHON_RUNTIME_PACKAGES))
+    pip_args_cmd = cmd_join(pip_index_args())
+    package_args_cmd = cmd_join(list(PYTHON_RUNTIME_PACKAGES))
+    venv_dir = runtime_venv_root()
+    python_bin = runtime_python_in_root(venv_dir)
+    if platform.system() == "Windows":
+        return f"""@echo off
+setlocal
+set "PYTHONUTF8=1"
+set "PYTHONUNBUFFERED=1"
+set "PIP_DISABLE_PIP_VERSION_CHECK=1"
+set "VENV_DIR={venv_dir}"
+set "PYTHON_BIN={python_bin}"
+echo [Agent Qt] 安装/修复 Python 文档处理环境
+echo 缓存目录: {runtime_cache_root()}
+if not exist "%VENV_DIR%" mkdir "%VENV_DIR%"
+if not exist "%PYTHON_BIN%" (
+  echo 创建虚拟环境...
+  py -3 -m venv "%VENV_DIR%" || python -m venv "%VENV_DIR%" || exit /b 1
+)
+echo.
+echo [1/2] 升级 pip
+"%PYTHON_BIN%" -m pip install --upgrade pip {pip_args_cmd} || exit /b 1
+echo.
+echo [2/2] 安装文档处理库
+"%PYTHON_BIN%" -m pip install {pip_args_cmd} {package_args_cmd} || exit /b 1
+echo.
+echo 验证模块...
+"%PYTHON_BIN%" -c "import pypdf, docx, openpyxl, PIL, pandas; print('文档处理环境 OK')" || exit /b 1
+echo.
+echo Python 运行环境安装完成: %PYTHON_BIN%
+"""
+    return f"""set -e
+export PYTHONUTF8=1
+export PYTHONUNBUFFERED=1
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+VENV_DIR={shlex.quote(venv_dir)}
+PYTHON_BIN={shlex.quote(python_bin)}
+echo "[Agent Qt] 安装/修复 Python 文档处理环境"
+echo "缓存目录: {runtime_cache_root()}"
+mkdir -p "$VENV_DIR"
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "创建虚拟环境..."
+  if command -v python3 >/dev/null 2>&1; then
+    BASE_PYTHON="$(command -v python3)"
+  elif command -v python >/dev/null 2>&1; then
+    BASE_PYTHON="$(command -v python)"
+  else
+    echo "未找到 python3/python，无法创建虚拟环境。"
+    exit 1
+  fi
+  "$BASE_PYTHON" -m venv "$VENV_DIR"
+fi
+echo
+echo "[1/2] 升级 pip"
+"$PYTHON_BIN" -m pip install --upgrade pip {pip_args_posix}
+echo
+echo "[2/2] 安装文档处理库"
+"$PYTHON_BIN" -m pip install {pip_args_posix} {package_args_posix}
+echo
+echo "验证模块..."
+"$PYTHON_BIN" -c "import pypdf, docx, openpyxl, PIL, pandas; print('文档处理环境 OK')"
+echo
+echo "Python 运行环境安装完成: $PYTHON_BIN"
+"""
+
+
 def run_runtime_command(command: List[str], cwd: str, timeout: int = 900) -> tuple[bool, str]:
     try:
         result = subprocess.run(
@@ -2516,7 +2597,7 @@ class TerminalPanel(QWidget):
     def add_process(self, cmd: str, cwd: str, name: str = "", interactive: bool = False):
         if not interactive and (not cmd.strip() or is_interactive_shell_command(cmd)):
             return None
-        label = self.terminal_title(cwd, len(self.processes) + 1)
+        label = name.strip() if name.strip() else self.terminal_title(cwd, len(self.processes) + 1)
         proc = ManagedProcess(cmd, cwd, label, interactive=interactive)
         proc.remove_requested.connect(self.remove_process)
         if proc.process:
@@ -2914,6 +2995,101 @@ print("chromium ok")
                 detail = (result.stderr or result.stdout or "").strip()
                 raise RuntimeError(detail[-2000:] or f"命令失败: {' '.join(command)}")
         return python_bin
+
+    def install_dependencies_command(self) -> str:
+        plugin_root = self.plugin_root
+        venv_dir = os.path.join(plugin_root, ".venv")
+        python_bin = automation_venv_python(plugin_root)
+        package_args = [
+            "fastapi>=0.115.0",
+            "uvicorn[standard]>=0.34.0",
+            "pydantic>=2",
+            "jsonschema",
+            "langchain-core",
+            "playwright",
+            "httpx",
+        ]
+        if platform.system() == "Windows":
+            return f"""@echo off
+setlocal
+set "PYTHONUTF8=1"
+set "PYTHONUNBUFFERED=1"
+set "PIP_DISABLE_PIP_VERSION_CHECK=1"
+set "PYTHONPATH={self.harness_path()};%PYTHONPATH%"
+set "VENV_DIR={venv_dir}"
+set "PYTHON_BIN={python_bin}"
+echo [Agent Qt] 安装/修复自动化插件依赖
+echo 插件目录: {plugin_root}
+echo Provider 源码: {self.backend_dir or '未找到'}
+if "{self.backend_dir}"=="" (
+  echo 未找到 provider 源码。
+  exit /b 1
+)
+if not exist "%VENV_DIR%" mkdir "%VENV_DIR%"
+if not exist "%PYTHON_BIN%" (
+  echo 创建插件虚拟环境...
+  py -3 -m venv "%VENV_DIR%" || python -m venv "%VENV_DIR%" || exit /b 1
+)
+echo.
+echo [1/3] 升级 pip
+"%PYTHON_BIN%" -m pip install {cmd_join(pip_index_args())} --upgrade pip || exit /b 1
+echo.
+echo [2/3] 安装 provider Python 依赖
+"%PYTHON_BIN%" -m pip install {cmd_join(pip_index_args())} {cmd_join(package_args)} || exit /b 1
+echo.
+echo [3/3] 安装 Playwright Chromium
+"%PYTHON_BIN%" -m playwright install chromium || exit /b 1
+echo.
+echo 验证 provider 模块...
+cd /d "{self.backend_dir}"
+"%PYTHON_BIN%" -c "import app.deepseek_local_provider; print('自动化插件依赖 OK')" || exit /b 1
+echo.
+echo 自动化插件依赖安装完成: %PYTHON_BIN%
+"""
+        return f"""set -e
+export PYTHONUTF8=1
+export PYTHONUNBUFFERED=1
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+export PYTHONPATH={shlex.quote(self.harness_path())}:$PYTHONPATH
+VENV_DIR={shlex.quote(venv_dir)}
+PYTHON_BIN={shlex.quote(python_bin)}
+BACKEND_DIR={shlex.quote(self.backend_dir)}
+echo "[Agent Qt] 安装/修复自动化插件依赖"
+echo "插件目录: {plugin_root}"
+echo "Provider 源码: {self.backend_dir or '未找到'}"
+if [ -z "$BACKEND_DIR" ]; then
+  echo "未找到 provider 源码。"
+  exit 1
+fi
+mkdir -p "$VENV_DIR"
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "创建插件虚拟环境..."
+  if command -v python3 >/dev/null 2>&1; then
+    BASE_PYTHON="$(command -v python3)"
+  elif command -v python >/dev/null 2>&1; then
+    BASE_PYTHON="$(command -v python)"
+  else
+    echo "未找到 python3/python，无法创建虚拟环境。"
+    exit 1
+  fi
+  "$BASE_PYTHON" -m venv "$VENV_DIR"
+fi
+echo
+echo "[1/3] 升级 pip"
+"$PYTHON_BIN" -m pip install {posix_join(pip_index_args())} --upgrade pip
+echo
+echo "[2/3] 安装 provider Python 依赖"
+"$PYTHON_BIN" -m pip install {posix_join(pip_index_args())} {posix_join(package_args)}
+echo
+echo "[3/3] 安装 Playwright Chromium"
+"$PYTHON_BIN" -m playwright install chromium
+echo
+echo "验证 provider 模块..."
+cd "$BACKEND_DIR"
+"$PYTHON_BIN" -c "import app.deepseek_local_provider; print('自动化插件依赖 OK')"
+echo
+echo "自动化插件依赖安装完成: $PYTHON_BIN"
+"""
 
     def active_python(self) -> str:
         status = self.dependency_status()
@@ -5175,6 +5351,9 @@ class ChatPage(QWidget):
         self.add_status_bubble(f"已复制 Python 路径：{text}")
 
     def run_python_runtime_setup(self, action: str):
+        if action == "install":
+            self.run_python_runtime_install_terminal()
+            return
         if self.python_runtime_setup_worker and self.python_runtime_setup_worker.isRunning():
             styled_warning(self, "Python 运行环境", "已有 Python 环境任务正在运行。")
             return
@@ -5197,7 +5376,30 @@ class ChatPage(QWidget):
         worker.finished_signal.connect(on_finished)
         worker.start()
 
+    def run_python_runtime_install_terminal(self):
+        set_agent_runtime_enabled(True)
+        cmd = build_python_runtime_install_command()
+        cwd = runtime_cache_root()
+        os.makedirs(cwd, exist_ok=True)
+        proc = self.terminal_panel.add_process(cmd, cwd, "Python 环境安装", interactive=False)
+        if proc is not None:
+            if proc.process is not None:
+                proc.process.finished.connect(lambda code, _status: self.on_python_runtime_install_terminal_finished(code))
+            self.terminal_panel.expand()
+            self.update_status_bar()
+            self.copy_prompt_btn.setText("Python安装中")
+
+    def on_python_runtime_install_terminal_finished(self, exit_code: int):
+        self.copy_prompt_btn.setText("复制系统提示词")
+        if exit_code == 0:
+            python_bin = ensure_agent_runtime(create=False)
+            if python_bin:
+                ensure_runtime_shims(python_bin)
+
     def run_automation_setup(self, action: str):
+        if action == "install":
+            self.run_automation_install_terminal()
+            return
         if self.automation_setup_worker and self.automation_setup_worker.isRunning():
             styled_warning(self, "自动化插件", "已有插件任务正在运行。")
             return
@@ -5228,6 +5430,21 @@ class ChatPage(QWidget):
         worker.status_signal.connect(on_status)
         worker.finished_signal.connect(on_finished)
         worker.start()
+
+    def run_automation_install_terminal(self):
+        if not self.automation_manager.has_backend():
+            styled_warning(self, "自动化插件", "未找到 provider 源码，无法安装插件依赖。")
+            return
+        cmd = self.automation_manager.install_dependencies_command()
+        cwd = self.automation_manager.plugin_root
+        os.makedirs(cwd, exist_ok=True)
+        proc = self.terminal_panel.add_process(cmd, cwd, "插件依赖安装", interactive=False)
+        if proc is not None:
+            if proc.process is not None:
+                proc.process.finished.connect(lambda _code, _status: self.copy_prompt_btn.setText("复制系统提示词"))
+            self.terminal_panel.expand()
+            self.update_status_bar()
+            self.copy_prompt_btn.setText("插件安装中")
 
     def delete_project_path(self, path: str):
         if not self.project_root:
