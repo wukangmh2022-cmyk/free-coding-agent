@@ -4692,6 +4692,7 @@ class ChatPage(QWidget):
         self.automation_worker: Optional[AutomationChatWorker] = None
         self.automation_preview_worker: Optional[AutomationPreviewWorker] = None
         self.automation_preview_bubble: Optional[QFrame] = None
+        self.automation_preview_started_at = 0.0
         self.automation_setup_worker: Optional[AutomationSetupWorker] = None
         self.python_runtime_setup_worker: Optional[PythonRuntimeSetupWorker] = None
         self.automation_loop_active = False
@@ -5289,8 +5290,9 @@ class ChatPage(QWidget):
             self.automation_loop_active = False
             self.automation_loop_round = 0
             self.automation_loop_goal = ""
+            self.stop_automation_preview(remove_bubble=True)
             self.hide_automation_composer()
-            self.refresh_prompt_bubble_buttons()
+            self.load_history()
             return
         status = self.automation_manager.dependency_status()
         if not status.get("ready"):
@@ -5304,10 +5306,8 @@ class ChatPage(QWidget):
             )
             return
         self.automation_enabled = True
-        self.remove_ai_response_frame()
-        self.remove_empty_automation_prompt_bubbles()
-        self.show_automation_composer(focus=False)
-        self.refresh_prompt_bubble_buttons()
+        self.stop_automation_preview(remove_bubble=True)
+        self.load_history()
         self.run_automation_setup("start")
 
     def show_automation_status(self):
@@ -5405,10 +5405,7 @@ class ChatPage(QWidget):
             if ok:
                 if action == "start":
                     self.automation_enabled = True
-                    self.remove_ai_response_frame()
-                    self.remove_empty_automation_prompt_bubbles()
                     self.show_automation_composer(focus=False)
-                    self.refresh_prompt_bubble_buttons()
                 if action != "start":
                     self.add_status_bubble(message)
             else:
@@ -5666,6 +5663,7 @@ class ChatPage(QWidget):
 
     def start_automation_preview(self):
         self.stop_automation_preview(remove_bubble=True)
+        self.automation_preview_started_at = time.time()
         self.automation_preview_bubble = self.create_automation_preview_bubble()
         worker = AutomationPreviewWorker(self.automation_manager, self.automation_model, self.thread_id)
         self.automation_preview_worker = worker
@@ -5693,6 +5691,11 @@ class ChatPage(QWidget):
             return
         should_follow_bottom = self.is_chat_at_bottom()
         text = str(preview.get("text") or "").strip()
+        preview_updated_at = float(preview.get("updated_at") or 0.0)
+        if text and preview_updated_at and preview_updated_at < self.automation_preview_started_at:
+            return
+        if text and not preview_updated_at and self.automation_preview_started_at:
+            return
         chars = int(preview.get("chars") or len(text))
         status = getattr(bubble, "preview_status", None)
         if status is not None:
@@ -5754,6 +5757,8 @@ class ChatPage(QWidget):
             return ""
         if entry_type == "prompt":
             user_text = self.prompt_text_from_system_prompt(content).strip()
+            if not user_text and PROMPT_BUBBLE_MARKER not in content:
+                user_text = content.strip()
             if not user_text:
                 return ""
             return "【用户需求】\n" + self.compact_automation_entry_text(user_text, 2000)
@@ -6087,10 +6092,11 @@ class ChatPage(QWidget):
         if entry_type == "prompt":
             if self.automation_enabled:
                 full_prompt = str(entry.get("content", ""))
-                if self.prompt_text_from_system_prompt(full_prompt).strip():
+                display_text = self.prompt_bubble_display_text(full_prompt)
+                if display_text.strip():
                     bubble = ChatBubble(
                         "user",
-                        self.prompt_bubble_display_text(full_prompt),
+                        display_text,
                         parent=self.chat_container,
                         show_copy=False,
                         show_prompt_input=False,
