@@ -946,12 +946,20 @@ def svg_icon(svg: str, size: int = 18) -> QIcon:
 def terminal_icon(color: str = "#172033", size: int = 16) -> QIcon:
     icon = svg_icon(f"""
         <svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none">
-          <rect x="3.5" y="5" width="17" height="14" rx="3" stroke="{color}" stroke-width="2.2"/>
-          <path d="M7.5 10l3 2.5-3 2.5" stroke="{color}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M12.5 15.5h4" stroke="{color}" stroke-width="2.2" stroke-linecap="round"/>
+          <rect x="3.5" y="5" width="17" height="14" rx="3.5" stroke="{color}" stroke-width="1.9"/>
+          <path d="M7.5 10.2l3 2.3-3 2.3" stroke="{color}" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M12.8 15h4.2" stroke="{color}" stroke-width="1.9" stroke-linecap="round"/>
         </svg>
     """, size)
     return icon if not icon.isNull() else line_icon("terminal", color, size)
+
+def close_icon(color: str = "#657089", size: int = 16) -> QIcon:
+    icon = svg_icon(f"""
+        <svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none">
+          <path d="M7.5 7.5l9 9M16.5 7.5l-9 9" stroke="{color}" stroke-width="2.2" stroke-linecap="round"/>
+        </svg>
+    """, size)
+    return icon if not icon.isNull() else line_icon("close", color, size)
 
 # ============================================================
 # 工具函数
@@ -2510,6 +2518,7 @@ class TerminalTabCard(QFrame):
         self.active = active
         self.setObjectName("terminalTabCard")
         self.setCursor(Qt.PointingHandCursor)
+        self.hovered = False
         self.setup_ui()
         self.apply_style()
 
@@ -2518,11 +2527,22 @@ class TerminalTabCard(QFrame):
         layout.setContentsMargins(8, 3, 5, 3)
         layout.setSpacing(6)
 
-        icon_label = QLabel()
-        icon_label.setPixmap(terminal_icon(COLORS["text_secondary"], 14).pixmap(14, 14))
-        icon_label.setFixedSize(16, 16)
-        icon_label.setStyleSheet("background: transparent; border: none;")
-        layout.addWidget(icon_label)
+        self.icon_btn = QToolButton(self)
+        self.icon_btn.setCursor(Qt.PointingHandCursor)
+        self.icon_btn.setFixedSize(18, 18)
+        self.icon_btn.setIconSize(QSize(14, 14))
+        self.icon_btn.clicked.connect(lambda: self.close_requested.emit(self.proc))
+        self.icon_btn.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+            }}
+            QToolButton:hover {{
+                background: {COLORS['border']};
+            }}
+        """)
+        layout.addWidget(self.icon_btn)
 
         self.title_label = QLabel(self.title)
         self.title_label.setStyleSheet(f"""
@@ -2538,33 +2558,19 @@ class TerminalTabCard(QFrame):
         self.title_label.setMaximumWidth(170)
         layout.addWidget(self.title_label)
 
-        self.close_btn = QToolButton(self)
-        self.close_btn.setCursor(Qt.PointingHandCursor)
-        self.close_btn.setText("×")
-        self.close_btn.setFixedSize(18, 18)
-        self.close_btn.setStyleSheet(f"""
-            QToolButton {{
-                background: transparent;
-                color: {COLORS['text_secondary']};
-                border: none;
-                border-radius: 8px;
-                font-size: 15px;
-                font-weight: 600;
-                padding-bottom: 1px;
-            }}
-            QToolButton:hover {{
-                background: {COLORS['border']};
-                color: {COLORS['text']};
-            }}
-        """)
-        self.close_btn.clicked.connect(lambda: self.close_requested.emit(self.proc))
-        layout.addWidget(self.close_btn)
+        self.update_icon()
+
+    def update_icon(self):
+        if self.hovered:
+            self.icon_btn.setIcon(close_icon(COLORS["text_secondary"], 14))
+        else:
+            self.icon_btn.setIcon(terminal_icon(COLORS["text_secondary"], 14))
 
     def apply_style(self):
-        background = COLORS["accent_light"] if self.active else "transparent"
-        border = "#d5c9ff" if self.active else "transparent"
-        hover_background = "#f5f2ff" if self.active else "#f7f5ff"
-        hover_border = "#d5c9ff" if self.active else "transparent"
+        background = "#eef1f6" if self.active else "transparent"
+        border = COLORS["border"] if self.active else "transparent"
+        hover_background = "#f4f6fa" if self.active else "#f7f8fb"
+        hover_border = COLORS["border"] if self.active else "transparent"
         self.setStyleSheet(f"""
             QFrame#terminalTabCard {{
                 background: {background};
@@ -2581,8 +2587,18 @@ class TerminalTabCard(QFrame):
         self.active = active
         self.apply_style()
 
+    def enterEvent(self, event):
+        self.hovered = True
+        self.update_icon()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.hovered = False
+        self.update_icon()
+        super().leaveEvent(event)
+
     def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton and not self.close_btn.geometry().contains(event.position().toPoint()):
+        if event.button() == Qt.MouseButton.LeftButton and not self.icon_btn.geometry().contains(event.position().toPoint()):
             self.selected.emit(self.proc)
             event.accept()
             return
