@@ -51,6 +51,7 @@ _AGENT_RUNTIME_PYTHON: Optional[str] = None
 _AGENT_RUNTIME_ERROR = ""
 _APP_SETTINGS: Optional[Dict[str, object]] = None
 _AGENT_RUNTIME_ENABLED: Optional[bool] = None
+_AUTOMATION_ENABLED: Optional[bool] = None
 DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 
@@ -108,6 +109,27 @@ def set_agent_runtime_enabled(enabled: bool):
     _AGENT_RUNTIME_ENABLED = bool(enabled)
     settings = load_app_settings()
     settings["agent_runtime_enabled"] = _AGENT_RUNTIME_ENABLED
+    save_app_settings(settings)
+
+
+def automation_enabled_setting() -> bool:
+    global _AUTOMATION_ENABLED
+    if _AUTOMATION_ENABLED is not None:
+        return _AUTOMATION_ENABLED
+    env_value = os.environ.get("AGENT_QT_AUTOMATION_ENABLED", "").strip().lower()
+    if env_value:
+        _AUTOMATION_ENABLED = env_value not in {"0", "false", "no", "off"}
+        return _AUTOMATION_ENABLED
+    settings = load_app_settings()
+    _AUTOMATION_ENABLED = bool(settings.get("automation_enabled", False))
+    return _AUTOMATION_ENABLED
+
+
+def set_automation_enabled_setting(enabled: bool):
+    global _AUTOMATION_ENABLED
+    _AUTOMATION_ENABLED = bool(enabled)
+    settings = load_app_settings()
+    settings["automation_enabled"] = _AUTOMATION_ENABLED
     save_app_settings(settings)
 
 
@@ -4687,7 +4709,7 @@ class ChatPage(QWidget):
         self.result_bubble: Optional[ChatBubble] = None
         self.worker: Optional[ExecuteWorker] = None
         self.automation_manager = AutomationProviderManager()
-        self.automation_enabled = False
+        self.automation_enabled = automation_enabled_setting()
         self.automation_model = AUTOMATION_DEFAULT_MODEL
         self.automation_worker: Optional[AutomationChatWorker] = None
         self.automation_preview_worker: Optional[AutomationPreviewWorker] = None
@@ -5007,6 +5029,8 @@ class ChatPage(QWidget):
         self.sidebar.set_tab("threads")
         self.expand_sidebar()
         self.load_history()
+        if self.automation_enabled:
+            self.run_automation_setup("start")
         self.update_prompt_tools_responsive()
         self.update_status_bar()
 
@@ -5287,6 +5311,7 @@ class ChatPage(QWidget):
     def set_automation_enabled(self, enabled: bool, toggle_row: Optional[SettingsToggleRow] = None):
         if not enabled:
             self.automation_enabled = False
+            set_automation_enabled_setting(False)
             self.automation_loop_active = False
             self.automation_loop_round = 0
             self.automation_loop_goal = ""
@@ -5297,6 +5322,7 @@ class ChatPage(QWidget):
         status = self.automation_manager.dependency_status()
         if not status.get("ready"):
             self.automation_enabled = False
+            set_automation_enabled_setting(False)
             if toggle_row is not None:
                 toggle_row.setChecked(False)
             styled_warning(
@@ -5306,6 +5332,7 @@ class ChatPage(QWidget):
             )
             return
         self.automation_enabled = True
+        set_automation_enabled_setting(True)
         self.stop_automation_preview(remove_bubble=True)
         self.load_history()
         self.run_automation_setup("start")
@@ -5410,6 +5437,9 @@ class ChatPage(QWidget):
                     self.add_status_bubble(message)
             else:
                 self.automation_enabled = False if action == "start" else self.automation_enabled
+                if action == "start":
+                    set_automation_enabled_setting(False)
+                    self.load_history()
                 self.refresh_prompt_bubble_buttons()
                 styled_warning(self, "自动化插件", message)
             worker.deleteLater()
