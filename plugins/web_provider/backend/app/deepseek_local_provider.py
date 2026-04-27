@@ -31,6 +31,32 @@ from deerflow.models.deepseek_web_bridge import DeepSeekWebBridge
 
 logger = logging.getLogger(__name__)
 
+
+def _looks_like_prompt_replay_text(text: str) -> bool:
+    content = str(text or "").strip()
+    if not content:
+        return False
+    lowered = content.lower()
+    markers = (
+        "you are acting as the backend llm for a local openai-compatible",
+        "you are acting as the backend llm for a local bash-only coding runner",
+        "continue the existing deerflow session already initialized in this chat",
+        "continue the existing plain bash agent session already initialized in this chat",
+        "return exactly one json object and nothing else",
+        "plain bash agent 模式",
+    )
+    if any(marker in lowered for marker in markers):
+        return True
+    hints = (
+        "no tools are available for this request",
+        "conversation:\n\n[user]",
+        "new conversation events since the previous request",
+        "runner 会执行你返回的单个 fenced bash 代码块",
+        "available tools (openai tools schema)",
+    )
+    return sum(1 for hint in hints if hint in lowered) >= 2
+
+
 DEFAULT_URL = os.environ.get("DEEPSEEK_WEB_URL", "https://chat.deepseek.com/")
 DEFAULT_HEADLESS = os.environ.get("DEEPSEEK_WEB_HEADLESS", "1") == "1"
 DEFAULT_FORCE_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FORCE_NEW_CHAT", "0") == "1"
@@ -1333,6 +1359,10 @@ def anthropic_tools_to_openai_tools(tools: list[dict[str, Any]] | None) -> list[
 
 def build_openai_assistant_message(payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
     assistant_content = payload.get("content", "")
+    if _looks_like_prompt_replay_text(str(assistant_content or "")):
+        logger.warning("Suppressing prompt-replay content before building assistant message.")
+        assistant_content = ""
+        payload = {**payload, "content": "", "parse_error": payload.get("parse_error") or "prompt_replay"}
     message: dict[str, Any] = {
         "role": "assistant",
         "content": assistant_content,
@@ -2741,6 +2771,9 @@ async def chat_completions(request: ChatCompletionRequest):
 
     payload = apply_text_tool_call_fallback(payload, request_tools)
     payload = validate_tool_calls_against_schemas(payload, request_tools)
+    if request_output_protocol == "plain" and _looks_like_prompt_replay_text(str(payload.get("content") or "")):
+        logger.warning("provider[%s] /v1 suppressed plain prompt replay response.", request_id)
+        payload = {**payload, "content": "", "tool_calls": [], "parse_error": "prompt_replay"}
     message, tool_calls, finish_reason = build_openai_assistant_message(payload)
     if tool_calls:
         logger.warning(

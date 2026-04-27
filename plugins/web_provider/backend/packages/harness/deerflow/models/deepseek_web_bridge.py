@@ -170,16 +170,26 @@ DEFAULT_ASSISTANT_SELECTORS = (
 PROMPT_REPLAY_MARKERS = (
     "You are acting as the backend LLM for a local OpenAI-compatible gateway.",
     "You are acting as the backend LLM for a local OpenAI-compatible chat gateway.",
+    "You are acting as the backend LLM for a local bash-only coding runner.",
     "Continue the existing DeerFlow session already initialized in this chat.",
+    "Continue the existing plain bash agent session already initialized in this chat.",
     "Return exactly one JSON object with this schema:",
     "Output should be clean assistant output (plain text by default), not a custom wrapper schema.",
+    "【非常重要：这是 plain bash agent 模式，不要使用 JSON 工具协议】",
 )
 PROMPT_REPLAY_HINTS = (
     "you are acting as the backend llm for a local openai-compatible",
+    "you are acting as the backend llm for a local bash-only coding runner",
     "continue this conversation naturally and follow the system/user/tool messages",
+    "continue this conversation naturally and follow the system/user messages",
     "continue the existing deerflow session already initialized in this chat",
+    "continue the existing plain bash agent session already initialized in this chat",
     "available tools (openai tools schema)",
+    "no tools are available for this request",
+    "plain bash agent 模式",
+    "runner 会执行你返回的单个 fenced bash 代码块",
     "conversation:\n\n[user]",
+    "new conversation events since the previous request",
 )
 EXACT_OUTPUT_HINTS = (
     "请严格只输出下一行文本",

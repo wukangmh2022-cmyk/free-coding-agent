@@ -1386,7 +1386,9 @@ def is_automation_done_response(text: str) -> bool:
 
 
 def looks_like_automation_context_payload(text: str) -> bool:
-    content = str(text or "")
+    content = str(text or "").strip()
+    if not content:
+        return False
     markers = (
         "第一段：系统提示词",
         "第二段：历史对话",
@@ -1395,7 +1397,29 @@ def looks_like_automation_context_payload(text: str) -> bool:
     marker_count = sum(1 for marker in markers if marker in content)
     if marker_count >= 2:
         return True
-    return "第三段：当前指令" in content and re.search(r"```+plaintext", content, re.I) is not None
+    if "第三段：当前指令" in content and re.search(r"```+plaintext", content, re.I) is not None:
+        return True
+    lowered = content.lower()
+    runner_hints = (
+        "plain bash agent 模式",
+        "backend llm for a local bash-only coding runner",
+        "runner 会执行你返回的单个 fenced bash 代码块",
+        "no tools are available for this request",
+        "session marker: flowflow_system_prompt",
+        "continue the existing plain bash agent session already initialized in this chat",
+        "follow the previously established bash-only runner instructions",
+        "new conversation events since the previous request",
+        "conversation:\n\n[user]",
+        "conversation:\r\n\r\n[user]",
+    )
+    runner_hint_count = sum(1 for hint in runner_hints if hint in lowered)
+    if runner_hint_count >= 3:
+        return True
+    if "backend llm for a local bash-only coding runner" in lowered and "conversation:" in lowered:
+        return True
+    if "plain bash agent 模式" in lowered and "conversation:" in lowered:
+        return True
+    return False
 
 
 def truncate_middle(text: str, limit: int) -> str:
@@ -2692,8 +2716,10 @@ def automation_venv_python(root: str) -> str:
 
 
 def find_automation_backend() -> str:
+    app_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.environ.get("AGENT_QT_WEB_PROVIDER_BACKEND", ""),
+        os.path.join(app_dir, "plugins", "web_provider", "backend"),
         "/Users/pippo/Downloads/freechat/deepseekwithdeerflow2.0/deer-flow/backend",
         os.path.expanduser("~/Downloads/freechat/deepseekwithdeerflow2.0/deer-flow/backend"),
         os.path.expanduser("~/Downloads/freechat/deepseekwithdeerflow2.0/deer-flow-gha/backend"),
