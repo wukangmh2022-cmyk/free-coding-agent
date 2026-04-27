@@ -3606,16 +3606,18 @@ class ChatBubble(QFrame):
         )
         editor_type = "QTextBrowser" if self.markdown else "QPlainTextEdit"
         font_family = "" if self.markdown else "font-family: 'SF Mono', 'Menlo', monospace;"
-        content_bg = "transparent" if self.flat else COLORS["code_bg"]
-        content_border = "transparent" if self.flat else COLORS["border"]
-        content_radius = 0 if self.flat else 12
+        flat_system_log = self.flat and self.role == "system"
+        content_bg = COLORS["code_bg"] if flat_system_log else ("transparent" if self.flat else COLORS["code_bg"])
+        content_border = COLORS["border"] if flat_system_log else ("transparent" if self.flat else COLORS["border"])
+        content_radius = 12 if flat_system_log else (0 if self.flat else 12)
+        content_padding = "10px 12px" if flat_system_log else ("2px 0" if self.flat else "10px 12px")
         self.content_label.setStyleSheet(f"""
             {editor_type} {{
                 background: {content_bg};
                 color: {COLORS['text']};
                 border: 1px solid {content_border};
                 border-radius: {content_radius}px;
-                padding: {'2px 0' if self.flat else '10px 12px'};
+                padding: {content_padding};
                 {font_family}
                 font-size: 12px;
                 selection-background-color: #d8e6ff;
@@ -6535,6 +6537,7 @@ class ChatPage(QWidget):
                 copy_text="复制执行日志",
                 scrollable=True,
                 max_content_height=210,
+                flat=True,
             )
             self.add_chat_widget(bubble)
             records = []
@@ -6798,6 +6801,7 @@ class ChatPage(QWidget):
             copy_text="复制执行日志",
             scrollable=True,
             max_content_height=210,
+            flat=True,
         )
         self.add_chat_widget(self.result_bubble, animate=True)
         
