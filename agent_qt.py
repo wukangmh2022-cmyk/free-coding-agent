@@ -1492,6 +1492,11 @@ AUTOMATION_FEEDBACK_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_FEEDBACK_CHARS", 1
 AUTOMATION_CONTEXT_WINDOW_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_TOKENS", 1_000_000, minimum=32000)
 AUTOMATION_CONTEXT_RESPONSE_RESERVE_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_RESERVE_TOKENS", 32000, minimum=4000)
 AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_TRIGGER_TOKENS", 180000, minimum=20000)
+AUTOMATION_CONTEXT_DISPLAY_TOKENS = env_int(
+    "AGENT_QT_AUTOMATION_CONTEXT_DISPLAY_TOKENS",
+    AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS,
+    minimum=20000,
+)
 AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_RECENT_TOKENS", 70000, minimum=8000)
 AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_SUMMARY_TOKENS", 90000, minimum=12000)
 AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 16000, minimum=1200)
@@ -5180,7 +5185,7 @@ class ChatPage(QWidget):
         composer_layout.setSpacing(8)
         self.automation_input = QTextEdit()
         self.automation_input.setPlaceholderText(
-            f"上下文 0k / {context_k_label(AUTOMATION_CONTEXT_WINDOW_TOKENS)} · 输入下一步需求..."
+            f"上下文 0k / {context_k_label(AUTOMATION_CONTEXT_DISPLAY_TOKENS)} · 输入下一步需求..."
         )
         self.automation_input.setFixedHeight(54)
         self.automation_input.setAcceptRichText(False)
@@ -6091,7 +6096,7 @@ class ChatPage(QWidget):
         return self.build_automation_system_text() + (
             "\n\n补充说明：provider 每次可能会打开新的网页对话，所以第二段包含 Agent Qt 保存的本会话上下文。"
             "请把这些上下文视为连续对话历史。上下文按纯文本给出，不是 JSON 或工具调用协议。"
-            f"DeepSeek V4 网页端上下文按 1000k 估算展示；当历史超过约 {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)} 时，"
+            f"自动化上下文按 {context_k_label(AUTOMATION_CONTEXT_DISPLAY_TOKENS)} 估算展示；当历史超过约 {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)} 时，"
             "Agent Qt 会把较早历史 compact 成 plaintext 摘要，近期上下文保留原文后继续。"
         )
 
@@ -6188,7 +6193,7 @@ class ChatPage(QWidget):
         current_text = self.automation_input.toPlainText().strip() if self.automation_input is not None else ""
         used = self.automation_context_tokens_for_next_request(current_text)
         return (
-            f"上下文 {context_k_label(used)} / {context_k_label(AUTOMATION_CONTEXT_WINDOW_TOKENS)}"
+            f"上下文 {context_k_label(used)} / {context_k_label(AUTOMATION_CONTEXT_DISPLAY_TOKENS)}"
             " · 输入下一步需求..."
         )
 
