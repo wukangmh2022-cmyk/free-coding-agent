@@ -956,8 +956,8 @@ def terminal_icon(color: str = "#172033", size: int = 16) -> QIcon:
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen)
     painter.drawRoundedRect(QRectF(2.5, 3.5, size - 5, size - 7), 2.8, 2.8)
-    painter.drawLine(5.4, 7.0, 8.2, 9.5)
-    painter.drawLine(8.2, 9.5, 5.4, 12.0)
+    painter.drawLine(5.9, 6.7, 8.8, 9.25)
+    painter.drawLine(8.8, 9.25, 5.9, 11.8)
     painter.drawLine(10.0, 12.0, size - 4.8, 12.0)
     painter.end()
     return QIcon(pixmap)
@@ -2536,6 +2536,8 @@ class TerminalTabCard(QFrame):
         self.setObjectName("terminalTabCard")
         self.setCursor(Qt.PointingHandCursor)
         self.hovered = False
+        self.setFixedHeight(28)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.setup_ui()
         self.apply_style()
 
@@ -2571,7 +2573,7 @@ class TerminalTabCard(QFrame):
                 border: none;
                 font-size: 12px;
                 font-weight: 500;
-                padding: 0;
+                padding: 0 0 1px 0;
             }}
         """)
         self.title_label.setMinimumWidth(56)
@@ -3535,13 +3537,22 @@ class ChatBubble(QFrame):
         layout.setSpacing(6 if self.compact_user else (8 if self.flat else 10))
         
         if self.compact_user:
-            self.content_label = QLabel(self.content)
-            self.content_label.setWordWrap(True)
+            self.content_label = QTextBrowser()
+            self.content_label.setOpenExternalLinks(False)
+            self.content_label.setReadOnly(True)
+            self.content_label.setPlainText(self.content)
+            self.content_label.document().setDocumentMargin(0)
             self.content_label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
             )
+            self.content_label.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.content_label.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.content_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.content_label.customContextMenuRequested.connect(
+                lambda pos, editor=self.content_label: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
+            )
             self.content_label.setStyleSheet(f"""
-                QLabel {{
+                QTextBrowser {{
                     background: transparent;
                     color: {COLORS['text']};
                     border: none;
@@ -3549,9 +3560,24 @@ class ChatBubble(QFrame):
                     font-size: 13px;
                     line-height: 1.35;
                 }}
+                QScrollBar:vertical {{
+                    background: transparent;
+                    width: 8px;
+                    margin: 2px 0 2px 2px;
+                }}
+                QScrollBar::handle:vertical {{
+                    background: {COLORS['border_strong']};
+                    border-radius: 4px;
+                    min-height: 22px;
+                }}
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                    height: 0;
+                }}
             """)
             self.content_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             layout.addWidget(self.content_label)
+            self.adjust_content_height()
+            self.schedule_content_height_adjustment()
             return
         
         header = QHBoxLayout()
@@ -3767,6 +3793,19 @@ class ChatBubble(QFrame):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
                 height: 0;
             }}
+            QScrollBar:horizontal {{
+                background: transparent;
+                height: 8px;
+                margin: 0 8px 2px 8px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {COLORS['border_strong']};
+                border-radius: 4px;
+                min-width: 28px;
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0;
+            }}
         """
 
     def markdown_code_frame_style(self) -> str:
@@ -3791,7 +3830,7 @@ class ChatBubble(QFrame):
                 background: transparent;
                 color: {COLORS['text_secondary']};
                 border: none;
-                padding: 6px 10px;
+                padding: 0;
                 font-size: 11px;
                 font-weight: 800;
                 letter-spacing: 0;
@@ -3832,12 +3871,14 @@ class ChatBubble(QFrame):
 
         header = ClickableFrame()
         header.setObjectName("markdownCodeHeader")
-        header.setFixedHeight(28)
+        header.setFixedHeight(32)
         header.setStyleSheet(self.markdown_code_header_style())
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(0, 0, 8, 0)
+        header_layout.setContentsMargins(10, 0, 8, 0)
         header_layout.setSpacing(4)
         lang_label = QLabel((lang or "text").strip().lower() or "text")
+        lang_label.setFixedHeight(24)
+        lang_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header_layout.addWidget(lang_label, 0, Qt.AlignmentFlag.AlignVCenter)
         header_layout.addStretch()
         collapse_btn = QToolButton(cursor=Qt.CursorShape.PointingHandCursor)
@@ -3949,7 +3990,7 @@ class ChatBubble(QFrame):
     def update_display_content(self, text: str):
         self.display_content = text
         if self.compact_user:
-            self.content_label.setText(text)
+            self.content_label.setPlainText(text)
         elif self.markdown and self.expand_to_content:
             self.render_markdown_parts()
         elif self.markdown:
@@ -4012,13 +4053,12 @@ class ChatBubble(QFrame):
             for code_box in self.markdown_code_widgets:
                 if not code_box.isVisible():
                     continue
-                available_width = max(120, code_box.viewport().width() - 10)
                 metrics = code_box.fontMetrics()
                 text = code_box.toPlainText()
-                target_height = min(
-                    self.code_max_height,
-                    max(70, estimate_wrapped_text_height(text, metrics, available_width)),
-                )
+                line_count = max(1, len(text.splitlines()) or 1)
+                vertical_padding = 26
+                scrollbar_room = 12 if code_box.horizontalScrollBarPolicy() != Qt.ScrollBarPolicy.ScrollBarAlwaysOff else 0
+                target_height = min(self.code_max_height, max(46, line_count * metrics.lineSpacing() + vertical_padding + scrollbar_room))
                 if self.stabilize_markdown_height:
                     key = id(code_box)
                     target_height = max(int(self._stable_markdown_heights.get(key, 0)), target_height)
@@ -4035,6 +4075,10 @@ class ChatBubble(QFrame):
             available_width = max(120, self.content_label.width() - 8)
             metrics = self.content_label.fontMetrics()
             target_height = max(26, estimate_wrapped_text_height(self.visible_content() or " ", metrics, available_width))
+            target_height = min(self.max_content_height, target_height)
+            self.content_label.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded if target_height >= self.max_content_height else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
             if self.content_label.height() != target_height:
                 self.content_label.setFixedHeight(target_height)
             return
@@ -5070,7 +5114,7 @@ class ChatPage(QWidget):
         
         right_panel = QWidget(styleSheet=f"background: {COLORS['bg']};")
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(18, 16, 18, 0)
+        right_layout.setContentsMargins(0, 16, 18, 0)
         right_layout.setSpacing(12)
         
         # 路径标签（双击返回首页）
