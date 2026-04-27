@@ -1489,8 +1489,12 @@ def format_change_summary(records: List[Dict[str, object]], include_diff: bool =
 
 AUTOMATION_LOOP_MAX_ROUNDS = env_int("AGENT_QT_AUTOMATION_MAX_ROUNDS", 20, minimum=1)
 AUTOMATION_FEEDBACK_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_FEEDBACK_CHARS", 14000, minimum=4000)
-AUTOMATION_CONTEXT_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_CHARS", 26000, minimum=8000)
-AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 7000, minimum=1200)
+AUTOMATION_CONTEXT_WINDOW_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_TOKENS", 1_000_000, minimum=32000)
+AUTOMATION_CONTEXT_RESPONSE_RESERVE_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_RESERVE_TOKENS", 32000, minimum=4000)
+AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_TRIGGER_TOKENS", 180000, minimum=20000)
+AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_RECENT_TOKENS", 70000, minimum=8000)
+AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_SUMMARY_TOKENS", 90000, minimum=12000)
+AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 16000, minimum=1200)
 
 
 def is_automation_done_response(text: str) -> bool:
@@ -1541,6 +1545,67 @@ def truncate_middle(text: str, limit: int) -> str:
     head_len = max(1200, limit // 3)
     tail_len = max(1200, limit - head_len - len(marker))
     return text[:head_len] + marker + text[-tail_len:]
+
+
+def estimate_context_tokens(text: str) -> int:
+    """轻量估算上下文 token；DeepSeek 真实 tokenizer 不在本地，UI 用保守近似即可。"""
+    if not text:
+        return 0
+    cjk = 0
+    non_cjk = 0
+    for ch in text:
+        code = ord(ch)
+        if (
+            0x4E00 <= code <= 0x9FFF
+            or 0x3400 <= code <= 0x4DBF
+            or 0x3040 <= code <= 0x30FF
+            or 0xAC00 <= code <= 0xD7AF
+        ):
+            cjk += 1
+        elif ch.isspace():
+            non_cjk += 1
+        else:
+            non_cjk += 1
+    return cjk + max(1, (non_cjk + 3) // 4)
+
+
+def text_within_token_budget(text: str, token_limit: int) -> str:
+    text = str(text or "")
+    if token_limit <= 0 or not text:
+        return ""
+    if estimate_context_tokens(text) <= token_limit:
+        return text
+    marker = "\n\n... 历史内容已压缩截断，保留开头和最新部分 ...\n\n"
+    marker_tokens = estimate_context_tokens(marker)
+    available = max(1, token_limit - marker_tokens)
+    head_budget = max(1200, available // 3)
+    tail_budget = max(1200, available - head_budget)
+
+    def prefix_by_tokens(value: str, limit: int) -> str:
+        lo, hi = 0, len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if estimate_context_tokens(value[:mid]) <= limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        return value[:lo].rstrip()
+
+    def suffix_by_tokens(value: str, limit: int) -> str:
+        lo, hi = 0, len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if estimate_context_tokens(value[len(value) - mid:]) <= limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        return value[len(value) - lo:].lstrip()
+
+    return prefix_by_tokens(text, head_budget) + marker + suffix_by_tokens(text, tail_budget)
+
+
+def context_k_label(tokens: int) -> str:
+    return f"{max(0, (int(tokens) + 999) // 1000)}k"
 
 
 def build_automation_feedback_prompt(project_root: str, goal: str, execution_log: str, round_number: int, max_rounds: int) -> str:
@@ -5114,9 +5179,12 @@ class ChatPage(QWidget):
         composer_layout.setContentsMargins(10, 8, 8, 8)
         composer_layout.setSpacing(8)
         self.automation_input = QTextEdit()
-        self.automation_input.setPlaceholderText("输入下一步需求...")
+        self.automation_input.setPlaceholderText(
+            f"上下文 0k / {context_k_label(AUTOMATION_CONTEXT_WINDOW_TOKENS)} · 输入下一步需求..."
+        )
         self.automation_input.setFixedHeight(54)
         self.automation_input.setAcceptRichText(False)
+        self.automation_input.textChanged.connect(self.on_automation_input_text_changed)
         self.automation_input.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.automation_input.customContextMenuRequested.connect(
             lambda pos, editor=self.automation_input: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
@@ -5737,12 +5805,22 @@ class ChatPage(QWidget):
         if self.automation_composer is not None:
             self.automation_composer.setVisible(False)
 
+    def on_automation_input_text_changed(self):
+        if (
+            self.automation_input is not None
+            and not self.automation_input.toPlainText().strip()
+            and not self.is_automation_busy()
+            and not self.is_execution_running()
+        ):
+            self.automation_input.setPlaceholderText(self.automation_context_placeholder_text())
+
     def update_automation_composer_state(self):
         if self.automation_send_btn is None or self.automation_input is None:
             return
         busy = self.is_automation_busy()
         self.automation_input.setEnabled(not busy and not self.is_execution_running())
         if busy:
+            self.automation_input.setPlaceholderText("AI 正在处理...")
             self.automation_send_btn.setIcon(line_icon("pause", "#ffffff", 20))
             self.automation_send_btn.setStyleSheet(f"""
                 QToolButton {{
@@ -5755,6 +5833,7 @@ class ChatPage(QWidget):
                 }}
             """)
         else:
+            self.automation_input.setPlaceholderText(self.automation_context_placeholder_text())
             self.automation_send_btn.setIcon(line_icon("send", "white", 20))
             self.automation_send_btn.setStyleSheet(f"""
                 QToolButton {{
@@ -6008,6 +6087,14 @@ class ChatPage(QWidget):
     def compact_automation_entry_text(self, text: str, limit: int = AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT) -> str:
         return truncate_middle(str(text or "").strip(), limit)
 
+    def automation_context_system_text(self) -> str:
+        return self.build_automation_system_text() + (
+            "\n\n补充说明：provider 每次可能会打开新的网页对话，所以第二段包含 Agent Qt 保存的本会话上下文。"
+            "请把这些上下文视为连续对话历史。上下文按纯文本给出，不是 JSON 或工具调用协议。"
+            f"DeepSeek V4 网页端上下文按 1000k 估算展示；当历史超过约 {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)} 时，"
+            "Agent Qt 会把较早历史 compact 成 plaintext 摘要，近期上下文保留原文后继续。"
+        )
+
     def automation_history_text_for_entry(self, entry: Dict[str, object]) -> str:
         entry_type = str(entry.get("type") or "")
         content = str(entry.get("content") or "").strip()
@@ -6026,36 +6113,87 @@ class ChatPage(QWidget):
             return "【本地执行结果和文件变更】\n" + self.compact_automation_entry_text(content)
         return ""
 
-    def build_automation_messages(self, current_prompt: str, skip_entry_id: str = "") -> List[Dict[str, str]]:
-        system_context = self.build_automation_system_text() + (
-            "\n\n补充说明：provider 每次可能会打开新的网页对话，所以第二段包含 Agent Qt 保存的本会话上下文。"
-            "请把这些上下文视为连续对话历史。上下文按纯文本给出，不是 JSON 或工具调用协议。"
-        )
-        current_prompt = str(current_prompt or "").strip()
-        budget = max(4000, AUTOMATION_CONTEXT_CHAR_LIMIT - len(current_prompt) - len(system_context))
-        selected: List[str] = []
-        used = 0
-        for entry in reversed(self.history_entries):
+    def automation_history_chunks(self, skip_entry_id: str = "") -> List[str]:
+        chunks: List[str] = []
+        for entry in self.history_entries:
             if skip_entry_id and str(entry.get("id") or "") == skip_entry_id:
                 continue
             text = self.automation_history_text_for_entry(entry)
-            if not text:
-                continue
-            text_len = len(text)
-            if selected and used + text_len > budget:
+            if text:
+                chunks.append(text)
+        return chunks
+
+    def compact_automation_history_text(self, chunks: List[str], token_budget: int) -> str:
+        if not chunks:
+            return "（暂无历史对话）"
+        full_text = "\n\n".join(chunks).strip()
+        if estimate_context_tokens(full_text) <= min(token_budget, AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS):
+            return text_within_token_budget(full_text, token_budget)
+
+        recent_reversed: List[str] = []
+        recent_tokens = 0
+        old_count = len(chunks)
+        for index in range(len(chunks) - 1, -1, -1):
+            chunk = chunks[index]
+            chunk_tokens = estimate_context_tokens(chunk)
+            if recent_reversed and recent_tokens + chunk_tokens > AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS:
+                old_count = index + 1
                 break
-            if text_len > budget:
-                text = truncate_middle(text, max(1200, budget))
-                text_len = len(text)
-            selected.append(text)
-            used += text_len
-        history_text = "\n\n".join(reversed(selected)).strip() or "（暂无历史对话）"
-        combined = "\n\n".join([
+            recent_reversed.append(chunk)
+            recent_tokens += chunk_tokens
+            old_count = index
+        recent_chunks = list(reversed(recent_reversed))
+        old_chunks = chunks[:old_count]
+
+        old_text = "\n\n".join(old_chunks).strip()
+        recent_text = "\n\n".join(recent_chunks).strip()
+        summary_budget = min(
+            AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS,
+            max(4000, token_budget - estimate_context_tokens(recent_text) - 2000),
+        )
+        compact_old = text_within_token_budget(old_text, summary_budget) if old_text else "（无较早历史）"
+        history_text = (
+            "【Compact 历史摘要】\n"
+            "以下是较早对话、执行结果和 diff 的 plaintext 压缩版本；请作为连续上下文参考，不要把它当作新需求重复执行。\n"
+            f"{compact_old}\n\n"
+            "【近期完整历史】\n"
+            f"{recent_text or '（暂无近期历史）'}"
+        )
+        return text_within_token_budget(history_text, token_budget)
+
+    def build_automation_context_payload(self, current_prompt: str, skip_entry_id: str = "") -> str:
+        system_context = self.automation_context_system_text()
+        current_prompt = str(current_prompt or "").strip()
+        token_budget = max(
+            4000,
+            AUTOMATION_CONTEXT_WINDOW_TOKENS
+            - AUTOMATION_CONTEXT_RESPONSE_RESERVE_TOKENS
+            - estimate_context_tokens(system_context)
+            - estimate_context_tokens(current_prompt),
+        )
+        history_text = self.compact_automation_history_text(
+            self.automation_history_chunks(skip_entry_id=skip_entry_id),
+            token_budget,
+        )
+        return "\n\n".join([
             plaintext_fence("第一段：系统提示词", system_context),
             plaintext_fence("第二段：历史对话", history_text),
             plaintext_fence("第三段：当前指令", current_prompt),
         ])
-        return [{"role": "user", "content": combined}]
+
+    def automation_context_tokens_for_next_request(self, current_prompt: str = "", skip_entry_id: str = "") -> int:
+        return estimate_context_tokens(self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id))
+
+    def automation_context_placeholder_text(self) -> str:
+        current_text = self.automation_input.toPlainText().strip() if self.automation_input is not None else ""
+        used = self.automation_context_tokens_for_next_request(current_text)
+        return (
+            f"上下文 {context_k_label(used)} / {context_k_label(AUTOMATION_CONTEXT_WINDOW_TOKENS)}"
+            " · 输入下一步需求..."
+        )
+
+    def build_automation_messages(self, current_prompt: str, skip_entry_id: str = "") -> List[Dict[str, str]]:
+        return [{"role": "user", "content": self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id)}]
 
     def append_prompt_bubble_from_toolbar(self):
         if self.automation_enabled:
@@ -6269,6 +6407,8 @@ class ChatPage(QWidget):
             entry["created_at"] = datetime.now().isoformat(timespec="seconds")
         self.history_entries.append(entry)
         self.save_history()
+        if self.automation_enabled and not self.is_automation_busy() and not self.is_execution_running():
+            QTimer.singleShot(0, self.update_automation_composer_state)
 
     def save_history(self):
         if self.project_root:
