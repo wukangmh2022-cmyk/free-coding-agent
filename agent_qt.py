@@ -944,22 +944,39 @@ def svg_icon(svg: str, size: int = 18) -> QIcon:
     return QIcon(pixmap)
 
 def terminal_icon(color: str = "#172033", size: int = 16) -> QIcon:
-    icon = svg_icon(f"""
-        <svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none">
-          <rect x="3.5" y="5" width="17" height="14" rx="3.5" stroke="{color}" stroke-width="1.9"/>
-          <path d="M7.5 10.2l3 2.3-3 2.3" stroke="{color}" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M12.8 15h4.2" stroke="{color}" stroke-width="1.9" stroke-linecap="round"/>
-        </svg>
-    """, size)
-    return icon if not icon.isNull() else line_icon("terminal", color, size)
+    scale = 3
+    pixmap = QPixmap(size * scale, size * scale)
+    pixmap.setDevicePixelRatio(scale)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), 1.55)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.drawRoundedRect(QRectF(2.5, 3.5, size - 5, size - 7), 2.8, 2.8)
+    painter.drawLine(5.4, 7.0, 8.2, 9.5)
+    painter.drawLine(8.2, 9.5, 5.4, 12.0)
+    painter.drawLine(10.0, 12.0, size - 4.8, 12.0)
+    painter.end()
+    return QIcon(pixmap)
 
 def close_icon(color: str = "#657089", size: int = 16) -> QIcon:
-    icon = svg_icon(f"""
-        <svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none">
-          <path d="M7.5 7.5l9 9M16.5 7.5l-9 9" stroke="{color}" stroke-width="2.2" stroke-linecap="round"/>
-        </svg>
-    """, size)
-    return icon if not icon.isNull() else line_icon("close", color, size)
+    scale = 3
+    pixmap = QPixmap(size * scale, size * scale)
+    pixmap.setDevicePixelRatio(scale)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), 1.7)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.drawLine(5.3, 5.3, size - 5.3, size - 5.3)
+    painter.drawLine(size - 5.3, 5.3, 5.3, size - 5.3)
+    painter.end()
+    return QIcon(pixmap)
 
 # ============================================================
 # 工具函数
@@ -2524,13 +2541,13 @@ class TerminalTabCard(QFrame):
 
     def setup_ui(self):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 3, 5, 3)
-        layout.setSpacing(6)
+        layout.setContentsMargins(9, 4, 9, 4)
+        layout.setSpacing(4)
 
         self.icon_btn = QToolButton(self)
         self.icon_btn.setCursor(Qt.PointingHandCursor)
-        self.icon_btn.setFixedSize(18, 18)
-        self.icon_btn.setIconSize(QSize(14, 14))
+        self.icon_btn.setFixedSize(16, 18)
+        self.icon_btn.setIconSize(QSize(16, 16))
         self.icon_btn.clicked.connect(lambda: self.close_requested.emit(self.proc))
         self.icon_btn.setStyleSheet(f"""
             QToolButton {{
@@ -2542,9 +2559,11 @@ class TerminalTabCard(QFrame):
                 background: {COLORS['border']};
             }}
         """)
-        layout.addWidget(self.icon_btn)
+        layout.addWidget(self.icon_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.title_label = QLabel(self.title)
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.title_label.setFixedHeight(18)
         self.title_label.setStyleSheet(f"""
             QLabel {{
                 color: {COLORS['text']};
@@ -2552,19 +2571,20 @@ class TerminalTabCard(QFrame):
                 border: none;
                 font-size: 12px;
                 font-weight: 500;
+                padding: 0;
             }}
         """)
         self.title_label.setMinimumWidth(56)
         self.title_label.setMaximumWidth(170)
-        layout.addWidget(self.title_label)
+        layout.addWidget(self.title_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.update_icon()
 
     def update_icon(self):
         if self.hovered:
-            self.icon_btn.setIcon(close_icon(COLORS["text_secondary"], 14))
+            self.icon_btn.setIcon(close_icon(COLORS["text_secondary"], 16))
         else:
-            self.icon_btn.setIcon(terminal_icon(COLORS["text_secondary"], 14))
+            self.icon_btn.setIcon(terminal_icon(COLORS["text_secondary"], 16))
 
     def apply_style(self):
         background = "#eef1f6" if self.active else "transparent"
