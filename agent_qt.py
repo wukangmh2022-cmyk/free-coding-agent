@@ -774,6 +774,21 @@ class SettingsToggleRow(QWidget):
     def isChecked(self) -> bool:
         return self.switch.isChecked()
 
+
+class ClickableFrame(QFrame):
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
 def split_markdown_fenced_blocks(text: str) -> List[Dict[str, str]]:
     parts: List[Dict[str, str]] = []
     lines = (text or "").splitlines(keepends=True)
@@ -1092,6 +1107,20 @@ def find_heredoc_tags(line: str) -> List[str]:
     """提取一行 Bash 命令里的 heredoc 结束标记，如 EOF。"""
     return [match.group("tag") for match in HEREDOC_RE.finditer(line)]
 
+def strip_heredoc_bodies_for_detection(cmd: str) -> str:
+    """长运行检测只看 shell 命令本身，避免把写入的 Python 内容误判成服务进程。"""
+    visible_lines: List[str] = []
+    pending_tags: List[str] = []
+    for raw_line in (cmd or "").splitlines():
+        stripped = raw_line.strip()
+        if pending_tags:
+            if stripped in pending_tags:
+                pending_tags = [tag for tag in pending_tags if tag != stripped]
+            continue
+        visible_lines.append(raw_line)
+        pending_tags.extend(find_heredoc_tags(raw_line))
+    return "\n".join(visible_lines)
+
 def split_cd_chain(line: str) -> List[str]:
     """
     将 `cd path && command` 拆成两条命令，避免执行器把整段当目录路径。
@@ -1245,8 +1274,9 @@ def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
     return cmds
 
 def is_long_running(cmd: str) -> bool:
-    command_text = cmd.lower()
-    first_line = cmd.splitlines()[0].lower().strip()
+    detection_cmd = strip_heredoc_bodies_for_detection(cmd).strip() or cmd
+    command_text = detection_cmd.lower()
+    first_line = detection_cmd.splitlines()[0].lower().strip() if detection_cmd.splitlines() else ""
     if any(kw in first_line for kw in ['pip', 'install', 'brew', 'apt', 'git clone']):
         return False
 
@@ -3354,6 +3384,9 @@ class ChatBubble(QFrame):
         self.code_max_height = 260
         self.markdown_widgets: List[QWidget] = []
         self.markdown_code_widgets: List[QPlainTextEdit] = []
+        self.markdown_part_signatures: List[tuple] = []
+        self.stabilize_markdown_height = False
+        self._stable_markdown_heights: Dict[int, int] = {}
         self.min_content_height = 34 if compact_user else 58
         self._height_adjust_scheduled = False
         self._last_content_width = 0
@@ -3552,6 +3585,8 @@ class ChatBubble(QFrame):
             widget.deleteLater()
         self.markdown_widgets = []
         self.markdown_code_widgets = []
+        self.markdown_part_signatures = []
+        self._stable_markdown_heights = {}
 
     def capture_markdown_code_scroll_state(self) -> List[Dict[str, object]]:
         states: List[Dict[str, object]] = []
@@ -3634,17 +3669,31 @@ class ChatBubble(QFrame):
 
     def markdown_code_header_style(self) -> str:
         return f"""
-            QLabel {{
+            QFrame#markdownCodeHeader {{
                 background: {COLORS['surface_alt']};
-                color: {COLORS['text_secondary']};
                 border: none;
                 border-bottom: 1px solid {COLORS['border']};
                 border-top-left-radius: 10px;
                 border-top-right-radius: 10px;
+            }}
+            QLabel {{
+                background: transparent;
+                color: {COLORS['text_secondary']};
+                border: none;
                 padding: 6px 10px;
                 font-size: 11px;
                 font-weight: 800;
                 letter-spacing: 0;
+            }}
+            QToolButton {{
+                background: transparent;
+                color: {COLORS['text_secondary']};
+                border: none;
+                font-size: 13px;
+                font-weight: 900;
+            }}
+            QToolButton:hover {{
+                color: {COLORS['accent_dark']};
             }}
         """
 
@@ -3657,6 +3706,7 @@ class ChatBubble(QFrame):
         viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         viewer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         viewer.setStyleSheet(self.markdown_text_style())
+        viewer.markdown_source = text
         layout.addWidget(viewer)
         self.markdown_widgets.append(viewer)
         return viewer
@@ -3669,10 +3719,21 @@ class ChatBubble(QFrame):
         code_layout.setContentsMargins(0, 0, 0, 0)
         code_layout.setSpacing(0)
 
+        header = ClickableFrame()
+        header.setObjectName("markdownCodeHeader")
+        header.setFixedHeight(28)
+        header.setStyleSheet(self.markdown_code_header_style())
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 8, 0)
+        header_layout.setSpacing(4)
         lang_label = QLabel((lang or "text").strip().lower() or "text")
-        lang_label.setFixedHeight(28)
-        lang_label.setStyleSheet(self.markdown_code_header_style())
-        code_layout.addWidget(lang_label)
+        header_layout.addWidget(lang_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addStretch()
+        collapse_btn = QToolButton(cursor=Qt.CursorShape.PointingHandCursor)
+        collapse_btn.setText("-")
+        collapse_btn.setFixedSize(22, 22)
+        header_layout.addWidget(collapse_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        code_layout.addWidget(header)
 
         code_box = QPlainTextEdit()
         code_box.setReadOnly(True)
@@ -3687,19 +3748,82 @@ class ChatBubble(QFrame):
         )
         code_box.setStyleSheet(self.markdown_code_style())
         code_layout.addWidget(code_box)
+
+        def toggle_code():
+            visible = code_box.isVisible()
+            code_box.setVisible(not visible)
+            collapse_btn.setText("+" if visible else "-")
+            header.setProperty("collapsed", visible)
+            self.adjust_content_height()
+
+        collapse_btn.clicked.connect(toggle_code)
+        code_box.code_source = code
+        code_frame.code_box = code_box
+        code_frame.lang_label = lang_label
+        code_frame.collapse_btn = collapse_btn
         layout.addWidget(code_frame)
         self.markdown_widgets.append(code_frame)
         self.markdown_code_widgets.append(code_box)
         return code_box
+
+    def update_markdown_parts_in_place(self, parts: List[Dict[str, str]], signatures: List[tuple]) -> bool:
+        if signatures != self.markdown_part_signatures or len(parts) != len(self.markdown_widgets):
+            return False
+        code_index = 0
+        changed = False
+        for part, widget in zip(parts, self.markdown_widgets):
+            if part["type"] == "code":
+                if code_index >= len(self.markdown_code_widgets):
+                    return False
+                code_box = self.markdown_code_widgets[code_index]
+                text = part.get("text", "")
+                if getattr(code_box, "code_source", None) != text:
+                    vertical = code_box.verticalScrollBar()
+                    horizontal = code_box.horizontalScrollBar()
+                    old_value = vertical.value()
+                    old_h_value = horizontal.value()
+                    was_at_bottom = old_value >= vertical.maximum() - 4
+                    code_box.code_source = text
+                    code_box.setUpdatesEnabled(False)
+                    code_box.setPlainText(text)
+                    code_box.setUpdatesEnabled(True)
+                    if was_at_bottom:
+                        vertical.setValue(vertical.maximum())
+                        QTimer.singleShot(0, lambda editor=code_box: editor.verticalScrollBar().setValue(editor.verticalScrollBar().maximum()))
+                    else:
+                        vertical.setValue(min(old_value, vertical.maximum()))
+                    horizontal.setValue(min(old_h_value, horizontal.maximum()))
+                    changed = True
+                code_index += 1
+            else:
+                text = part.get("text", "")
+                if not isinstance(widget, QTextBrowser):
+                    return False
+                if getattr(widget, "markdown_source", None) != text:
+                    widget.markdown_source = text
+                    widget.setMarkdown(text)
+                    changed = True
+        if changed:
+            self.adjust_content_height()
+            self.schedule_content_height_adjustment()
+        return True
 
     def render_markdown_parts(self, layout: Optional[QVBoxLayout] = None):
         if layout is None:
             layout = self.layout()
         if layout is None:
             return
+        parts = split_markdown_fenced_blocks(self.visible_content())
+        signatures = [
+            (part["type"], (part.get("lang", "") if part["type"] == "code" else ""))
+            for part in parts
+        ]
+        if self.update_markdown_parts_in_place(parts, signatures):
+            return
         code_scroll_states = self.capture_markdown_code_scroll_state()
         self.clear_markdown_widgets()
-        for part in split_markdown_fenced_blocks(self.visible_content()):
+        self.markdown_part_signatures = signatures
+        for part in parts:
             if part["type"] == "code":
                 self.add_markdown_code_widget(part.get("lang", ""), part.get("text", ""), layout)
             else:
@@ -3760,6 +3884,7 @@ class ChatBubble(QFrame):
     def adjust_content_height(self):
         if self.markdown and self.expand_to_content and self.markdown_widgets:
             self._height_adjust_scheduled = False
+            next_stable_heights: Dict[int, int] = {}
             for widget in self.markdown_widgets:
                 if not isinstance(widget, QTextBrowser):
                     continue
@@ -3767,9 +3892,15 @@ class ChatBubble(QFrame):
                 metrics = widget.fontMetrics()
                 text = widget.toPlainText()
                 target_height = max(34, estimate_wrapped_text_height(text, metrics, available_width))
+                if self.stabilize_markdown_height:
+                    key = id(widget)
+                    target_height = max(int(self._stable_markdown_heights.get(key, 0)), target_height)
+                    next_stable_heights[key] = target_height
                 if widget.height() != target_height:
                     widget.setFixedHeight(target_height)
             for code_box in self.markdown_code_widgets:
+                if not code_box.isVisible():
+                    continue
                 available_width = max(120, code_box.viewport().width() - 10)
                 metrics = code_box.fontMetrics()
                 text = code_box.toPlainText()
@@ -3777,8 +3908,14 @@ class ChatBubble(QFrame):
                     self.code_max_height,
                     max(70, estimate_wrapped_text_height(text, metrics, available_width)),
                 )
+                if self.stabilize_markdown_height:
+                    key = id(code_box)
+                    target_height = max(int(self._stable_markdown_heights.get(key, 0)), target_height)
+                    next_stable_heights[key] = target_height
                 if code_box.height() != target_height:
                     code_box.setFixedHeight(target_height)
+            if self.stabilize_markdown_height:
+                self._stable_markdown_heights = next_stable_heights
             return
         if not hasattr(self, "content_label") or self.content_label is None:
             return
@@ -3811,10 +3948,14 @@ class ChangeSummaryCard(QFrame):
         self.records = records
         self.detail_widgets: List[QTextEdit] = []
         self.file_row_widgets: List[QFrame] = []
-        self.file_row_buttons: List[QPushButton] = []
+        self.file_row_toggles: List[QFrame] = []
+        self.file_row_text_labels: List[QLabel] = []
+        self.file_row_arrow_labels: List[QLabel] = []
+        self.file_row_stat_labels: List[QLabel] = []
         self.undo_btn: Optional[QPushButton] = None
         self.title_label: Optional[QLabel] = None
-        self.stats_label: Optional[QLabel] = None
+        self.stats_add_label: Optional[QLabel] = None
+        self.stats_del_label: Optional[QLabel] = None
         self.status_label: Optional[QLabel] = None
         self.is_undone = False
         self.setup_ui()
@@ -3832,9 +3973,12 @@ class ChangeSummaryCard(QFrame):
         title = QLabel(f"{len(self.records)} files changed")
         self.title_label = title
         title.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900; background: transparent; border: none;")
-        stats = QLabel(f"+{additions}  -{deletions}")
-        self.stats_label = stats
-        stats.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; font-weight: 800; background: transparent; border: none;")
+        stats_add = QLabel(f"+{additions}")
+        self.stats_add_label = stats_add
+        stats_add.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px; font-weight: 900; background: transparent; border: none;")
+        stats_del = QLabel(f"-{deletions}")
+        self.stats_del_label = stats_del
+        stats_del.setStyleSheet(f"color: {COLORS['danger']}; font-size: 12px; font-weight: 900; background: transparent; border: none;")
         self.status_label = QLabel("已撤销")
         self.status_label.setVisible(False)
         self.status_label.setStyleSheet(f"""
@@ -3850,7 +3994,9 @@ class ChangeSummaryCard(QFrame):
         """)
         header.addWidget(title)
         header.addSpacing(10)
-        header.addWidget(stats)
+        header.addWidget(stats_add)
+        header.addSpacing(6)
+        header.addWidget(stats_del)
         header.addSpacing(8)
         header.addWidget(self.status_label)
         header.addStretch()
@@ -3898,24 +4044,51 @@ class ChangeSummaryCard(QFrame):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(8)
 
-        row = QPushButton()
+        row = ClickableFrame()
+        row.setObjectName("changeFileToggle")
         row.setCursor(Qt.PointingHandCursor)
         row.setStyleSheet(f"""
-            QPushButton {{
-                text-align: left;
+            QFrame#changeFileToggle {{
                 background: transparent;
-                color: {COLORS['text']};
                 border: none;
                 padding: 4px 2px;
+            }}
+            QFrame#changeFileToggle:hover QLabel#changePathLabel {{
+                color: {COLORS['accent_dark']};
+            }}
+            QLabel {{
+                background: transparent;
+                border: none;
                 font-size: 12px;
                 font-weight: 800;
             }}
-            QPushButton:hover {{
-                color: {COLORS['accent_dark']};
-            }}
         """)
-        row.setText(f"› {record['path']}    +{record['additions']} -{record['deletions']}")
-        self.file_row_buttons.append(row)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(2, 2, 2, 2)
+        row_layout.setSpacing(7)
+        arrow_label = QLabel("›")
+        arrow_label.setFixedWidth(12)
+        arrow_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        arrow_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        path_label = QLabel(str(record["path"]))
+        path_label.setObjectName("changePathLabel")
+        path_label.setStyleSheet(f"color: {COLORS['text']};")
+        path_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        path_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        add_label = QLabel(f"+{record['additions']}")
+        add_label.setStyleSheet(f"color: {COLORS['success']};")
+        add_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        del_label = QLabel(f"-{record['deletions']}")
+        del_label.setStyleSheet(f"color: {COLORS['danger']};")
+        del_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        row_layout.addWidget(arrow_label)
+        row_layout.addWidget(path_label, 1)
+        row_layout.addWidget(add_label)
+        row_layout.addWidget(del_label)
+        self.file_row_toggles.append(row)
+        self.file_row_arrow_labels.append(arrow_label)
+        self.file_row_text_labels.append(path_label)
+        self.file_row_stat_labels.extend([add_label, del_label])
         layout.addWidget(row)
 
         diff_view = QTextEdit()
@@ -3949,7 +4122,7 @@ class ChangeSummaryCard(QFrame):
         def toggle():
             visible = not diff_view.isVisible()
             diff_view.setVisible(visible)
-            row.setText(f"{'⌄' if visible else '›'} {record['path']}    +{record['additions']} -{record['deletions']}")
+            arrow_label.setText("⌄" if visible else "›")
 
         row.clicked.connect(toggle)
         return wrapper
@@ -3965,8 +4138,10 @@ class ChangeSummaryCard(QFrame):
         """)
         if self.title_label:
             self.title_label.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900; background: transparent; border: none;")
-        if self.stats_label:
-            self.stats_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; font-weight: 800; background: transparent; border: none;")
+        if self.stats_add_label:
+            self.stats_add_label.setStyleSheet(f"color: {COLORS['muted'] if undone else COLORS['success']}; font-size: 12px; font-weight: 900; background: transparent; border: none;")
+        if self.stats_del_label:
+            self.stats_del_label.setStyleSheet(f"color: {COLORS['muted'] if undone else COLORS['danger']}; font-size: 12px; font-weight: 900; background: transparent; border: none;")
         if self.status_label:
             self.status_label.setVisible(undone)
         for row in self.file_row_widgets:
@@ -3977,24 +4152,17 @@ class ChangeSummaryCard(QFrame):
                     border-radius: 12px;
                 }}
             """)
-        for button in self.file_row_buttons:
-            font = button.font()
+        for label in [*self.file_row_text_labels, *self.file_row_stat_labels]:
+            font = label.font()
             font.setStrikeOut(undone)
-            button.setFont(font)
-            button.setStyleSheet(f"""
-                QPushButton {{
-                    text-align: left;
-                    background: transparent;
-                    color: {COLORS['muted'] if undone else COLORS['text']};
-                    border: none;
-                    padding: 4px 2px;
-                    font-size: 12px;
-                    font-weight: 800;
-                }}
-                QPushButton:hover {{
-                    color: {COLORS['muted'] if undone else COLORS['accent_dark']};
-                }}
-            """)
+            label.setFont(font)
+        for label in self.file_row_text_labels:
+            label.setStyleSheet(f"color: {COLORS['muted'] if undone else COLORS['text']};")
+        for idx, label in enumerate(self.file_row_stat_labels):
+            color = COLORS["muted"] if undone else (COLORS["success"] if idx % 2 == 0 else COLORS["danger"])
+            label.setStyleSheet(f"color: {color};")
+        for label in self.file_row_arrow_labels:
+            label.setStyleSheet(f"color: {COLORS['muted'] if undone else COLORS['text_secondary']};")
 
     def mark_undone(self, applied: int, skipped: int):
         if self.undo_btn:
@@ -4705,6 +4873,7 @@ class ChatPage(QWidget):
         self.threads: List[Dict[str, object]] = [default_thread()]
         self.cmd_outputs = []
         self.pending_snapshot: Dict[str, bytes] = {}
+        self.pending_long_running_launches = 0
         self.history_entries: List[Dict[str, object]] = []
         self.result_bubble: Optional[ChatBubble] = None
         self.worker: Optional[ExecuteWorker] = None
@@ -4715,6 +4884,16 @@ class ChatPage(QWidget):
         self.automation_preview_worker: Optional[AutomationPreviewWorker] = None
         self.automation_preview_bubble: Optional[QFrame] = None
         self.automation_preview_started_at = 0.0
+        self.automation_preview_pending_text = ""
+        self.automation_preview_last_rendered_text = ""
+        self.automation_preview_last_chars = 0
+        self.automation_preview_dots = 0
+        self.automation_preview_render_timer = QTimer(self)
+        self.automation_preview_render_timer.setSingleShot(True)
+        self.automation_preview_render_timer.timeout.connect(self.flush_automation_preview_render)
+        self.automation_preview_dots_timer = QTimer(self)
+        self.automation_preview_dots_timer.setInterval(520)
+        self.automation_preview_dots_timer.timeout.connect(self.tick_automation_preview_status)
         self.automation_setup_worker: Optional[AutomationSetupWorker] = None
         self.python_runtime_setup_worker: Optional[PythonRuntimeSetupWorker] = None
         self.automation_loop_active = False
@@ -5561,10 +5740,10 @@ class ChatPage(QWidget):
     def update_automation_composer_state(self):
         if self.automation_send_btn is None or self.automation_input is None:
             return
-        busy = self.is_automation_request_running()
+        busy = self.is_automation_busy()
         self.automation_input.setEnabled(not busy and not self.is_execution_running())
         if busy:
-            self.automation_send_btn.setIcon(line_icon("pause", "white", 20))
+            self.automation_send_btn.setIcon(line_icon("pause", "#ffffff", 20))
             self.automation_send_btn.setStyleSheet(f"""
                 QToolButton {{
                     background: #8b95aa;
@@ -5589,7 +5768,7 @@ class ChatPage(QWidget):
             """)
 
     def on_automation_composer_action(self):
-        if self.is_automation_request_running():
+        if self.is_automation_busy():
             self.cancel_automation_request()
             return
         self.submit_automation_prompt_from_composer()
@@ -5674,16 +5853,17 @@ class ChatPage(QWidget):
         self.hide_empty_state()
         frame = ChatBubble(
             "ai",
-            "等待模型输出...",
+            "",
             parent=self.chat_container,
             markdown=True,
             expand_to_content=True,
             flat=True,
         )
+        frame.stabilize_markdown_height = True
         role_label = frame.findChild(QLabel)
         if role_label is not None:
             role_label.setText("AI 正在回复")
-        status = QLabel("等待网页开始生成...")
+        status = QLabel("AI 正在回复.")
         status.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; background: transparent;")
         frame.layout().insertWidget(1, status)
         frame.preview_status = status
@@ -5694,7 +5874,12 @@ class ChatPage(QWidget):
     def start_automation_preview(self):
         self.stop_automation_preview(remove_bubble=True)
         self.automation_preview_started_at = time.time()
+        self.automation_preview_pending_text = ""
+        self.automation_preview_last_rendered_text = ""
+        self.automation_preview_last_chars = 0
+        self.automation_preview_dots = 0
         self.automation_preview_bubble = self.create_automation_preview_bubble()
+        self.automation_preview_dots_timer.start()
         worker = AutomationPreviewWorker(self.automation_manager, self.automation_model, self.thread_id)
         self.automation_preview_worker = worker
         worker.preview_signal.connect(self.update_automation_preview)
@@ -5709,17 +5894,62 @@ class ChatPage(QWidget):
             else:
                 worker.finished.connect(worker.deleteLater)
             self.automation_preview_worker = None
+        self.automation_preview_render_timer.stop()
+        self.automation_preview_dots_timer.stop()
+        self.automation_preview_pending_text = ""
+        self.automation_preview_last_rendered_text = ""
+        self.automation_preview_last_chars = 0
         if remove_bubble and self.automation_preview_bubble is not None:
             bubble = self.automation_preview_bubble
             self.automation_preview_bubble = None
             self.chat_layout.removeWidget(bubble)
             bubble.deleteLater()
 
+    def update_automation_preview_status(self, chars: Optional[int] = None):
+        bubble = self.automation_preview_bubble
+        if bubble is None:
+            return
+        if chars is not None:
+            self.automation_preview_last_chars = max(0, int(chars))
+        status = getattr(bubble, "preview_status", None)
+        if status is None:
+            return
+        dots = "." * ((self.automation_preview_dots % 3) + 1)
+        if self.automation_preview_last_chars > 0:
+            text = f"AI 正在回复{dots} 已生成约 {self.automation_preview_last_chars} 字"
+        else:
+            text = f"AI 正在回复{dots}"
+        if status.text() != text:
+            status.setText(text)
+
+    def tick_automation_preview_status(self):
+        if self.automation_preview_bubble is None:
+            self.automation_preview_dots_timer.stop()
+            return
+        self.automation_preview_dots = (self.automation_preview_dots + 1) % 3
+        self.update_automation_preview_status()
+
+    def schedule_automation_preview_render(self):
+        if not self.automation_preview_render_timer.isActive():
+            self.automation_preview_render_timer.start(120)
+
+    def flush_automation_preview_render(self):
+        bubble = self.automation_preview_bubble
+        if bubble is None:
+            return
+        text = self.automation_preview_pending_text
+        if not text or text == self.automation_preview_last_rendered_text:
+            return
+        should_follow_bottom = self.is_chat_at_bottom()
+        bubble.update_content(text)
+        self.automation_preview_last_rendered_text = text
+        if should_follow_bottom:
+            QTimer.singleShot(0, self.scroll_to_bottom_now)
+
     def update_automation_preview(self, preview: dict):
         bubble = self.automation_preview_bubble
         if bubble is None:
             return
-        should_follow_bottom = self.is_chat_at_bottom()
         text = str(preview.get("text") or "").strip()
         preview_updated_at = float(preview.get("updated_at") or 0.0)
         if text and preview_updated_at and preview_updated_at < self.automation_preview_started_at:
@@ -5727,15 +5957,13 @@ class ChatPage(QWidget):
         if text and not preview_updated_at and self.automation_preview_started_at:
             return
         chars = int(preview.get("chars") or len(text))
-        status = getattr(bubble, "preview_status", None)
-        if status is not None:
-            status.setText(f"已生成约 {chars} 字，最终执行会等待完整复制结果")
+        self.update_automation_preview_status(chars)
         if text:
             if looks_like_automation_context_payload(text):
                 return
-            bubble.update_content(text)
-        if should_follow_bottom:
-            self.scroll_to_bottom()
+            if text != self.automation_preview_pending_text:
+                self.automation_preview_pending_text = text
+                self.schedule_automation_preview_render()
 
     def build_system_prompt(self, user_text: str) -> str:
         raw_prompt = user_text.strip()
@@ -6430,12 +6658,14 @@ class ChatPage(QWidget):
         
         self.cmd_outputs = []
         self.pending_snapshot = snapshot_project(self.project_root)
+        self.pending_long_running_launches = 0
         
         self.worker = ExecuteWorker(commands, self.project_root)
         self.worker.output_signal.connect(self.on_output)
         self.worker.long_running_signal.connect(self.on_long_running)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
+        self.update_automation_composer_state()
         self.scroll_to_bottom()
     
     def on_output(self, output: str):
@@ -6444,6 +6674,7 @@ class ChatPage(QWidget):
     
     def on_long_running(self, cmd: str, cwd: str, name: str):
         self.terminal_panel.add_process(cmd, cwd, name)
+        self.pending_long_running_launches += 1
         self.update_status_bar()
         self.keep_ai_response_visible()
     
@@ -6455,9 +6686,13 @@ class ChatPage(QWidget):
         after_snapshot = snapshot_project(self.project_root)
         change_records = build_change_records(self.pending_snapshot, after_snapshot)
         self.pending_snapshot = {}
+        long_running_launches = self.pending_long_running_launches
+        self.pending_long_running_launches = 0
         log_with_changes = full_log
         if change_records:
             log_with_changes += format_change_summary(change_records, include_diff=True)
+        elif long_running_launches:
+            log_with_changes += "\n\nFiles changed:\n未检测到文件改动。若命令正在底部终端继续运行，保存/生成文件后需要等待进程结束或再执行一次检查。"
         self.result_bubble.update_content(log_with_changes)
         if change_records:
             change_card = ChangeSummaryCard(change_records, parent=self.chat_container)
@@ -6476,6 +6711,7 @@ class ChatPage(QWidget):
         self.append_history(result_entry)
         self.sidebar.refresh_tree(self.project_root)
         self.update_status_bar()
+        self.update_automation_composer_state()
         if self.automation_enabled and self.automation_loop_active:
             self.request_next_automation_step(log_with_changes, skip_entry_id=str(result_entry.get("id") or ""))
         elif self.automation_enabled:
