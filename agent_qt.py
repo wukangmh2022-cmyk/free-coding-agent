@@ -4112,10 +4112,7 @@ class AutomationPreviewWorker(QThread):
                 self.preview_signal.emit(preview)
             except Exception:
                 pass
-            for _ in range(8):
-                if not self._running:
-                    return
-                self.msleep(150)
+            self.msleep(250)
 
 # ============================================================
 # 对话气泡
@@ -4166,6 +4163,7 @@ class ChatBubble(QFrame):
         self.min_content_height = 34 if compact_user else 58
         self._height_adjust_scheduled = False
         self._last_content_width = 0
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setup_ui()
     
     def setup_ui(self):
@@ -4713,14 +4711,12 @@ class ChatBubble(QFrame):
                     continue
                 widget.setMinimumHeight(0)
                 widget.setMaximumHeight(QT_WIDGET_MAX_HEIGHT)
-                available_width = max(120, widget.viewport().width() - 10)
-                metrics = widget.fontMetrics()
-                text = widget.toPlainText()
-                source_text = str(getattr(widget, "markdown_source", "") or text)
+                text_width = max(120, widget.viewport().width() - 10)
+                widget.document().setTextWidth(text_width)
+                document_height = int(widget.document().documentLayout().documentSize().height()) + 10
                 target_height = max(
                     34,
-                    estimate_wrapped_text_height(text, metrics, available_width)
-                    + estimate_markdown_table_extra_height(source_text, metrics, available_width),
+                    document_height,
                 )
                 if self.stabilize_markdown_height:
                     key = id(widget)
@@ -7003,7 +6999,7 @@ class ChatPage(QWidget):
 
     def schedule_automation_preview_render(self):
         if not self.automation_preview_render_timer.isActive():
-            self.automation_preview_render_timer.start(120)
+            self.automation_preview_render_timer.start(60)
 
     def flush_automation_preview_render(self):
         bubble = self.automation_preview_bubble
@@ -7723,7 +7719,7 @@ class ChatPage(QWidget):
         done_response = self.automation_loop_active and is_automation_done_response(text)
         display_text = strip_automation_done_marker(text) if done_response else text
         if done_response and not display_text:
-            self.stop_automation_loop("", ensure_manual_entry=True)
+            self.stop_automation_loop("自动化执行完成。", ensure_manual_entry=True)
             self.scroll_to_bottom()
             return
         self.hide_empty_state()
@@ -7750,7 +7746,7 @@ class ChatPage(QWidget):
         })
 
         if done_response:
-            self.stop_automation_loop("", ensure_manual_entry=True)
+            self.stop_automation_loop("自动化执行完成。", ensure_manual_entry=True)
             self.scroll_to_bottom()
             return
         
@@ -7773,7 +7769,7 @@ class ChatPage(QWidget):
         
         if not commands:
             if self.automation_loop_active:
-                self.stop_automation_loop("", ensure_manual_entry=True)
+                self.stop_automation_loop("自动化执行完成。", ensure_manual_entry=True)
                 self.scroll_to_bottom()
                 return
             warning_bubble = ChatBubble(
