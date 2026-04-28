@@ -35,8 +35,8 @@ from PySide6.QtWidgets import (
     QGridLayout, QSizePolicy, QGraphicsOpacityEffect, QAbstractItemView,
     QSpacerItem, QWidgetAction, QAbstractButton
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, Property
-from PySide6.QtGui import QFont, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QKeySequence, QTextDocument
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, Property
+from PySide6.QtGui import QFont, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QKeySequence, QTextDocument, QImage
 from PySide6.QtCore import QUrl
 
 try:
@@ -1704,7 +1704,7 @@ class InternalGitChangeTracker:
         )
         return (result.stdout or "").strip() or "(metadata changed)"
 
-    def _numstat(self, before_commit: str, after_commit: str, path: str) -> tuple[int, int]:
+    def _numstat(self, before_commit: str, after_commit: str, path: str) -> tuple[int, int, bool]:
         result = self._run(
             ["diff", "--numstat", "--no-renames", before_commit, after_commit, "--", path],
             check=False,
@@ -1713,7 +1713,8 @@ class InternalGitChangeTracker:
         line = (result.stdout or "").splitlines()[0] if result.stdout else ""
         parts = line.split("\t")
         if len(parts) < 2:
-            return 0, 0
+            return 0, 0, False
+        is_binary = parts[0] == "-" or parts[1] == "-"
         try:
             additions = int(parts[0])
         except ValueError:
@@ -1722,7 +1723,7 @@ class InternalGitChangeTracker:
             deletions = int(parts[1])
         except ValueError:
             deletions = 0
-        return additions, deletions
+        return additions, deletions, is_binary
 
     def build_change_records(self, before_commit: str, after_commit: str) -> List[Dict[str, object]]:
         result = self._run(
@@ -1748,7 +1749,8 @@ class InternalGitChangeTracker:
             if status_code != "D":
                 after, after_ok = self._blob_bytes(after_commit, path)
             diff = self._diff_text(before_commit, after_commit, path)
-            additions, deletions = self._numstat(before_commit, after_commit, path)
+            additions, deletions, is_binary = self._numstat(before_commit, after_commit, path)
+            is_binary = is_binary or "Binary files " in diff
             if additions == 0 and deletions == 0:
                 additions = sum(1 for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++"))
                 deletions = sum(1 for line in diff.splitlines() if line.startswith("-") and not line.startswith("---"))
@@ -1762,7 +1764,8 @@ class InternalGitChangeTracker:
                     "additions": additions,
                     "deletions": deletions,
                     "diff": diff,
-                    "diff_rows": parse_unified_diff_lines(diff),
+                    "diff_rows": [] if is_binary else parse_unified_diff_lines(diff),
+                    "binary": is_binary,
                     "internal_git": True,
                     "before_commit": before_commit,
                     "after_commit": after_commit,
@@ -1827,6 +1830,8 @@ def build_file_diff(path: str, before: Optional[bytes], after: Optional[bytes]) 
         detail = "Binary file changed"
         additions = 0
         deletions = 0
+        diff_rows = []
+        binary = True
     else:
         diff_lines = list(difflib.unified_diff(
             before_text.splitlines(),
@@ -1839,6 +1844,7 @@ def build_file_diff(path: str, before: Optional[bytes], after: Optional[bytes]) 
         deletions = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))
         detail = "\n".join(diff_lines) if diff_lines else "(metadata changed)"
         diff_rows = parse_unified_diff_lines(detail)
+        binary = False
 
     return {
         "path": path,
@@ -1848,7 +1854,8 @@ def build_file_diff(path: str, before: Optional[bytes], after: Optional[bytes]) 
         "additions": additions,
         "deletions": deletions,
         "diff": detail,
-        "diff_rows": [] if before_text is None or after_text is None else diff_rows,
+        "diff_rows": diff_rows,
+        "binary": binary,
     }
 
 def build_change_records(before: Dict[str, bytes], after: Dict[str, bytes]) -> List[Dict[str, object]]:
@@ -1863,21 +1870,35 @@ def build_change_records(before: Dict[str, bytes], after: Dict[str, bytes]) -> L
 def format_change_summary(records: List[Dict[str, object]], include_diff: bool = True) -> str:
     if not records:
         return ""
-    additions = sum(int(r["additions"]) for r in records)
-    deletions = sum(int(r["deletions"]) for r in records)
+    text_records = [r for r in records if not r.get("binary")]
+    binary_count = len(records) - len(text_records)
+    additions = sum(int(r["additions"]) for r in text_records)
+    deletions = sum(int(r["deletions"]) for r in text_records)
+    stat_parts = []
+    if text_records:
+        stat_parts.append(f"+{additions}  -{deletions}")
+    if binary_count:
+        stat_parts.append(f"{binary_count} binary")
+    stat_suffix = "  " + "  · ".join(stat_parts) if stat_parts else ""
     lines = [
         "",
         "Files changed:",
-        f"{len(records)} files changed  +{additions}  -{deletions}",
+        f"{len(records)} files changed{stat_suffix}",
     ]
     for record in records:
-        lines.append(f"- {record['path']}  +{record['additions']}  -{record['deletions']}")
+        if record.get("binary"):
+            lines.append(f"- {record['path']}  binary/{record.get('status', 'modified')}")
+        else:
+            lines.append(f"- {record['path']}  +{record['additions']}  -{record['deletions']}")
     if include_diff:
         lines.append("")
         lines.append("Diff:")
         for record in records:
             lines.append(f"\n--- {record['path']} ---")
-            lines.append(str(record["diff"]))
+            if record.get("binary"):
+                lines.append("Binary/Office file changed; textual diff is not available.")
+            else:
+                lines.append(str(record["diff"]))
     return "\n".join(lines)
 
 
@@ -1910,16 +1931,27 @@ def diff_hunk_headers(diff_text: str, limit: int = 24) -> List[str]:
 def format_change_context_summary(records: List[Dict[str, object]]) -> str:
     if not records:
         return "Git diff file names:\n未检测到文件改动。"
-    additions = sum(int(r.get("additions", 0)) for r in records)
-    deletions = sum(int(r.get("deletions", 0)) for r in records)
+    text_records = [r for r in records if not r.get("binary")]
+    binary_count = len(records) - len(text_records)
+    additions = sum(int(r.get("additions", 0)) for r in text_records)
+    deletions = sum(int(r.get("deletions", 0)) for r in text_records)
+    stat_parts = []
+    if text_records:
+        stat_parts.append(f"+{additions}  -{deletions}")
+    if binary_count:
+        stat_parts.append(f"{binary_count} binary")
+    stat_suffix = "  " + "  · ".join(stat_parts) if stat_parts else ""
     lines = [
         "Git diff file names:",
-        f"{len(records)} files changed  +{additions}  -{deletions}",
+        f"{len(records)} files changed{stat_suffix}",
     ]
     for record in records:
         status = str(record.get("status", "modified"))
         marker = {"added": "A", "deleted": "D"}.get(status, "M")
-        lines.append(f"{marker} {record.get('path', '')}  +{record.get('additions', 0)}  -{record.get('deletions', 0)}")
+        if record.get("binary"):
+            lines.append(f"{marker} {record.get('path', '')}  binary/{status}")
+        else:
+            lines.append(f"{marker} {record.get('path', '')}  +{record.get('additions', 0)}  -{record.get('deletions', 0)}")
     lines.append("")
     lines.append("Git diff hunks:")
     for record in records:
@@ -1973,6 +2005,16 @@ AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY
 
 def is_automation_done_response(text: str) -> bool:
     return AUTOMATION_DONE_MARKER in (text or "")
+
+
+def strip_automation_done_marker(text: str) -> str:
+    content = str(text or "").strip()
+    if not content:
+        return ""
+    pattern = rf"(?im)^\s*{re.escape(AUTOMATION_DONE_MARKER)}\s*:?\s*$"
+    content = re.sub(pattern, "", content).strip()
+    content = re.sub(rf"(?i)\b{re.escape(AUTOMATION_DONE_MARKER)}\b\s*:?", "", content).strip()
+    return content
 
 
 def looks_like_automation_context_payload(text: str) -> bool:
@@ -2455,6 +2497,7 @@ def serialize_change_record(record: Dict[str, object]) -> Dict[str, object]:
         "additions": int(record.get("additions", 0) or 0),
         "deletions": int(record.get("deletions", 0) or 0),
         "diff": str(record.get("diff", "")),
+        "binary": bool(record.get("binary", False)),
         "internal_git": bool(record.get("internal_git", False)),
         "undoable": bool(record.get("undoable", True)),
         "undone": bool(record.get("undone", False)),
@@ -2471,13 +2514,14 @@ def deserialize_change_record(record: Dict[str, object]) -> Optional[Dict[str, o
     diff = str(record.get("diff", ""))
     if diff:
         rebuilt["diff"] = diff
-        rebuilt["diff_rows"] = parse_unified_diff_lines(diff)
+        rebuilt["diff_rows"] = [] if bool(record.get("binary", False)) else parse_unified_diff_lines(diff)
     for key in ("additions", "deletions"):
         try:
             rebuilt[key] = int(record.get(key, rebuilt.get(key, 0)) or 0)
         except (TypeError, ValueError):
             pass
     rebuilt["internal_git"] = bool(record.get("internal_git", False))
+    rebuilt["binary"] = bool(record.get("binary", rebuilt.get("binary", False)))
     rebuilt["undoable"] = bool(record.get("undoable", True))
     rebuilt["undone"] = bool(record.get("undone", False))
     return rebuilt
@@ -4746,16 +4790,23 @@ class ChangeSummaryCard(QFrame):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
 
-        additions = sum(int(r["additions"]) for r in self.records)
-        deletions = sum(int(r["deletions"]) for r in self.records)
+        text_records = [r for r in self.records if not r.get("binary")]
+        binary_count = len(self.records) - len(text_records)
+        additions = sum(int(r["additions"]) for r in text_records)
+        deletions = sum(int(r["deletions"]) for r in text_records)
         header = QHBoxLayout()
         title = QLabel(f"{len(self.records)} files changed")
         self.title_label = title
         title.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900; background: transparent; border: none;")
-        stats_add = QLabel(f"+{additions}")
+        stat_labels = []
+        if text_records:
+            stat_labels.append(f"+{additions}")
+        if binary_count:
+            stat_labels.append(f"{binary_count} binary")
+        stats_add = QLabel("  ·  ".join(stat_labels) if stat_labels else "")
         self.stats_add_label = stats_add
-        stats_add.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px; font-weight: 900; background: transparent; border: none;")
-        stats_del = QLabel(f"-{deletions}")
+        stats_add.setStyleSheet(f"color: {COLORS['success'] if text_records else COLORS['text_secondary']}; font-size: 12px; font-weight: 900; background: transparent; border: none;")
+        stats_del = QLabel(f"-{deletions}" if text_records else "")
         self.stats_del_label = stats_del
         stats_del.setStyleSheet(f"color: {COLORS['danger']}; font-size: 12px; font-weight: 900; background: transparent; border: none;")
         self.status_label = QLabel("已撤销")
@@ -4855,9 +4906,16 @@ class ChangeSummaryCard(QFrame):
         path_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         path_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         add_label = QLabel(f"+{record['additions']}")
-        add_label.setStyleSheet(f"color: {COLORS['success']};")
+        if record.get("binary"):
+            status_text = {"added": "added", "deleted": "deleted"}.get(str(record.get("status", "")), "changed")
+            add_label.setText(status_text)
+            add_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        else:
+            add_label.setStyleSheet(f"color: {COLORS['success']};")
         add_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         del_label = QLabel(f"-{record['deletions']}")
+        if record.get("binary"):
+            del_label.setText("")
         del_label.setStyleSheet(f"color: {COLORS['danger']};")
         del_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         row_layout.addWidget(arrow_label)
@@ -4872,8 +4930,12 @@ class ChangeSummaryCard(QFrame):
 
         diff_view = QTextEdit()
         diff_view.setReadOnly(True)
-        diff_view.setHtml(render_diff_html(record))
-        diff_view.setFixedHeight(260)
+        if record.get("binary"):
+            diff_view.setHtml(self.render_binary_change_html(record))
+            diff_view.setFixedHeight(92)
+        else:
+            diff_view.setHtml(render_diff_html(record))
+            diff_view.setFixedHeight(260)
         diff_view.setVisible(False)
         diff_view.setStyleSheet(f"""
             QTextEdit {{
@@ -4905,6 +4967,25 @@ class ChangeSummaryCard(QFrame):
 
         row.clicked.connect(toggle)
         return wrapper
+
+    def render_binary_change_html(self, record: Dict[str, object]) -> str:
+        status = str(record.get("status", "modified") or "modified")
+        status_text = {
+            "added": "新增二进制/Office 文件",
+            "deleted": "删除二进制/Office 文件",
+            "modified": "二进制/Office 文件已修改",
+        }.get(status, "二进制/Office 文件已变更")
+        path = html.escape(str(record.get("path", "")))
+        return (
+            "<html><body style='margin:0; background:#ffffff; color:#172033; "
+            "font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;'>"
+            "<div style='padding:12px 14px;'>"
+            f"<div style='font-weight:700; font-size:13px;'>{status_text}</div>"
+            f"<div style='margin-top:6px; color:#657089; font-size:12px;'>{path}</div>"
+            "<div style='margin-top:8px; color:#657089; font-size:12px;'>"
+            "此类文件无法生成逐行文本 diff，但仍可撤销/重做本轮变更。"
+            "</div></div></body></html>"
+        )
 
     def apply_state_style(self, undone: bool):
         self.setStyleSheet(f"""
@@ -4938,7 +5019,11 @@ class ChangeSummaryCard(QFrame):
         for label in self.file_row_text_labels:
             label.setStyleSheet(f"color: {COLORS['muted'] if undone else COLORS['text']};")
         for idx, label in enumerate(self.file_row_stat_labels):
-            color = COLORS["muted"] if undone else (COLORS["success"] if idx % 2 == 0 else COLORS["danger"])
+            text = label.text().strip()
+            if text in {"added", "deleted", "changed"}:
+                color = COLORS["muted"] if undone else COLORS["text_secondary"]
+            else:
+                color = COLORS["muted"] if undone else (COLORS["success"] if idx % 2 == 0 else COLORS["danger"])
             label.setStyleSheet(f"color: {color};")
         for label in self.file_row_arrow_labels:
             label.setStyleSheet(f"color: {COLORS['muted'] if undone else COLORS['text_secondary']};")
@@ -6387,17 +6472,32 @@ class ChatPage(QWidget):
         self.add_status_bubble(f"已导出：{path}")
 
     def export_conversation_screenshot(self):
+        QApplication.processEvents()
         self.chat_column.adjustSize()
-        size = self.chat_column.sizeHint()
-        width = max(self.chat_column.width(), size.width(), 640)
-        height = max(self.chat_column.height(), size.height(), 240)
-        pixmap = QPixmap(width, height)
-        pixmap.fill(QColor(COLORS["surface"]))
-        painter = QPainter(pixmap)
-        self.chat_column.render(painter)
-        painter.end()
+        self.chat_container.adjustSize()
+        QApplication.processEvents()
+        width = max(self.chat_column.width(), self.chat_column.sizeHint().width(), 640)
+        height = max(self.chat_column.height(), self.chat_column.sizeHint().height(), 240)
+        max_pixels = 120_000_000
+        if width * height > max_pixels:
+            styled_warning(self, "导出失败", f"会话太长，长截图约 {width}×{height}，已超过安全导出尺寸。请先分享为 Markdown 或 TXT。")
+            return
+        image = QImage(width, height, QImage.Format.Format_ARGB32)
+        if image.isNull():
+            styled_warning(self, "导出失败", "无法创建长截图画布。")
+            return
+        image.fill(QColor(COLORS["surface"]))
+        painter = QPainter(image)
+        if not painter.isActive():
+            styled_warning(self, "导出失败", "无法开始绘制长截图。")
+            return
+        try:
+            painter.translate((width - self.chat_column.width()) // 2, 0)
+            self.chat_column.render(painter, QPoint(0, 0))
+        finally:
+            painter.end()
         path = os.path.join(self.export_dir(), f"agent-qt-{self.thread_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png")
-        if not pixmap.save(path, "PNG"):
+        if not image.save(path, "PNG"):
             styled_warning(self, "导出失败", "长截图保存失败。")
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
@@ -7537,14 +7637,16 @@ class ChatPage(QWidget):
             )
             self.scroll_to_bottom()
             return
-        if self.automation_loop_active and is_automation_done_response(text):
+        done_response = self.automation_loop_active and is_automation_done_response(text)
+        display_text = strip_automation_done_marker(text) if done_response else text
+        if done_response and not display_text:
             self.stop_automation_loop("", ensure_manual_entry=True)
             self.scroll_to_bottom()
             return
         self.hide_empty_state()
         ai_bubble = ChatBubble(
             "ai",
-            text,
+            display_text,
             show_copy=True,
             parent=self.chat_container,
             copy_text="复制 AI 输出",
@@ -7561,12 +7663,17 @@ class ChatPage(QWidget):
         animate_widget_in(ai_bubble)
         self.append_history({
             "type": "ai",
-            "content": text,
+            "content": display_text,
         })
+
+        if done_response:
+            self.stop_automation_loop("", ensure_manual_entry=True)
+            self.scroll_to_bottom()
+            return
         
-        blocks = scan_all_code_blocks(text)
+        blocks = scan_all_code_blocks(display_text)
         try:
-            commands = extract_bash_commands(text, blocks)
+            commands = extract_bash_commands(display_text, blocks)
         except ValueError as exc:
             if self.automation_loop_active:
                 self.stop_automation_loop(str(exc), ensure_manual_entry=True)
