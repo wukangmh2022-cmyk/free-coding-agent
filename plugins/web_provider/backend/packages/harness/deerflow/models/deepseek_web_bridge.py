@@ -3835,95 +3835,6 @@ class DeepSeekWebBridge:
             )
         )
 
-    def markdown_aware_node_text(self, node: Locator) -> str:
-        try:
-            value = node.evaluate(
-                """(root) => {
-                    const blockTags = new Set([
-                        'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DIV', 'DL', 'FIELDSET',
-                        'FIGCAPTION', 'FIGURE', 'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4',
-                        'H5', 'H6', 'HEADER', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'PRE',
-                        'SECTION', 'TABLE', 'UL'
-                    ]);
-
-                    const cleanCell = (value) => String(value || '')
-                        .replace(/\\u00a0/g, ' ')
-                        .replace(/[ \\t]+/g, ' ')
-                        .replace(/\\s*\\n\\s*/g, '<br>')
-                        .trim()
-                        .replace(/\\|/g, '\\\\|');
-
-                    const padRow = (row, width) => {
-                        const next = row.slice(0, width);
-                        while (next.length < width) {
-                            next.push('');
-                        }
-                        return next;
-                    };
-
-                    const tableToMarkdown = (table) => {
-                        const rows = [...table.querySelectorAll('tr')]
-                            .map((tr) => [...tr.children]
-                                .filter((cell) => /^(TH|TD)$/i.test(cell.tagName))
-                                .map((cell) => cleanCell(cell.innerText || cell.textContent || '')))
-                            .filter((row) => row.some((cell) => cell));
-                        if (rows.length === 0) {
-                            return '';
-                        }
-                        const width = Math.max(...rows.map((row) => row.length));
-                        const header = padRow(rows[0], width);
-                        const body = rows.slice(1).map((row) => padRow(row, width));
-                        const lines = [
-                            `| ${header.join(' | ')} |`,
-                            `| ${Array.from({ length: width }, () => '---').join(' | ')} |`,
-                            ...body.map((row) => `| ${row.join(' | ')} |`),
-                        ];
-                        return lines.join('\\n');
-                    };
-
-                    const serialize = (node) => {
-                        if (!node) {
-                            return '';
-                        }
-                        if (node.nodeType === Node.TEXT_NODE) {
-                            return node.textContent || '';
-                        }
-                        if (!(node instanceof HTMLElement)) {
-                            return '';
-                        }
-                        const tag = node.tagName.toUpperCase();
-                        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') {
-                            return '';
-                        }
-                        if (tag === 'BR') {
-                            return '\\n';
-                        }
-                        if (tag === 'TABLE') {
-                            const markdown = tableToMarkdown(node);
-                            return markdown ? `\\n\\n${markdown}\\n\\n` : '';
-                        }
-                        if (tag === 'PRE') {
-                            return `\\n\\n${node.innerText || node.textContent || ''}\\n\\n`;
-                        }
-                        const text = [...node.childNodes].map(serialize).join('');
-                        if (blockTags.has(tag)) {
-                            return `\\n${text.trim()}\\n`;
-                        }
-                        return text;
-                    };
-
-                    return serialize(root)
-                        .replace(/[ \\t]+\\n/g, '\\n')
-                        .replace(/\\n[ \\t]+/g, '\\n')
-                        .replace(/\\n{3,}/g, '\\n\\n')
-                        .replace(/[ \\t]{2,}/g, ' ')
-                        .trim();
-                }"""
-            )
-        except Exception:
-            return ""
-        return value.strip() if isinstance(value, str) else ""
-
     def assistant_text_candidates(self, locator: Locator, *, max_items: int = 24) -> list[dict[str, Any]]:
         count = locator.count()
         if count == 0:
@@ -3934,9 +3845,6 @@ class DeepSeekWebBridge:
         for index in range(start, count):
             node = locator.nth(index)
             texts: list[str] = []
-            rendered_markdown = self.markdown_aware_node_text(node)
-            if rendered_markdown:
-                texts.append(rendered_markdown)
             try:
                 rendered = node.inner_text(timeout=500)
                 if rendered:

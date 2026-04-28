@@ -4717,11 +4717,8 @@ class ChatBubble(QFrame):
                 metrics = widget.fontMetrics()
                 text = widget.toPlainText()
                 source_text = str(getattr(widget, "markdown_source", "") or text)
-                widget.document().setTextWidth(max(120, widget.viewport().width() - 10))
-                document_height = int(widget.document().size().height()) + 8
                 target_height = max(
                     34,
-                    document_height,
                     estimate_wrapped_text_height(text, metrics, available_width)
                     + estimate_markdown_table_extra_height(source_text, metrics, available_width),
                 )
@@ -4776,6 +4773,82 @@ class ChatBubble(QFrame):
             target_height = min(self.max_content_height, target_height)
         if self.content_label.height() != target_height:
             self.content_label.setFixedHeight(target_height)
+
+
+class ExecutionLogPanel(QFrame):
+    def __init__(self, content: str = "", parent=None, max_content_height: int = 210):
+        super().__init__(parent)
+        self.content = content
+        self.max_content_height = max_content_height
+        self.setObjectName("executionLogPanel")
+        self.setStyleSheet("QFrame#executionLogPanel { background: transparent; border: none; margin: 0; }")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(0)
+
+        self.editor = QPlainTextEdit()
+        self.editor.setReadOnly(True)
+        self.editor.setPlainText(content)
+        self.editor.setMaximumBlockCount(20000)
+        self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.editor.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.editor.customContextMenuRequested.connect(
+            lambda pos, editor=self.editor: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
+        )
+        self.editor.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background: {COLORS['code_bg']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+                padding: 10px 12px;
+                font-family: 'SF Mono', 'Menlo', monospace;
+                font-size: 12px;
+                selection-background-color: #d8e6ff;
+                selection-color: {COLORS['text']};
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 8px;
+                margin: 4px 2px 4px 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {COLORS['border_strong']};
+                border-radius: 4px;
+                min-height: 28px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+        """)
+        layout.addWidget(self.editor)
+        self.adjust_content_height()
+
+    def visible_content(self) -> str:
+        return self.content or self.editor.toPlainText() or " "
+
+    def adjust_content_height(self):
+        available_width = max(120, self.editor.viewport().width() - 10)
+        metrics = self.editor.fontMetrics()
+        line_spacing = max(1, metrics.lineSpacing())
+        max_visual_lines = max(1, (self.max_content_height - 36 + line_spacing - 1) // line_spacing)
+        natural_height = estimate_wrapped_text_height(self.visible_content(), metrics, available_width, max_visual_lines)
+        target_height = min(self.max_content_height, max(58, int(natural_height)))
+        if self.editor.height() != target_height:
+            self.editor.setFixedHeight(target_height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.adjust_content_height()
+
+    def update_content(self, text: str):
+        self.content = text
+        self.editor.setPlainText(text)
+        self.adjust_content_height()
+
 
 class ChangeSummaryCard(QFrame):
     undo_requested = Signal(object)
@@ -5756,7 +5829,7 @@ class ChatPage(QWidget):
         self.pending_internal_git_commit = ""
         self.pending_long_running_launches = 0
         self.history_entries: List[Dict[str, object]] = []
-        self.result_bubble: Optional[ChatBubble] = None
+        self.result_bubble: Optional[ExecutionLogPanel] = None
         self.worker: Optional[ExecuteWorker] = None
         self.automation_manager = AutomationProviderManager()
         self.automation_enabled = automation_enabled_setting()
@@ -7451,15 +7524,10 @@ class ChatPage(QWidget):
             )
             self.add_chat_widget(bubble)
         elif entry_type == "result":
-            bubble = ChatBubble(
-                "system",
+            bubble = ExecutionLogPanel(
                 str(entry.get("content", "")),
-                show_copy=True,
                 parent=self.chat_container,
-                copy_text="复制执行日志",
-                scrollable=True,
                 max_content_height=210,
-                flat=True,
             )
             self.add_chat_widget(bubble)
             records = []
@@ -7727,15 +7795,10 @@ class ChatPage(QWidget):
         if self.automation_loop_active:
             self.refresh_prompt_bubble_buttons()
         
-        self.result_bubble = ChatBubble(
-            "system",
+        self.result_bubble = ExecutionLogPanel(
             "⏳ 执行中...",
             parent=self.chat_container,
-            show_copy=True,
-            copy_text="复制执行日志",
-            scrollable=True,
             max_content_height=210,
-            flat=True,
         )
         self.add_chat_widget(self.result_bubble, animate=True)
         
