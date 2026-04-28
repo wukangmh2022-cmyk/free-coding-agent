@@ -327,6 +327,9 @@ WINDOWS_PYTHON_INSTALLER_URL = "https://www.python.org/ftp/python/3.12.10/python
 
 def windows_python_bootstrap_batch() -> str:
     return f"""set "BASE_PYTHON="
+set "BASE_PYTHON_DIR={os.path.join(runtime_cache_root(), 'python312')}"
+if exist "%BASE_PYTHON_DIR%\\python.exe" set "BASE_PYTHON=%BASE_PYTHON_DIR%\\python.exe"
+if "%BASE_PYTHON%"=="" if exist "%VENV_DIR%\\..\\python312\\python.exe" set "BASE_PYTHON=%VENV_DIR%\\..\\python312\\python.exe"
 for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
 if "%BASE_PYTHON%"=="" (
   for /f "usebackq delims=" %%P in (`python -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
@@ -343,12 +346,27 @@ if "%BASE_PYTHON%"=="" (
 )
 if "%BASE_PYTHON%"=="" if exist "%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe"
 if "%BASE_PYTHON%"=="" (
-  echo winget 不可用或安装失败，下载 Python 3.12 安装器...
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $u='{WINDOWS_PYTHON_INSTALLER_URL}'; $p=Join-Path $env:TEMP ('agent-qt-python-3.12-' + [guid]::NewGuid().ToString('N') + '.exe'); Invoke-WebRequest -Uri $u -OutFile $p; try {{ Start-Process -Wait -FilePath $p -ArgumentList '/quiet InstallAllUsers=0 PrependPath=0 Include_pip=1 Include_launcher=1 Include_test=0' }} finally {{ Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }}"
+  echo winget 不可用或安装后仍未定位到 Python，安装独立 Python 到缓存目录...
+  if not exist "%BASE_PYTHON_DIR%" mkdir "%BASE_PYTHON_DIR%"
+  set "PYTHON_INSTALLER=%TEMP%\\agent-qt-python-3.12-%RANDOM%%RANDOM%.exe"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{WINDOWS_PYTHON_INSTALLER_URL}' -OutFile $env:PYTHON_INSTALLER"
+  if errorlevel 1 (
+    echo Python 安装器下载失败。
+    del /f /q "%PYTHON_INSTALLER%" >nul 2>nul
+    exit /b 1
+  )
+  "%PYTHON_INSTALLER%" /quiet InstallAllUsers=0 TargetDir="%BASE_PYTHON_DIR%" PrependPath=0 Include_pip=1 Include_launcher=0 Include_test=0
+  set "PYTHON_INSTALL_EXIT=%ERRORLEVEL%"
+  del /f /q "%PYTHON_INSTALLER%" >nul 2>nul
+  if not "%PYTHON_INSTALL_EXIT%"=="0" if not "%PYTHON_INSTALL_EXIT%"=="3010" (
+    echo Python 安装器失败，退出码: %PYTHON_INSTALL_EXIT%
+    exit /b 1
+  )
 )
 if "%BASE_PYTHON%"=="" (
   for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
 )
+if "%BASE_PYTHON%"=="" if exist "%BASE_PYTHON_DIR%\\python.exe" set "BASE_PYTHON=%BASE_PYTHON_DIR%\\python.exe"
 if "%BASE_PYTHON%"=="" if exist "%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe"
 if "%BASE_PYTHON%"=="" (
   echo 无法安装或定位 Python 3.9+。
