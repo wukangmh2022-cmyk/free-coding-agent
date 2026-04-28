@@ -5262,7 +5262,7 @@ class ChatBubble(QFrame):
 
 
 class ExecutionLogPanel(QFrame):
-    def __init__(self, content: str = "", parent=None, max_content_height: int = 210):
+    def __init__(self, content: str = "", parent=None, max_content_height: int = 210, title: str = ""):
         super().__init__(parent)
         self.content = content
         self.max_content_height = max_content_height
@@ -5270,7 +5270,23 @@ class ExecutionLogPanel(QFrame):
         self.setStyleSheet("QFrame#executionLogPanel { background: transparent; border: none; margin: 0; }")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 4)
-        layout.setSpacing(0)
+        layout.setSpacing(8)
+
+        if title:
+            self.title_label = QLabel(title)
+            self.title_label.setStyleSheet(f"""
+                QLabel {{
+                    background: transparent;
+                    color: {COLORS['text']};
+                    border: none;
+                    font-size: 14px;
+                    font-weight: 900;
+                    padding: 0;
+                }}
+            """)
+            layout.addWidget(self.title_label)
+        else:
+            self.title_label = None
 
         self.editor = QPlainTextEdit()
         self.editor.setReadOnly(True)
@@ -8168,6 +8184,7 @@ class ChatPage(QWidget):
                 str(entry.get("content", "")),
                 parent=self.chat_container,
                 max_content_height=210,
+                title="执行结果",
             )
             self.add_chat_widget(bubble)
             records = []
@@ -8436,6 +8453,7 @@ class ChatPage(QWidget):
             "⏳ 执行中...",
             parent=self.chat_container,
             max_content_height=210,
+            title="执行结果",
         )
         self.add_chat_widget(self.result_bubble, animate=True)
         
