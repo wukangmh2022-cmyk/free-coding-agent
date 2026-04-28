@@ -809,6 +809,28 @@ MARKDOWN_LANGUAGE_LINES = {
 }
 
 
+def strip_deepseek_empty_text_tail(text: str) -> str:
+    """Drop the empty trailing ```text block DeepSeek can leave after an abnormal stop."""
+    result = (text or "").strip()
+    if not result:
+        return ""
+
+    patterns = (
+        r"(?ms)(?:\n|^)```(?:text|plain|plaintext)\s*\n\s*```\s*$",
+        r"(?ms)(?:\n|^)```(?:text|plain|plaintext)\s*\n?\s*$",
+        r"(?ms)\n```\s*\n(?:text|plain|plaintext)\s*$",
+    )
+    changed = True
+    while changed and result:
+        changed = False
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "\n", result).strip()
+            if cleaned != result:
+                result = cleaned
+                changed = True
+    return result
+
+
 def clean_plain_visible_assistant_text(text: str) -> str:
     """Remove DeepSeek Web button labels from rendered plain-text fallback."""
     if not text:
@@ -840,7 +862,7 @@ def clean_plain_visible_assistant_text(text: str) -> str:
 
     result = "\n".join(cleaned)
     result = re.sub(r"\n{4,}", "\n\n\n", result).strip()
-    return result
+    return strip_deepseek_empty_text_tail(result)
 
 
 def has_unclosed_markdown_fence(text: str) -> bool:
@@ -878,6 +900,9 @@ def is_likely_truncated_plain_text(text: str) -> bool:
             return True
         if lang in {"bash", "sh", "shell", "zsh"} and is_suspicious_incomplete_command_text(code):
             return True
+    cleaned = strip_deepseek_empty_text_tail(stripped)
+    if cleaned and cleaned != stripped:
+        return is_likely_truncated_plain_text(cleaned)
     tail = stripped[-240:]
     if re.search(r"<<-?\s*['\"]?[A-Za-z_][A-Za-z0-9_-]*['\"]?\s*$", tail):
         return True
@@ -4623,6 +4648,18 @@ class DeepSeekWebBridge:
                 continue
         return False
 
+    def has_continue_generation_button(self, page: Page) -> bool:
+        for selector in self.continue_generation_selectors:
+            locator = page.locator(selector).last
+            try:
+                if locator.count() == 0:
+                    continue
+                if locator.is_visible(timeout=120) and locator.is_enabled(timeout=120):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def click_continue_generation_if_present(self, page: Page, *, trace: DeepSeekTrace | None = None) -> bool:
         """Click DeepSeek's continuation button when a long answer is truncated.
 
@@ -4751,6 +4788,8 @@ class DeepSeekWebBridge:
         incomplete_command_extra_wait_rounds = 0
         best_seen_text = ""
         continue_clicks = 0
+        stable_copy_text = ""
+        stable_copy_seen = 0
 
         def assistant_has_advanced(current_count: int, current_index: int, current_text: str) -> bool:
             if self.force_new_chat:
@@ -5082,6 +5121,30 @@ class DeepSeekWebBridge:
             if has_advanced and current and stable_seen >= self.stable_rounds:
                 if try_continue_generation("stable_text"):
                     continue
+                if plain_protocol and self.can_submit_next_turn(page) and not self.has_continue_generation_button(page):
+                    copied = self.try_copy_last_assistant_text(
+                        page,
+                        max_total_ms=max(self.copy_probe_max_ms, 1500),
+                        plain_protocol=True,
+                    )
+                    if copied and self._matches_current_request_response_candidate(copied):
+                        if copied == stable_copy_text:
+                            stable_copy_seen += 1
+                        else:
+                            stable_copy_text = copied
+                            stable_copy_seen = 1
+                        if stable_copy_seen >= max(2, self.stable_rounds):
+                            if trace is not None:
+                                trace.set("response_chars", len(copied))
+                                trace.set("response_ready_reason", "copy_button_plain_terminal_stable")
+                                trace.mark("response_stable")
+                            logger.warning(
+                                "DeepSeek wait_for_response returning terminal stable plain clipboard copy dom_chars=%d copied_chars=%d stable_copy_seen=%d",
+                                len(current),
+                                len(copied),
+                                stable_copy_seen,
+                            )
+                            return copied
                 if (
                     plain_protocol
                     and has_agent_qt_completion_line(current)
