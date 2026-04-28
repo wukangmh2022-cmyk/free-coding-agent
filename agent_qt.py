@@ -637,14 +637,21 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
    - <!-- YAML block --> 对应 yaml 代码块
    - <!-- TypeScript block --> 对应 typescript/ts 代码块
    - <!-- 其他任意类型 block --> 对应该类型名的代码块（如 svg/xml/toml 等）
-3. 各代码块在命令块之后单独给出。
-4. 指令按顺序排列，先创建目录再写文件，确保可直接执行。
-5. 项目根目录: {project_root}，所有路径使用绝对路径。
-6. **重要：一个命令块包含所有指令，不要输出多个命令块。**
-7. **重要：二选一的操作只保留一种**（如启动服务器 OR 手动打开，选前者）。
-8. 安装依赖用 pip install，启动后端用 python server.py 或 python3 -m http.server。
-9. 常驻进程命令（python server.py 等）会自动进入后台终端，不要加 & 或 nohup。
-10. 自动化循环中，如果根据执行日志判断任务已经完成，不要再输出命令块，回复 `{done_marker}` 加简短总结即可；如果未完成，继续输出下一轮完整命令块。
+3. **占位符必须一一对应代码块**：
+   - 每出现一次 `<!-- Python block -->` 或 `# Python block`，就必须提供一个后续 ```python 代码块；同类占位符出现两次就需要两个同类代码块。
+   - 更推荐同一个文件只写一次：先用一个占位符写入脚本文件，再执行这个脚本。不要先执行带占位符 stdin/heredoc 的命令，再用同一个占位符写文件。
+   - 如果只需要一份 Python 代码，只允许出现一个 Python 占位符。
+4. 各代码块在命令块之后单独给出。
+5. 指令按顺序排列，先创建目录再写文件，确保可直接执行。
+6. 项目根目录: {project_root}，所有路径使用绝对路径。
+7. **重要：一个命令块包含所有指令，不要输出多个命令块。**
+8. **禁止输出备用方案或二选一方案**：
+   - 不要写“如果上面失败/如果 heredoc 有问题/或者改用/备用方案/方案 A 和方案 B”。
+   - 不要在同一轮里同时保留两种会互相覆盖或重复执行的做法。
+   - 你必须自己选择一个最高把握方案，只输出这一种可执行路径。
+9. 安装依赖用 pip install，启动后端用 python server.py 或 python3 -m http.server。
+10. 常驻进程命令（python server.py 等）会自动进入后台终端，不要加 & 或 nohup。
+11. 自动化循环中，如果根据执行日志判断任务已经完成，不要再输出命令块，回复 `{done_marker}` 加简短总结即可；如果未完成，继续输出下一轮完整命令块。
 
 ---
 
@@ -1443,7 +1450,15 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
     resolved = placeholder_pattern.sub(replace, bash_text)
     if missing:
         unique_missing = ", ".join(sorted(set(missing)))
-        raise ValueError(f"缺少占位符对应的代码块：{unique_missing}。为避免覆盖文件，本轮已停止执行。")
+        missing_counts = ", ".join(
+            f"{lang}×{count}" for lang, count in sorted(
+                {lang: missing.count(lang) for lang in set(missing)}.items()
+            )
+        )
+        raise ValueError(
+            f"缺少占位符对应的代码块：{unique_missing}（缺少 {missing_counts}）。"
+            "每出现一次占位符都需要一个对应代码块；不要输出备用方案或重复写入同一个文件。为避免覆盖文件，本轮已停止执行。"
+        )
     if placeholder_pattern.search(resolved):
         raise ValueError("仍有未替换的占位符。为避免覆盖文件，本轮已停止执行。")
     return resolved
@@ -2413,6 +2428,8 @@ def context_k_label(tokens: int) -> str:
 def build_automation_feedback_prompt(project_root: str, goal: str, execution_log: str, round_number: int, max_rounds: int) -> str:
     goal_text = goal.strip() or "用户没有填写一句话需求，请根据前文、执行日志和当前项目状态继续判断。"
     clipped_log = truncate_middle(execution_log.strip(), AUTOMATION_FEEDBACK_CHAR_LIMIT)
+    env = runtime_environment()
+    command_block_lang = env["command_block_lang"]
     return f"""你正在 Agent Qt 的自动化循环中，这是第 {round_number}/{max_rounds} 轮。
 
 原始用户需求：
@@ -2427,10 +2444,12 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 ```
 
 请基于日志和 diff 判断下一步：
-- 如果任务已经完成，只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出 Bash。
-- 如果任务还没有完成，继续输出一个完整的 ```bash 代码块，并按既有“占位符 + 后续代码块”协议补齐需要写入的大段文件内容。
+- 如果任务已经完成，只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。
+- 如果任务还没有完成，继续输出一个完整的 ```{command_block_lang} 代码块，并按既有“占位符 + 后续代码块”协议补齐需要写入的大段文件内容。
 - 不要重复已经成功完成的步骤；优先修复日志里的错误、补齐缺失文件或做必要验证。
-- 不要输出 JSON，不要输出 content/tool_calls 包装；这里需要的是普通 Markdown 文本和 fenced bash。
+- 禁止输出备用方案或“如果上面失败就改用...”这类二选一命令；必须自己选择一个最高把握方案，只保留一种可执行路径。
+- 每出现一次占位符就必须提供一个对应代码块；如果只需要一份 Python 代码，就只出现一个 Python 占位符。
+- 不要输出 JSON，不要输出 content/tool_calls 包装；这里需要的是普通 Markdown 文本和 fenced {command_block_lang}。
 """
 
 
