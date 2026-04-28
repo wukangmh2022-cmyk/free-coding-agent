@@ -3513,6 +3513,31 @@ class DeepSeekWebBridge:
                     logger.warning("DeepSeek submit_prompt prompt filled prompt_chars=%d", len(prompt))
                     if not self.try_submit(page, input_box, trace=trace):
                         raise RuntimeError("Failed to submit prompt to DeepSeek web UI.")
+                    if not self.confirm_submission_started(
+                        page,
+                        before_count,
+                        before_last_text,
+                        before_last_index,
+                        transport_capture=transport_capture,
+                        trace=trace,
+                    ):
+                        logger.warning("DeepSeek submit did not start generation; retrying once.")
+                        if trace is not None:
+                            trace.mark("submit_retry_started")
+                        if not self.try_submit(page, input_box, trace=trace):
+                            raise RuntimeError("DeepSeek submit button was clicked, but the page did not start generating.")
+                        if not self.confirm_submission_started(
+                            page,
+                            before_count,
+                            before_last_text,
+                            before_last_index,
+                            transport_capture=transport_capture,
+                            trace=trace,
+                        ):
+                            raise RuntimeError(
+                                "DeepSeek submit button was clicked, but the web page stayed idle. "
+                                "Please check whether the prompt remained in the input box or the page is rate-limited."
+                            )
                     self.scroll_chat_to_bottom(page)
                     if self.sticky_marker:
                         self._sticky_initialized = True
@@ -4638,6 +4663,51 @@ class DeepSeekWebBridge:
         if not isinstance(result, dict) or not result.get("ok"):
             raise RuntimeError(f"DeepSeek input injection failed: {result}")
         logger.warning("DeepSeek fill_input page-level inject done tag=%s", result.get("tag"))
+
+    def confirm_submission_started(
+        self,
+        page: Page,
+        before_count: int,
+        before_last_text: str,
+        before_last_index: int,
+        *,
+        transport_capture: DeepSeekTransportCapture | None = None,
+        trace: DeepSeekTrace | None = None,
+        timeout_ms: int = 4500,
+    ) -> bool:
+        locator = self.assistant_locator(page)
+        deadline = time.time() + max(0.5, timeout_ms / 1000)
+        while time.time() < deadline:
+            transport_text = transport_capture.best_payload_text() if transport_capture is not None else ""
+            current_count = locator.count()
+            if self.force_new_chat:
+                current_index = -1
+                current_text = self.last_assistant_text(locator, page)
+            else:
+                current_snapshot = self.assistant_snapshot(locator, page)
+                current_index = current_snapshot["index"]
+                current_text = current_snapshot["text"]
+            can_submit = self.can_submit_next_turn(page)
+            started = (
+                bool(transport_text)
+                or not can_submit
+                or current_count > before_count
+                or current_index > before_last_index
+                or (bool(current_text) and current_text != before_last_text)
+            )
+            if started:
+                if trace is not None:
+                    trace.set("submit_confirm_can_submit", can_submit)
+                    trace.set("submit_confirm_current_count", current_count)
+                    trace.set("submit_confirm_transport_chars", len(transport_text))
+                    trace.mark("submit_confirmed")
+                return True
+            page.wait_for_timeout(200)
+        if trace is not None:
+            trace.set("submit_confirm_timeout_ms", timeout_ms)
+            trace.set("submit_confirm_can_submit", self.can_submit_next_turn(page))
+            trace.mark("submit_not_started")
+        return False
 
     def try_submit(self, page: Page, input_box: Locator, *, trace: DeepSeekTrace | None = None) -> bool:
         for selector in self.send_selectors:
