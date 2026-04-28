@@ -637,17 +637,17 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
    - <!-- YAML block --> 对应 yaml 代码块
    - <!-- TypeScript block --> 对应 typescript/ts 代码块
    - <!-- 其他任意类型 block --> 对应该类型名的代码块（如 svg/xml/toml 等）
-3. **占位符必须一一对应代码块**：
-   - 每出现一次 `<!-- Python block -->` 或 `# Python block`，就必须提供一个后续 ```python 代码块；同类占位符出现两次就需要两个同类代码块。
-   - 更推荐同一个文件只写一次：先用一个占位符写入脚本文件，再执行这个脚本。不要先执行带占位符 stdin/heredoc 的命令，再用同一个占位符写文件。
-   - 如果只需要一份 Python 代码，只允许出现一个 Python 占位符。
+3. **占位符与代码块的对应规则**：
+   - 未编号占位符按出现顺序消费同语言代码块：两个 `<!-- Python block -->` 需要两个后续 ```python 代码块。
+   - 编号占位符固定引用对应序号的同语言代码块：`<!-- Python block 1 -->`、`# Python block 1` 都引用第 1 个 ```python 代码块。
+   - 同一个编号可以重复使用；如果同一份代码需要替换到多个位置，重复写 `<!-- Python block 1 -->` 即可，不要重复提供同一份代码块。
 4. 各代码块在命令块之后单独给出。
 5. 指令按顺序排列，先创建目录再写文件，确保可直接执行。
 6. 项目根目录: {project_root}，所有路径使用绝对路径。
 7. **重要：一个命令块包含所有指令，不要输出多个命令块。**
 8. **禁止输出备用方案或二选一方案**：
-   - 不要写“如果上面失败/如果 heredoc 有问题/或者改用/备用方案/方案 A 和方案 B”。
-   - 不要在同一轮里同时保留两种会互相覆盖或重复执行的做法。
+   - 不要写“如果上面失败/或者改用/备用方案/方案 A 和方案 B”。
+   - 不要在同一轮里同时保留两种互相替代的做法。
    - 你必须自己选择一个最高把握方案，只输出这一种可执行路径。
 9. 安装依赖用 pip install，启动后端用 python server.py 或 python3 -m http.server。
 10. 常驻进程命令（python server.py 等）会自动进入后台终端，不要加 & 或 nohup。
@@ -1427,23 +1427,37 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
     替换所有占位符。
     支持格式:
     - <!-- XXX block -->
+    - <!-- XXX block 1 -->
     - # XXX block
+    - # XXX block 1
     其中 XXX 对应 blocks 中的 key（html/css/js/python/svg/json/yaml/typescript/ts...）
     """
     counters: Dict[str, int] = {}
     missing: List[str] = []
     placeholder_pattern = re.compile(
-        r'<!--\s*(?P<html>\w+)\s+block\s*-->'
-        r'|/\*\s*(?P<css>\w+)\s+block\s*\*/'
-        r'|//\s*(?P<slash>\w+)\s+block\b'
-        r'|#\s*(?P<hash>\w+)\s+block\b'
+        r'<!--\s*(?P<html>\w+)\s+block(?:\s+(?P<html_index>\d+))?\s*-->'
+        r'|/\*\s*(?P<css>\w+)\s+block(?:\s+(?P<css_index>\d+))?\s*\*/'
+        r'|//\s*(?P<slash>\w+)\s+block(?:\s+(?P<slash_index>\d+))?\b'
+        r'|#\s*(?P<hash>\w+)\s+block(?:\s+(?P<hash_index>\d+))?\b'
     )
 
     def replace(match: re.Match) -> str:
         lang = (match.group('html') or match.group('css') or match.group('slash') or match.group('hash') or '').lower()
-        code = get_next_code_block(blocks, counters, lang)
+        index_text = (
+            match.group('html_index')
+            or match.group('css_index')
+            or match.group('slash_index')
+            or match.group('hash_index')
+            or ''
+        )
+        if index_text:
+            block_index = max(0, int(index_text) - 1)
+            code = get_code_block(blocks, lang, block_index)
+        else:
+            code = get_next_code_block(blocks, counters, lang)
         if code is None:
-            missing.append(canonical_lang(lang))
+            suffix = f" block {index_text}" if index_text else ""
+            missing.append(canonical_lang(lang) + suffix)
             return match.group(0)
         return code
 
@@ -1457,7 +1471,8 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
         )
         raise ValueError(
             f"缺少占位符对应的代码块：{unique_missing}（缺少 {missing_counts}）。"
-            "每出现一次占位符都需要一个对应代码块；不要输出备用方案或重复写入同一个文件。为避免覆盖文件，本轮已停止执行。"
+            "未编号占位符会按顺序消费代码块；如需多处复用同一代码块，请使用编号占位符，例如 <!-- Python block 1 -->。"
+            "为避免覆盖文件，本轮已停止执行。"
         )
     if placeholder_pattern.search(resolved):
         raise ValueError("仍有未替换的占位符。为避免覆盖文件，本轮已停止执行。")
@@ -2448,7 +2463,7 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 - 如果任务还没有完成，继续输出一个完整的 ```{command_block_lang} 代码块，并按既有“占位符 + 后续代码块”协议补齐需要写入的大段文件内容。
 - 不要重复已经成功完成的步骤；优先修复日志里的错误、补齐缺失文件或做必要验证。
 - 禁止输出备用方案或“如果上面失败就改用...”这类二选一命令；必须自己选择一个最高把握方案，只保留一种可执行路径。
-- 每出现一次占位符就必须提供一个对应代码块；如果只需要一份 Python 代码，就只出现一个 Python 占位符。
+- 未编号占位符按顺序消费代码块；编号占位符可复用同一个代码块，例如多处 `<!-- Python block 1 -->` 都引用第 1 个 python 代码块。
 - 不要输出 JSON，不要输出 content/tool_calls 包装；这里需要的是普通 Markdown 文本和 fenced {command_block_lang}。
 """
 
