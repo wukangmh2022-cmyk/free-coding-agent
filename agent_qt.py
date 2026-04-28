@@ -2938,6 +2938,31 @@ def automation_venv_python(root: str) -> str:
     return os.path.join(root, ".venv", "bin", "python")
 
 
+def browser_channel_probe_code() -> str:
+    return """
+from playwright.sync_api import sync_playwright
+channels = ["msedge", "chrome"]
+p = sync_playwright().start()
+try:
+    for channel in channels:
+        try:
+            b = p.chromium.launch(channel=channel, headless=True)
+            b.close()
+            print(channel)
+            raise SystemExit(0)
+        except Exception:
+            pass
+finally:
+    p.stop()
+raise SystemExit(1)
+"""
+
+
+def python_exec_base64_code(source: str) -> str:
+    payload = base64.b64encode(source.encode("utf-8")).decode("ascii")
+    return f"import base64; exec(base64.b64decode('{payload}').decode('utf-8'))"
+
+
 def is_python_executable_candidate(path: str) -> bool:
     if not path:
         return False
@@ -3037,6 +3062,15 @@ class AutomationProviderManager:
         env.setdefault("DEEPSEEK_WEB_SESSION_STATE_DEERFLOW", os.path.join(profile_root, "deepseek-session.json"))
         env.setdefault("XIAOMI_MIMO_WEB_PROFILE", os.path.join(profile_root, "mimo"))
         env.setdefault("XIAOMI_MIMO_WEB_SESSION_STATE", os.path.join(profile_root, "mimo-session.json"))
+        browser_channel_path = os.path.join(self.plugin_root, "browser-channel.txt")
+        if os.path.isfile(browser_channel_path):
+            try:
+                browser_channel = open(browser_channel_path, "r", encoding="utf-8").read().strip()
+            except OSError:
+                browser_channel = ""
+            if browser_channel:
+                env.setdefault("DEEPSEEK_WEB_BROWSER_CHANNEL", browser_channel)
+                env.setdefault("XIAOMI_MIMO_WEB_BROWSER_CHANNEL", browser_channel)
         env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
         env.setdefault("no_proxy", env["NO_PROXY"])
         return env
@@ -3078,10 +3112,22 @@ print(json.dumps({{"missing": missing, "provider_error": ""}}, ensure_ascii=Fals
 raise SystemExit(1 if missing else 0)
 """
         last_output = ""
-        for python_bin in self.candidate_pythons():
+        candidates = self.candidate_pythons()
+        if not candidates:
+            return {
+                "ready": False,
+                "python": "",
+                "missing": list(AUTOMATION_REQUIRED_MODULES),
+                "message": "未找到可用 Python。请先开启/安装 Python 运行环境，或重新点击“安装/修复插件依赖”。",
+            }
+        for python_bin in candidates:
             ok, output = self.run_python_probe(python_bin, probe)
             last_output = output or last_output
             if ok:
+                browser_ok, browser_output = self.browser_status(python_bin)
+                if not browser_ok:
+                    last_output = browser_output or last_output
+                    continue
                 return {
                     "ready": True,
                     "python": python_bin,
@@ -3089,20 +3135,45 @@ raise SystemExit(1 if missing else 0)
                     "message": "依赖可用。",
                 }
         missing = list(AUTOMATION_REQUIRED_MODULES)
+        provider_error = ""
         try:
-            payload = json.loads((last_output or "{}").splitlines()[-1])
+            payload = {}
+            for line in reversed((last_output or "").splitlines()):
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                payload = json.loads(line)
+                break
             if isinstance(payload.get("missing"), list):
                 missing = payload["missing"]
+            provider_error = str(payload.get("provider_error") or "")
         except Exception:
             pass
+        message = provider_error or last_output or "依赖检查失败。"
         return {
             "ready": False,
             "python": "",
             "missing": missing,
-            "message": last_output or "依赖检查失败。",
+            "message": message,
         }
 
     def browser_status(self, python_bin: str) -> tuple[bool, str]:
+        browser_channel_path = os.path.join(self.plugin_root, "browser-channel.txt")
+        channel_ok, channel_output = self.run_python_probe(python_bin, browser_channel_probe_code(), timeout=60)
+        if channel_ok:
+            channel = (channel_output or "").splitlines()[-1].strip()
+            try:
+                os.makedirs(self.plugin_root, exist_ok=True)
+                with open(browser_channel_path, "w", encoding="utf-8") as f:
+                    f.write(channel)
+            except OSError:
+                pass
+            return True, f"system browser channel ok: {channel}"
+        try:
+            if os.path.isfile(browser_channel_path):
+                os.remove(browser_channel_path)
+        except OSError:
+            pass
         probe = """
 from playwright.sync_api import sync_playwright
 p = sync_playwright().start()
@@ -3113,7 +3184,7 @@ finally:
     p.stop()
 print("chromium ok")
 """
-        return self.run_python_probe(python_bin, probe, timeout=20)
+        return self.run_python_probe(python_bin, probe, timeout=60)
 
     def install_dependencies(self, status_callback=None) -> str:
         os.makedirs(self.plugin_root, exist_ok=True)
@@ -3138,7 +3209,6 @@ print("chromium ok")
                 "playwright",
                 "httpx",
             ],
-            [python_bin, "-m", "playwright", "install", "chromium"],
         ]
         for command in commands:
             if status_callback:
@@ -3153,6 +3223,24 @@ print("chromium ok")
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "").strip()
                 raise RuntimeError(detail[-2000:] or f"命令失败: {' '.join(command)}")
+        browser_ok, browser_message = self.browser_status(python_bin)
+        if not browser_ok:
+            if status_callback:
+                status_callback("未检测到系统 Edge/Chrome，安装 Playwright Chromium...")
+            command = [python_bin, "-m", "playwright", "install", "chromium"]
+            result = subprocess.run(
+                command,
+                cwd=self.plugin_root,
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                raise RuntimeError(detail[-2000:] or f"命令失败: {' '.join(command)}")
+            browser_ok, browser_message = self.browser_status(python_bin)
+        if not browser_ok:
+            raise RuntimeError(browser_message or "Playwright Chromium 启动验证失败。")
         return python_bin
 
     def install_dependencies_command(self) -> str:
@@ -3168,6 +3256,7 @@ print("chromium ok")
             "playwright",
             "httpx",
         ]
+        browser_probe = python_exec_base64_code(browser_channel_probe_code())
         if platform.system() == "Windows":
             return f"""@echo off
 setlocal
@@ -3196,12 +3285,26 @@ echo.
 echo [2/3] 安装 provider Python 依赖
 "%PYTHON_BIN%" -m pip install {cmd_join(pip_index_args())} {cmd_join(package_args)} || exit /b 1
 echo.
-echo [3/3] 安装 Playwright Chromium
-"%PYTHON_BIN%" -m playwright install chromium || exit /b 1
+echo [3/3] 检查系统 Edge/Chrome 或安装 Playwright Chromium
+cd /d "{self.backend_dir}"
+set "BROWSER_CHANNEL="
+for /f "usebackq delims=" %%C in (`"%PYTHON_BIN%" -c "{browser_probe}" 2^>nul`) do set "BROWSER_CHANNEL=%%C"
+if not "%BROWSER_CHANNEL%"=="" (
+  echo 使用系统浏览器: %BROWSER_CHANNEL%
+  echo %BROWSER_CHANNEL%>"%VENV_DIR%\\..\\browser-channel.txt"
+) else (
+  "%PYTHON_BIN%" -m playwright install chromium || exit /b 1
+)
 echo.
 echo 验证 provider 模块...
-cd /d "{self.backend_dir}"
 "%PYTHON_BIN%" -c "import app.deepseek_local_provider; print('自动化插件依赖 OK')" || exit /b 1
+echo.
+echo 验证 Playwright 浏览器...
+if not "%BROWSER_CHANNEL%"=="" (
+  "%PYTHON_BIN%" -c "from playwright.sync_api import sync_playwright; import os; p=sync_playwright().start(); b=p.chromium.launch(channel=os.environ['BROWSER_CHANNEL'], headless=True); b.close(); p.stop(); print('Playwright browser OK: ' + os.environ['BROWSER_CHANNEL'])" || exit /b 1
+) else (
+  "%PYTHON_BIN%" -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); b.close(); p.stop(); print('Playwright browser OK: chromium')" || exit /b 1
+)
 echo.
 echo 自动化插件依赖安装完成: %PYTHON_BIN%
 """
@@ -3240,12 +3343,25 @@ echo
 echo "[2/3] 安装 provider Python 依赖"
 "$PYTHON_BIN" -m pip install {posix_join(pip_index_args())} {posix_join(package_args)}
 echo
-echo "[3/3] 安装 Playwright Chromium"
-"$PYTHON_BIN" -m playwright install chromium
+echo "[3/3] 检查系统 Edge/Chrome 或安装 Playwright Chromium"
+cd "$BACKEND_DIR"
+BROWSER_CHANNEL="$("$PYTHON_BIN" -c {shlex.quote(browser_probe)} 2>/dev/null || true)"
+if [ -n "$BROWSER_CHANNEL" ]; then
+  echo "使用系统浏览器: $BROWSER_CHANNEL"
+  printf "%s" "$BROWSER_CHANNEL" > "$VENV_DIR/../browser-channel.txt"
+else
+  "$PYTHON_BIN" -m playwright install chromium
+fi
 echo
 echo "验证 provider 模块..."
-cd "$BACKEND_DIR"
 "$PYTHON_BIN" -c "import app.deepseek_local_provider; print('自动化插件依赖 OK')"
+echo
+echo "验证 Playwright 浏览器..."
+if [ -n "$BROWSER_CHANNEL" ]; then
+  BROWSER_CHANNEL="$BROWSER_CHANNEL" "$PYTHON_BIN" -c "from playwright.sync_api import sync_playwright; import os; p=sync_playwright().start(); b=p.chromium.launch(channel=os.environ['BROWSER_CHANNEL'], headless=True); b.close(); p.stop(); print('Playwright browser OK: ' + os.environ['BROWSER_CHANNEL'])"
+else
+  "$PYTHON_BIN" -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); b.close(); p.stop(); print('Playwright browser OK: chromium')"
+fi
 echo
 echo "自动化插件依赖安装完成: $PYTHON_BIN"
 """
@@ -3298,6 +3414,16 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         python_bin = str(status["python"])
         os.makedirs(self.log_dir, exist_ok=True)
         log = open(self.log_file, "a", encoding="utf-8")
+        popen_kwargs = {
+            "cwd": self.backend_dir,
+            "env": self.provider_env(),
+            "stdout": log,
+            "stderr": subprocess.STDOUT,
+        }
+        if platform.system() == "Windows":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(
             [
                 python_bin,
@@ -3311,11 +3437,7 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
                 "--log-level",
                 "warning",
             ],
-            cwd=self.backend_dir,
-            env=self.provider_env(),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+            **popen_kwargs,
         )
         os.makedirs(self.plugin_root, exist_ok=True)
         with open(self.pid_file, "w", encoding="utf-8") as f:
@@ -5673,18 +5795,8 @@ class ChatPage(QWidget):
             self.hide_automation_composer()
             self.load_history()
             return
-        status = self.automation_manager.dependency_status()
-        if not status.get("ready"):
-            self.automation_enabled = False
-            set_automation_enabled_setting(False)
-            if toggle_row is not None:
-                toggle_row.setChecked(False)
-            styled_warning(
-                self,
-                "自动化插件未就绪",
-                "插件依赖还没有准备好。请先在设置里点击“安装/修复插件依赖”。\n\n" + str(status.get("message", ""))[-800:],
-            )
-            return
+        if toggle_row is not None:
+            toggle_row.setChecked(True)
         self.automation_enabled = True
         set_automation_enabled_setting(True)
         self.stop_automation_preview(remove_bubble=True)
@@ -5786,6 +5898,7 @@ class ChatPage(QWidget):
             if ok:
                 if action == "start":
                     self.automation_enabled = True
+                    set_automation_enabled_setting(True)
                     self.show_automation_composer(focus=False)
                 if action != "start":
                     self.add_status_bubble(message)
@@ -5793,6 +5906,8 @@ class ChatPage(QWidget):
                 self.automation_enabled = False if action == "start" else self.automation_enabled
                 if action == "start":
                     set_automation_enabled_setting(False)
+                    self.stop_automation_preview(remove_bubble=True)
+                    self.hide_automation_composer()
                     self.load_history()
                 self.refresh_prompt_bubble_buttons()
                 styled_warning(self, "自动化插件", message)

@@ -1788,6 +1788,7 @@ class DeepSeekWebBridge:
         sticky_scan_chars: int = 8000,
         sticky_reanchor_messages: int | None = 24,
         session_state_path: str | None = None,
+        browser_channel: str | None = None,
         reuse_persisted_chat: bool = False,
         copy_probe_max_ms: int = DEFAULT_COPY_PROBE_MAX_MS,
         copy_candidate_max_distance: int = DEFAULT_COPY_CANDIDATE_MAX_DISTANCE,
@@ -1814,6 +1815,7 @@ class DeepSeekWebBridge:
         self.sticky_scan_chars = sticky_scan_chars
         self.sticky_reanchor_messages = sticky_reanchor_messages
         self.session_state_path = session_state_path
+        self.browser_channel = (browser_channel or "").strip() or None
         self.reuse_persisted_chat = reuse_persisted_chat
         self.copy_probe_max_ms = max(0, int(copy_probe_max_ms))
         self.copy_candidate_max_distance = max(0, int(copy_candidate_max_distance))
@@ -2037,10 +2039,15 @@ class DeepSeekWebBridge:
 
             self._playwright = sync_playwright().start()
             self._browser_type = self._playwright.chromium
+            launch_options: dict[str, Any] = {
+                "user_data_dir": profile_dir,
+                "headless": requested_headless,
+                "viewport": {"width": 1440, "height": 960},
+            }
+            if self.browser_channel:
+                launch_options["channel"] = self.browser_channel
             self._context = self._browser_type.launch_persistent_context(
-                user_data_dir=profile_dir,
-                headless=requested_headless,
-                viewport={"width": 1440, "height": 960},
+                **launch_options,
             )
             try:
                 parsed_url = urlparse(self.url)

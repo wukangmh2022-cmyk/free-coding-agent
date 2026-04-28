@@ -60,6 +60,7 @@ def _looks_like_prompt_replay_text(text: str) -> bool:
 DEFAULT_URL = os.environ.get("DEEPSEEK_WEB_URL", "https://chat.deepseek.com/")
 DEFAULT_HEADLESS = os.environ.get("DEEPSEEK_WEB_HEADLESS", "1") == "1"
 DEFAULT_FORCE_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FORCE_NEW_CHAT", "0") == "1"
+DEFAULT_BROWSER_CHANNEL = os.environ.get("DEEPSEEK_WEB_BROWSER_CHANNEL", "").strip() or None
 DEFAULT_MODEL_ID = os.environ.get("DEEPSEEK_LOCAL_MODEL", "DeepSeekV4")
 INTERFACE_MODE = os.environ.get("DEEPSEEK_LOCAL_INTERFACE_MODE", "both").strip().lower()
 
@@ -154,6 +155,7 @@ class ModelSpec:
     sticky_marker: str | None = None
     sticky_reanchor_messages: int | None = 24
     session_state_path: str | None = None
+    browser_channel: str | None = DEFAULT_BROWSER_CHANNEL
     reuse_persisted_chat: bool = False
     forced_thinking_enabled: bool | None = None
     forced_expert_mode_enabled: bool | None = None
@@ -191,6 +193,9 @@ XIAOMI_MIMO_PROFILE_DIR = os.environ.get("XIAOMI_MIMO_WEB_PROFILE", "~/.deerflow
 XIAOMI_MIMO_SESSION_STATE_PATH = os.environ.get(
     "XIAOMI_MIMO_WEB_SESSION_STATE",
     "~/.deerflow/xiaomi-mimo-session.json",
+)
+XIAOMI_MIMO_BROWSER_CHANNEL = (
+    os.environ.get("XIAOMI_MIMO_WEB_BROWSER_CHANNEL", "").strip() or DEFAULT_BROWSER_CHANNEL
 )
 XIAOMI_MIMO_FORCE_NEW_CHAT = os.environ.get("XIAOMI_MIMO_FORCE_NEW_CHAT", "1") == "1"
 XIAOMI_MIMO_STICKY_MARKER = os.environ.get("XIAOMI_MIMO_STICKY_MARKER", "mimo__system_prompt_v2")
@@ -338,6 +343,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         profile_dir=XIAOMI_MIMO_PROFILE_DIR,
         url=XIAOMI_MIMO_URL,
         headless=XIAOMI_MIMO_HEADLESS,
+        browser_channel=XIAOMI_MIMO_BROWSER_CHANNEL,
         force_new_chat=XIAOMI_MIMO_FORCE_NEW_CHAT,
         sticky_marker=XIAOMI_MIMO_STICKY_MARKER,
         sticky_reanchor_messages=XIAOMI_MIMO_STICKY_REANCHOR_MESSAGES,
@@ -362,6 +368,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         profile_dir=XIAOMI_MIMO_PROFILE_DIR,
         url=XIAOMI_MIMO_URL,
         headless=XIAOMI_MIMO_HEADLESS,
+        browser_channel=XIAOMI_MIMO_BROWSER_CHANNEL,
         force_new_chat=XIAOMI_MIMO_FORCE_NEW_CHAT,
         sticky_marker=XIAOMI_MIMO_STICKY_MARKER,
         sticky_reanchor_messages=XIAOMI_MIMO_STICKY_REANCHOR_MESSAGES,
@@ -614,6 +621,7 @@ def _make_bridge(base_spec: ModelSpec, *, cache_key: str, slot_index: int, pool_
             slot_index=slot_index,
             pool_size=pool_size,
         ),
+        "browser_channel": base_spec.browser_channel,
         "reuse_persisted_chat": base_spec.reuse_persisted_chat,
         "fast_new_chat": base_spec.fast_new_chat,
     }
