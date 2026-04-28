@@ -2312,17 +2312,18 @@ def build_execution_context_content(full_log: str, records: List[Dict[str, objec
 
 AUTOMATION_LOOP_MAX_ROUNDS = env_int("AGENT_QT_AUTOMATION_MAX_ROUNDS", 20, minimum=1)
 AUTOMATION_FEEDBACK_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_FEEDBACK_CHARS", 14000, minimum=4000)
-AUTOMATION_CONTEXT_WINDOW_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_TOKENS", 1_000_000, minimum=32000)
-AUTOMATION_CONTEXT_RESPONSE_RESERVE_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_RESERVE_TOKENS", 32000, minimum=4000)
-AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_TRIGGER_TOKENS", 180000, minimum=20000)
+AUTOMATION_CONTEXT_WINDOW_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_TOKENS", 80_000, minimum=32000)
+AUTOMATION_CONTEXT_RESPONSE_RESERVE_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_RESERVE_TOKENS", 16_000, minimum=4000)
+AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_TRIGGER_TOKENS", 45_000, minimum=20000)
 AUTOMATION_CONTEXT_DISPLAY_TOKENS = env_int(
     "AGENT_QT_AUTOMATION_CONTEXT_DISPLAY_TOKENS",
     AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS,
     minimum=20000,
 )
-AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_RECENT_TOKENS", 70000, minimum=8000)
-AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_SUMMARY_TOKENS", 90000, minimum=12000)
-AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 16000, minimum=1200)
+AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_RECENT_TOKENS", 24_000, minimum=8000)
+AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_SUMMARY_TOKENS", 18_000, minimum=12000)
+AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 6000, minimum=1200)
+AUTOMATION_CONTEXT_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_CHARS", 60_000, minimum=20_000)
 
 
 def is_automation_done_response(text: str) -> bool:
@@ -2449,6 +2450,22 @@ def context_k_label(tokens: int) -> str:
 def looks_like_timeout_error(text: str) -> bool:
     lowered = str(text or "").lower()
     return any(token in lowered for token in ("timed out", "timeout", "超时", "timeouterror"))
+
+
+def looks_like_submit_idle_error(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return (
+        "deepseek submit button was clicked" in lowered
+        and "web page stayed idle" in lowered
+    )
+
+
+def quiet_automation_error_message(error: str) -> str:
+    if looks_like_timeout_error(error):
+        return "响应超时，自动化任务已暂停。"
+    if looks_like_submit_idle_error(error):
+        return "DeepSeek 页面没有开始生成，自动化任务已暂停。可能是页面限流、输入框未接受超长上下文，或提交按钮状态异常。"
+    return ""
 
 
 def build_automation_feedback_prompt(project_root: str, goal: str, execution_log: str, round_number: int, max_rounds: int) -> str:
@@ -4554,6 +4571,8 @@ class AutomationPreviewWorker(QThread):
         self.model = model
         self.thread_id = thread_id
         self._running = True
+        self._last_signature: tuple = ()
+        self._last_emit_at = 0.0
 
     def stop(self):
         self._running = False
@@ -4562,10 +4581,20 @@ class AutomationPreviewWorker(QThread):
         while self._running:
             try:
                 preview = self.manager.response_preview(self.model, self.thread_id)
-                self.preview_signal.emit(preview)
+                signature = (
+                    str(preview.get("source") or ""),
+                    int(preview.get("chars") or 0),
+                    bool(preview.get("done")),
+                    str(preview.get("error") or ""),
+                )
+                now = time.time()
+                if signature != self._last_signature or now - self._last_emit_at >= 1.2:
+                    self._last_signature = signature
+                    self._last_emit_at = now
+                    self.preview_signal.emit(preview)
             except Exception:
                 pass
-            self.msleep(220)
+            self.msleep(300)
 
 
 class MarkdownRenderWorker(QThread):
@@ -7728,7 +7757,6 @@ class ChatPage(QWidget):
         self.automation_preview_last_chars = 0
         self.automation_preview_dots = 0
         self.automation_preview_bubble = self.create_automation_preview_bubble()
-        self.automation_preview_dots_timer.start()
         worker = AutomationPreviewWorker(self.automation_manager, self.automation_model, self.thread_id)
         self.automation_preview_worker = worker
         worker.preview_signal.connect(self.update_automation_preview)
@@ -7766,11 +7794,10 @@ class ChatPage(QWidget):
         status = getattr(bubble, "preview_status", None)
         if status is None:
             return
-        dots = "." * ((self.automation_preview_dots % 3) + 1)
         if self.automation_preview_last_chars > 0:
-            text = f"AI 正在回复{dots} 已生成约 {self.automation_preview_last_chars} 字"
+            text = f"AI 正在回复... 已生成约 {self.automation_preview_last_chars} 字"
         else:
-            text = f"AI 正在回复{dots}"
+            text = "AI 正在回复..."
         if status.text() != text:
             status.setText(text)
 
@@ -7936,7 +7963,7 @@ class ChatPage(QWidget):
         )
         return text_within_token_budget(history_text, token_budget)
 
-    def build_automation_context_payload(self, current_prompt: str, skip_entry_id: str = "") -> str:
+    def build_automation_context_payload(self, current_prompt: str, skip_entry_id: str = "", log_stats: bool = True) -> str:
         system_context = self.automation_context_system_text()
         current_prompt = str(current_prompt or "").strip()
         token_budget = max(
@@ -7950,22 +7977,28 @@ class ChatPage(QWidget):
             self.automation_history_chunks(skip_entry_id=skip_entry_id),
             token_budget,
         )
-        return "\n\n".join([
+        payload = "\n\n".join([
             plaintext_fence("第一段：系统提示词", system_context),
             plaintext_fence("第二段：历史对话", history_text),
             plaintext_fence("第三段：当前指令", current_prompt),
         ])
+        if len(payload) > AUTOMATION_CONTEXT_CHAR_LIMIT:
+            payload = truncate_middle(payload, AUTOMATION_CONTEXT_CHAR_LIMIT)
+        if log_stats:
+            logger.warning(
+                "Automation context payload chars=%d tokens=%d char_limit=%d token_budget=%d",
+                len(payload),
+                estimate_context_tokens(payload),
+                AUTOMATION_CONTEXT_CHAR_LIMIT,
+                token_budget,
+            )
+        return payload
 
     def automation_context_tokens_for_next_request(self, current_prompt: str = "", skip_entry_id: str = "") -> int:
-        return estimate_context_tokens(self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id))
+        return estimate_context_tokens(self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id, log_stats=False))
 
     def automation_context_placeholder_text(self) -> str:
-        current_text = self.automation_input.toPlainText().strip() if self.automation_input is not None else ""
-        used = self.automation_context_tokens_for_next_request(current_text)
-        return (
-            f"上下文 {context_k_label(used)} / {context_k_label(AUTOMATION_CONTEXT_DISPLAY_TOKENS)}"
-            " · 输入下一步需求..."
-        )
+        return f"上下文自动压缩到约 {context_k_label(AUTOMATION_CONTEXT_DISPLAY_TOKENS)} 内 · 输入下一步需求..."
 
     def build_automation_messages(self, current_prompt: str, skip_entry_id: str = "") -> List[Dict[str, str]]:
         return [{"role": "user", "content": self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id)}]
@@ -8063,14 +8096,16 @@ class ChatPage(QWidget):
                 copy_btn.setEnabled(True)
                 copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
             if error:
-                is_timeout = looks_like_timeout_error(error)
+                quiet_message = quiet_automation_error_message(error)
                 self.stop_automation_loop(
-                    "响应超时，自动化任务已暂停。" if is_timeout else "自动化循环已暂停。",
+                    quiet_message or "自动化循环已暂停。",
                     ensure_manual_entry=True,
                 )
                 if "网页登录还没有准备好" in error:
                     self.add_status_bubble("需要先完成网页登录。请使用设置里的“打开网页登录”，登录后重新发送。")
-                if not is_timeout or developer_error_details_enabled():
+                elif quiet_message:
+                    self.add_status_bubble(quiet_message)
+                if (not quiet_message) or developer_error_details_enabled():
                     styled_warning(self, "AI 自动化失败", self.automation_manager.error_with_log_hint(error))
             else:
                 self.handle_ai_response_text(text)
