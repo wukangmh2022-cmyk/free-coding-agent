@@ -406,6 +406,37 @@ if (-not $BasePython) {{
 }}
 """
 
+def windows_pip_helpers_powershell() -> str:
+    return """
+function Invoke-AgentQtPipInstall {
+    param(
+        [Parameter(Mandatory=$true)][string]$PythonBin,
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [switch]$Optional
+    )
+    $lastExit = 1
+    if ($script:PipIndexArgs -and $script:PipIndexArgs.Count -gt 0) {
+        Write-Host "尝试使用配置的 PyPI 镜像..."
+        & $PythonBin -m pip install @script:PipIndexArgs @Arguments
+        $lastExit = $LASTEXITCODE
+        if ($lastExit -eq 0) { return }
+        Write-Host "配置的 PyPI 镜像失败，回退官方 PyPI..."
+    }
+    & $PythonBin -m pip install @Arguments
+    $lastExit = $LASTEXITCODE
+    if ($lastExit -eq 0) { return }
+    if ($Optional) {
+        Write-Host "pip 可选升级失败，检查现有 pip 是否可用..."
+        & $PythonBin -m pip --version
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "现有 pip 可用，继续安装流程。"
+            return
+        }
+    }
+    exit $lastExit
+}
+"""
+
 def build_python_runtime_install_command() -> str:
     pip_args_posix = posix_join(pip_index_args())
     venv_dir = runtime_venv_root()
@@ -420,6 +451,8 @@ $VenvDir = {ps_quote(venv_dir)}
 $PythonBin = {ps_quote(python_bin)}
 $PipIndexArgs = {ps_array(pip_index_args())}
 
+{windows_pip_helpers_powershell()}
+
 Write-Host "[Agent Qt] 创建/修复 Agent Python 环境"
 Write-Host "缓存目录: {runtime_cache_root()}"
 New-Item -ItemType Directory -Force -Path $VenvDir | Out-Null
@@ -432,8 +465,7 @@ if (-not (Test-Path -LiteralPath $PythonBin -PathType Leaf)) {{
 
 Write-Host ""
 Write-Host "升级 pip"
-& $PythonBin -m pip install --upgrade pip @PipIndexArgs
-if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+Invoke-AgentQtPipInstall -PythonBin $PythonBin -Arguments @('--upgrade', 'pip') -Optional
 
 Write-Host ""
 Write-Host "验证 Python..."
@@ -4064,6 +4096,8 @@ $BackendDir = {ps_quote(self.backend_dir)}
 $PipIndexArgs = {ps_array(pip_index_args())}
 $PackageArgs = {ps_array(package_args)}
 
+{windows_pip_helpers_powershell()}
+
 Write-Host "[Agent Qt] 安装/修复自动化插件依赖"
 Write-Host "插件目录: $PluginRoot"
 Write-Host "Provider 源码: {self.backend_dir or '未找到'}"
@@ -4081,13 +4115,11 @@ if (-not (Test-Path -LiteralPath $PythonBin -PathType Leaf)) {{
 
 Write-Host ""
 Write-Host "[1/3] 升级 pip"
-& $PythonBin -m pip install @PipIndexArgs --upgrade pip
-if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+Invoke-AgentQtPipInstall -PythonBin $PythonBin -Arguments @('--upgrade', 'pip') -Optional
 
 Write-Host ""
 Write-Host "[2/3] 安装 provider Python 依赖"
-& $PythonBin -m pip install @PipIndexArgs @PackageArgs
-if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+Invoke-AgentQtPipInstall -PythonBin $PythonBin -Arguments $PackageArgs
 
 Write-Host ""
 Write-Host "[3/3] 检查系统 Edge/Chrome 或安装 Playwright Chromium"
@@ -6662,10 +6694,17 @@ class ChatPage(QWidget):
     def show_settings_menu(self):
         if agent_runtime_enabled() and not agent_runtime_ready():
             set_agent_runtime_enabled(False)
+        if self.automation_enabled:
+            dep = self.automation_manager.dependency_status()
+            if not dep.get("ready"):
+                self.automation_enabled = False
+                set_automation_enabled_setting(False)
+                self.stop_automation_preview(remove_bubble=True)
+                self.hide_automation_composer()
         menu = QMenu(self)
         runtime_toggle = SettingsToggleRow(
             "Python 运行环境",
-            "让 bash 优先使用 Agent 缓存 Python",
+            "让命令优先使用 Agent 缓存 Python",
             agent_runtime_enabled(),
             parent=menu,
         )
@@ -6775,6 +6814,19 @@ class ChatPage(QWidget):
             self.hide_automation_composer()
             self.load_history()
             self.update_prompt_tools_responsive()
+            return
+        dep = self.automation_manager.dependency_status()
+        if not dep.get("ready"):
+            self.automation_enabled = False
+            set_automation_enabled_setting(False)
+            if toggle_row is not None:
+                toggle_row.setChecked(False)
+            styled_warning(
+                self,
+                "自动化插件",
+                "自动化插件依赖尚未就绪。请先点击“安装/修复插件依赖”，安装成功后再开启这个开关。\n\n"
+                + str(dep.get("message") or ""),
+            )
             return
         if toggle_row is not None:
             toggle_row.setChecked(True)
