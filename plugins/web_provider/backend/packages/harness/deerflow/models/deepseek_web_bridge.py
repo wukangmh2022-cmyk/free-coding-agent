@@ -1865,6 +1865,7 @@ class DeepSeekWebBridge:
         self._active_request_prompt = ""
         self._active_request_messages: list[dict[str, Any]] = []
         self._active_request_expected_exact_text: str | None = None
+        self._response_preview_started_at = 0.0
         self._response_preview_lock = threading.Lock()
         self._response_preview: dict[str, Any] = {
             "active": False,
@@ -1905,6 +1906,8 @@ class DeepSeekWebBridge:
         self._active_request_expected_exact_text = None
 
     def reset_response_preview(self) -> None:
+        now = time.time()
+        self._response_preview_started_at = now
         with self._response_preview_lock:
             self._response_preview = {
                 "active": True,
@@ -1913,7 +1916,7 @@ class DeepSeekWebBridge:
                 "source": "started",
                 "text": "",
                 "chars": 0,
-                "updated_at": time.time(),
+                "updated_at": now,
             }
 
     def update_response_preview(
@@ -1940,6 +1943,14 @@ class DeepSeekWebBridge:
                 and len(text) < max(80, int(len(previous_text) * 0.75))
             ):
                 return
+            now = time.time()
+            if text and not previous_text:
+                logger.warning(
+                    "DeepSeek first preview chars=%d source=%s latency_ms=%d",
+                    len(text),
+                    source,
+                    int((now - self._response_preview_started_at) * 1000) if self._response_preview_started_at else -1,
+                )
             self._response_preview = {
                 "active": not done,
                 "done": bool(done),
@@ -1947,7 +1958,7 @@ class DeepSeekWebBridge:
                 "source": source,
                 "text": text,
                 "chars": len(text),
-                "updated_at": time.time(),
+                "updated_at": now,
             }
 
     def response_preview(self) -> dict[str, Any]:

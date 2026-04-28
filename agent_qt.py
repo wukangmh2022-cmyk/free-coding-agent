@@ -4363,9 +4363,12 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
             pass
 
     def start_provider(self) -> str:
+        started = time.perf_counter()
         if self.health() and not self.provider_process_stale():
+            logger.warning("Automation provider ready health_ms=%d", int((time.perf_counter() - started) * 1000))
             return f"provider 已运行: {self.base_url}"
         if self.health():
+            logger.warning("Automation provider stale; restarting source_mtime=%s", self.provider_source_mtime())
             self.stop_provider_process()
         status = self.dependency_status()
         if not status.get("ready"):
@@ -4404,6 +4407,7 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         deadline = time.time() + 45
         while time.time() < deadline:
             if self.health():
+                logger.warning("Automation provider started startup_ms=%d", int((time.perf_counter() - started) * 1000))
                 return f"provider 已启动: {self.base_url}"
             time.sleep(0.5)
         tail = ""
@@ -7700,10 +7704,11 @@ class ChatPage(QWidget):
             "",
             parent=self.chat_container,
             markdown=True,
-            expand_to_content=True,
+            expand_to_content=False,
             flat=True,
+            max_content_height=560,
         )
-        frame.async_markdown_render = True
+        frame.async_markdown_render = False
         role_label = frame.findChild(QLabel)
         if role_label is not None:
             role_label.setText("AI 正在回复")
@@ -7778,7 +7783,8 @@ class ChatPage(QWidget):
 
     def schedule_automation_preview_render(self):
         if not self.automation_preview_render_timer.isActive():
-            self.automation_preview_render_timer.start(140)
+            delay = 20 if not self.automation_preview_last_rendered_text else 360
+            self.automation_preview_render_timer.start(delay)
 
     def flush_automation_preview_render(self):
         bubble = self.automation_preview_bubble
