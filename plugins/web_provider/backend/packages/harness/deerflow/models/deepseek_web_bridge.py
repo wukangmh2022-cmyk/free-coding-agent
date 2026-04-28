@@ -4634,7 +4634,6 @@ class DeepSeekWebBridge:
                 return { ok: true, tag };
             }""",
             {"selectors": list(self.input_selectors), "value": prompt},
-            timeout=1500,
         )
         if not isinstance(result, dict) or not result.get("ok"):
             raise RuntimeError(f"DeepSeek input injection failed: {result}")
