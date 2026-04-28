@@ -15,6 +15,7 @@ import platform
 import html
 import json
 import base64
+import hashlib
 import shutil
 import shlex
 import uuid
@@ -1382,6 +1383,19 @@ SNAPSHOT_SKIP_DIRS = {
     HISTORY_DIR_NAME,
 }
 SNAPSHOT_MAX_FILE_BYTES = 8 * 1024 * 1024
+INTERNAL_GIT_MAX_STORED_FILE_BYTES = SNAPSHOT_MAX_FILE_BYTES
+
+
+def project_cache_key(root: str) -> str:
+    normalized = os.path.abspath(os.path.expanduser(root or "workspace"))
+    digest = hashlib.sha1(normalized.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
+    base = re.sub(r"[^a-zA-Z0-9_.-]+", "_", os.path.basename(normalized) or "workspace").strip("._-") or "workspace"
+    return f"{base[:48]}-{digest}"
+
+
+def project_cache_dir(root: str) -> str:
+    return os.path.join(AGENT_HOME_DIR, "projects", project_cache_key(root))
+
 
 def snapshot_project(root: str) -> Dict[str, bytes]:
     """记录执行前/后的项目文件快照，用于展示 diff 和撤销本轮修改。"""
@@ -1401,6 +1415,221 @@ def snapshot_project(root: str) -> Dict[str, bytes]:
             except OSError:
                 continue
     return snapshot
+
+
+def should_skip_snapshot_dir(dirname: str) -> bool:
+    return dirname in SNAPSHOT_SKIP_DIRS or dirname.startswith(".Trash")
+
+
+class InternalGitChangeTracker:
+    """Shadow git repo stored in Agent Qt cache, never inside the user's project."""
+
+    def __init__(self, project_root: str):
+        self.project_root = os.path.abspath(os.path.expanduser(project_root))
+        self.repo_root = os.path.join(project_cache_dir(self.project_root), "internal-git")
+        self.git = shutil.which("git") or ""
+        self.available = bool(self.git)
+
+    def _run(
+        self,
+        args: List[str],
+        *,
+        check: bool = True,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        if not self.available:
+            raise RuntimeError("git executable not found")
+        return subprocess.run(
+            [self.git, *args],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=text,
+            check=check,
+        )
+
+    def ensure_repo(self) -> bool:
+        if not self.available or not os.path.isdir(self.project_root):
+            return False
+        os.makedirs(self.repo_root, exist_ok=True)
+        if not os.path.isdir(os.path.join(self.repo_root, ".git")):
+            subprocess.run([self.git, "init", "-q"], cwd=self.repo_root, capture_output=True, text=True, check=False)
+        for key, value in (
+            ("user.name", "Agent Qt Internal Git"),
+            ("user.email", "agent-qt-internal@example.invalid"),
+            ("core.autocrlf", "false"),
+            ("core.quotepath", "false"),
+        ):
+            self._run(["config", key, value], check=False)
+        return os.path.isdir(os.path.join(self.repo_root, ".git"))
+
+    def _project_files(self) -> Dict[str, str]:
+        files: Dict[str, str] = {}
+        shadow_root = os.path.abspath(self.repo_root)
+        for dirpath, dirnames, filenames in os.walk(self.project_root):
+            abs_dirpath = os.path.abspath(dirpath)
+            if abs_dirpath == shadow_root or abs_dirpath.startswith(shadow_root + os.sep):
+                dirnames[:] = []
+                continue
+            dirnames[:] = [dirname for dirname in dirnames if not should_skip_snapshot_dir(dirname)]
+            for filename in filenames:
+                source = os.path.join(dirpath, filename)
+                if not os.path.isfile(source):
+                    continue
+                rel = os.path.relpath(source, self.project_root).replace(os.sep, "/")
+                files[rel] = source
+        return files
+
+    def sync_from_project(self) -> bool:
+        if not self.ensure_repo():
+            return False
+        files = self._project_files()
+        seen = set(files)
+        for rel, source in files.items():
+            target = os.path.join(self.repo_root, *rel.split("/"))
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copy2(source, target)
+            except OSError:
+                continue
+
+        for dirpath, dirnames, filenames in os.walk(self.repo_root, topdown=True):
+            if ".git" in dirnames:
+                dirnames.remove(".git")
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                rel = os.path.relpath(path, self.repo_root).replace(os.sep, "/")
+                if rel not in seen:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+        for dirpath, dirnames, filenames in os.walk(self.repo_root, topdown=False):
+            if os.path.abspath(dirpath) == os.path.abspath(self.repo_root):
+                continue
+            if ".git" in os.path.relpath(dirpath, self.repo_root).split(os.sep):
+                continue
+            for dirname in dirnames:
+                path = os.path.join(dirpath, dirname)
+                if os.path.basename(path) == ".git":
+                    continue
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+        return True
+
+    def commit_snapshot(self, label: str) -> str:
+        if not self.sync_from_project():
+            return ""
+        self._run(["add", "-A"], check=False)
+        message = f"Agent Qt internal {label} {datetime.now().isoformat(timespec='seconds')}"
+        self._run(["commit", "--allow-empty", "-q", "-m", message], check=False)
+        result = self._run(["rev-parse", "HEAD"], check=True, text=True)
+        return result.stdout.strip()
+
+    def prepare_before(self) -> str:
+        return self.commit_snapshot("before")
+
+    def capture_changes(self, before_commit: str) -> List[Dict[str, object]]:
+        after_commit = self.commit_snapshot("after")
+        if not before_commit or not after_commit:
+            return []
+        return self.build_change_records(before_commit, after_commit)
+
+    def _decode_git_path(self, value: bytes) -> str:
+        return value.decode("utf-8", errors="surrogateescape")
+
+    def _blob_bytes(self, commit: str, path: str) -> tuple[Optional[bytes], bool]:
+        spec = f"{commit}:{path}"
+        size_result = self._run(["cat-file", "-s", spec], check=False, text=True)
+        if size_result.returncode != 0:
+            return None, True
+        try:
+            size = int((size_result.stdout or "0").strip())
+        except ValueError:
+            size = INTERNAL_GIT_MAX_STORED_FILE_BYTES + 1
+        if size > INTERNAL_GIT_MAX_STORED_FILE_BYTES:
+            return None, False
+        blob = self._run(["show", "--no-ext-diff", spec], check=False, text=False)
+        if blob.returncode != 0:
+            return None, True
+        return blob.stdout, True
+
+    def _diff_text(self, before_commit: str, after_commit: str, path: str) -> str:
+        result = self._run(
+            ["diff", "--no-ext-diff", "--no-renames", "--unified=3", before_commit, after_commit, "--", path],
+            check=False,
+            text=True,
+        )
+        return (result.stdout or "").strip() or "(metadata changed)"
+
+    def _numstat(self, before_commit: str, after_commit: str, path: str) -> tuple[int, int]:
+        result = self._run(
+            ["diff", "--numstat", "--no-renames", before_commit, after_commit, "--", path],
+            check=False,
+            text=True,
+        )
+        line = (result.stdout or "").splitlines()[0] if result.stdout else ""
+        parts = line.split("\t")
+        if len(parts) < 2:
+            return 0, 0
+        try:
+            additions = int(parts[0])
+        except ValueError:
+            additions = 0
+        try:
+            deletions = int(parts[1])
+        except ValueError:
+            deletions = 0
+        return additions, deletions
+
+    def build_change_records(self, before_commit: str, after_commit: str) -> List[Dict[str, object]]:
+        result = self._run(
+            ["diff", "--name-status", "--no-renames", "-z", before_commit, after_commit, "--"],
+            check=False,
+            text=False,
+        )
+        parts = [part for part in (result.stdout or b"").split(b"\0") if part]
+        records: List[Dict[str, object]] = []
+        index = 0
+        while index + 1 < len(parts):
+            raw_status = self._decode_git_path(parts[index])
+            path = self._decode_git_path(parts[index + 1])
+            index += 2
+            status_code = (raw_status or "M")[0]
+            status = {"A": "added", "D": "deleted"}.get(status_code, "modified")
+            before = None
+            after = None
+            before_ok = True
+            after_ok = True
+            if status_code != "A":
+                before, before_ok = self._blob_bytes(before_commit, path)
+            if status_code != "D":
+                after, after_ok = self._blob_bytes(after_commit, path)
+            diff = self._diff_text(before_commit, after_commit, path)
+            additions, deletions = self._numstat(before_commit, after_commit, path)
+            if additions == 0 and deletions == 0:
+                additions = sum(1 for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++"))
+                deletions = sum(1 for line in diff.splitlines() if line.startswith("-") and not line.startswith("---"))
+            undoable = before_ok and after_ok
+            records.append(
+                {
+                    "path": path,
+                    "status": status,
+                    "before": before,
+                    "after": after,
+                    "additions": additions,
+                    "deletions": deletions,
+                    "diff": diff,
+                    "diff_rows": parse_unified_diff_lines(diff),
+                    "internal_git": True,
+                    "before_commit": before_commit,
+                    "after_commit": after_commit,
+                    "undoable": undoable,
+                }
+            )
+        return records
 
 def decode_text(data: Optional[bytes]) -> Optional[str]:
     if data is None:
@@ -1510,6 +1739,81 @@ def format_change_summary(records: List[Dict[str, object]], include_diff: bool =
             lines.append(f"\n--- {record['path']} ---")
             lines.append(str(record["diff"]))
     return "\n".join(lines)
+
+
+LOW_VALUE_CONTEXT_START = "<<<AGENT_QT_LOW_VALUE_CONTEXT_START"
+LOW_VALUE_CONTEXT_END = "<<<AGENT_QT_LOW_VALUE_CONTEXT_END>>>"
+LOW_VALUE_CONTEXT_BLOCK_RE = re.compile(
+    rf"{re.escape(LOW_VALUE_CONTEXT_START)}[^\n]*\n.*?\n{re.escape(LOW_VALUE_CONTEXT_END)}",
+    re.S,
+)
+
+
+def low_value_context_block(kind: str, content: str) -> str:
+    return f"{LOW_VALUE_CONTEXT_START} kind={kind}>>>\n{str(content or '').strip()}\n{LOW_VALUE_CONTEXT_END}"
+
+
+def strip_low_value_context_blocks(text: str) -> str:
+    return LOW_VALUE_CONTEXT_BLOCK_RE.sub("[低密度工具输出已省略；如需细节请读取具体文件或重新运行命令]", str(text or ""))
+
+
+def diff_hunk_headers(diff_text: str, limit: int = 24) -> List[str]:
+    headers = []
+    for line in str(diff_text or "").splitlines():
+        if line.startswith("@@"):
+            headers.append(line)
+            if len(headers) >= limit:
+                break
+    return headers
+
+
+def format_change_context_summary(records: List[Dict[str, object]]) -> str:
+    if not records:
+        return "Git diff file names:\n未检测到文件改动。"
+    additions = sum(int(r.get("additions", 0)) for r in records)
+    deletions = sum(int(r.get("deletions", 0)) for r in records)
+    lines = [
+        "Git diff file names:",
+        f"{len(records)} files changed  +{additions}  -{deletions}",
+    ]
+    for record in records:
+        status = str(record.get("status", "modified"))
+        marker = {"added": "A", "deleted": "D"}.get(status, "M")
+        lines.append(f"{marker} {record.get('path', '')}  +{record.get('additions', 0)}  -{record.get('deletions', 0)}")
+    lines.append("")
+    lines.append("Git diff hunks:")
+    for record in records:
+        headers = diff_hunk_headers(str(record.get("diff", "")))
+        if headers:
+            lines.append(str(record.get("path", "")))
+            lines.extend(f"  {header}" for header in headers)
+        else:
+            lines.append(f"{record.get('path', '')}  (binary/metadata or full-file change)")
+    lines.append("")
+    lines.append("未附完整 diff。若下一步需要具体内容，请用 git diff/读取文件命令按文件名查询。")
+    return "\n".join(lines)
+
+
+def build_execution_context_content(full_log: str, records: List[Dict[str, object]], long_running_launches: int = 0) -> str:
+    parts = [
+        "【执行日志（低密度，自动压缩优先）】",
+        low_value_context_block("execution_log", truncate_middle(str(full_log or "").strip(), 6000)),
+    ]
+    if records:
+        parts.extend([
+            "",
+            "【文件变更摘要（高密度，优先保留）】",
+            format_change_context_summary(records),
+        ])
+    elif long_running_launches:
+        parts.extend([
+            "",
+            "Git diff file names:",
+            "未检测到文件改动。若命令正在底部终端继续运行，保存/生成文件后需要等待进程结束或再执行一次检查。",
+        ])
+    else:
+        parts.extend(["", "Git diff file names:", "未检测到文件改动。"])
+    return "\n".join(parts)
 
 
 AUTOMATION_LOOP_MAX_ROUNDS = env_int("AGENT_QT_AUTOMATION_MAX_ROUNDS", 20, minimum=1)
@@ -1754,6 +2058,9 @@ def apply_change_records(root: str, records: List[Dict[str, object]], target_key
     conflicts = []
     for record in records:
         rel = str(record["path"])
+        if record.get("undoable") is False:
+            conflicts.append(rel)
+            continue
         path = os.path.join(root, rel)
         expected = record.get(expected_key)
         try:
@@ -2005,6 +2312,11 @@ def serialize_change_record(record: Dict[str, object]) -> Dict[str, object]:
         "status": record.get("status", "modified"),
         "before": bytes_to_store(record.get("before") if isinstance(record.get("before"), bytes) else None),
         "after": bytes_to_store(record.get("after") if isinstance(record.get("after"), bytes) else None),
+        "additions": int(record.get("additions", 0) or 0),
+        "deletions": int(record.get("deletions", 0) or 0),
+        "diff": str(record.get("diff", "")),
+        "internal_git": bool(record.get("internal_git", False)),
+        "undoable": bool(record.get("undoable", True)),
         "undone": bool(record.get("undone", False)),
     }
 
@@ -2015,6 +2327,18 @@ def deserialize_change_record(record: Dict[str, object]) -> Optional[Dict[str, o
     before = bytes_from_store(record.get("before"))
     after = bytes_from_store(record.get("after"))
     rebuilt = build_file_diff(path, before, after)
+    rebuilt["status"] = str(record.get("status", rebuilt.get("status", "modified")) or "modified")
+    diff = str(record.get("diff", ""))
+    if diff:
+        rebuilt["diff"] = diff
+        rebuilt["diff_rows"] = parse_unified_diff_lines(diff)
+    for key in ("additions", "deletions"):
+        try:
+            rebuilt[key] = int(record.get(key, rebuilt.get(key, 0)) or 0)
+        except (TypeError, ValueError):
+            pass
+    rebuilt["internal_git"] = bool(record.get("internal_git", False))
+    rebuilt["undoable"] = bool(record.get("undoable", True))
     rebuilt["undone"] = bool(record.get("undone", False))
     return rebuilt
 
@@ -4006,6 +4330,9 @@ class ChatBubble(QFrame):
         viewer = QTextBrowser()
         viewer.setOpenExternalLinks(False)
         viewer.setReadOnly(True)
+        # TODO: QTextBrowser.setMarkdown does not render GitHub-style pipe tables.
+        # Add a lightweight table-to-HTML pass for automation summaries like
+        # "| 文件 | 大小 | 说明 |" so AI output cards preserve tabular structure.
         viewer.setMarkdown(text)
         viewer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -5183,6 +5510,8 @@ class ChatPage(QWidget):
         self.threads: List[Dict[str, object]] = [default_thread()]
         self.cmd_outputs = []
         self.pending_snapshot: Dict[str, bytes] = {}
+        self.change_tracker: Optional[InternalGitChangeTracker] = None
+        self.pending_internal_git_commit = ""
         self.pending_long_running_launches = 0
         self.history_entries: List[Dict[str, object]] = []
         self.result_bubble: Optional[ChatBubble] = None
@@ -5296,7 +5625,7 @@ class ChatPage(QWidget):
         path_bar.addWidget(self.path_label)
         path_bar.addStretch()
 
-        self.copy_prompt_btn = QPushButton("复制系统提示词", clicked=self.append_prompt_bubble_from_toolbar, cursor=Qt.PointingHandCursor)
+        self.copy_prompt_btn = QPushButton("复制系统提示词", clicked=self.on_primary_action_button, cursor=Qt.PointingHandCursor)
         self.copy_prompt_btn.setFixedHeight(36)
         self.copy_prompt_btn.setFixedWidth(136)
         self.copy_prompt_btn.setStyleSheet(f"""
@@ -5511,6 +5840,7 @@ class ChatPage(QWidget):
         self.terminal_panel.close_all_processes()
         self.terminal_panel.collapse()
         self.project_root = path
+        self.change_tracker = InternalGitChangeTracker(path)
         self.threads = load_workspace_threads(path)
         save_workspace_threads(path, self.threads)
         self.thread_id = load_last_thread_id(path, self.threads)
@@ -5605,9 +5935,9 @@ class ChatPage(QWidget):
         narrow = width < 1180
         very_narrow = width < 980
         self.path_label.setMaximumWidth(180 if very_narrow else (260 if narrow else 420))
-        self.copy_prompt_btn.setText("复制提示词" if very_narrow else "复制系统提示词")
+        self.copy_prompt_btn.setText("分享" if self.automation_enabled else ("复制提示词" if very_narrow else "复制系统提示词"))
         self.top_clear_history_btn.setText("清空" if narrow else "清空记录")
-        self.copy_prompt_btn.setFixedWidth(104 if very_narrow else (118 if narrow else 136))
+        self.copy_prompt_btn.setFixedWidth(78 if self.automation_enabled else (104 if very_narrow else (118 if narrow else 136)))
         self.top_clear_history_btn.setFixedWidth(58 if very_narrow else (68 if narrow else 86))
     
     def toggle_sidebar(self):
@@ -5799,6 +6129,7 @@ class ChatPage(QWidget):
     def set_python_runtime_enabled(self, enabled: bool):
         set_agent_runtime_enabled(enabled)
         self.refresh_prompt_bubble_buttons()
+        self.update_prompt_tools_responsive()
 
     def set_automation_enabled(self, enabled: bool, toggle_row: Optional[SettingsToggleRow] = None):
         if not enabled:
@@ -5810,6 +6141,7 @@ class ChatPage(QWidget):
             self.stop_automation_preview(remove_bubble=True)
             self.hide_automation_composer()
             self.load_history()
+            self.update_prompt_tools_responsive()
             return
         if toggle_row is not None:
             toggle_row.setChecked(True)
@@ -5817,6 +6149,7 @@ class ChatPage(QWidget):
         set_automation_enabled_setting(True)
         self.stop_automation_preview(remove_bubble=True)
         self.load_history()
+        self.update_prompt_tools_responsive()
         self.run_automation_setup("start")
 
     def show_automation_status(self):
@@ -5849,6 +6182,97 @@ class ChatPage(QWidget):
         QApplication.clipboard().setText(text)
         self.add_status_bubble(f"已复制 Python 路径：{text}")
 
+    def reset_primary_button_text(self):
+        self.update_prompt_tools_responsive()
+
+    def export_dir(self) -> str:
+        path = os.path.join(project_cache_dir(self.project_root or os.path.expanduser("~")), "exports")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def conversation_export_text(self, fmt: str = "md") -> str:
+        lines: List[str] = []
+        if fmt == "md":
+            lines.append("# Agent Qt 会话导出")
+            lines.append("")
+            lines.append(f"- 工作区: `{self.project_root}`")
+            lines.append(f"- 会话: `{self.thread_id}`")
+            lines.append(f"- 导出时间: {datetime.now().isoformat(timespec='seconds')}")
+            lines.append("")
+        else:
+            lines.append("Agent Qt 会话导出")
+            lines.append(f"工作区: {self.project_root}")
+            lines.append(f"会话: {self.thread_id}")
+            lines.append(f"导出时间: {datetime.now().isoformat(timespec='seconds')}")
+            lines.append("")
+
+        for entry in self.history_entries:
+            entry_type = str(entry.get("type") or "")
+            content = str(entry.get("content") or "").strip()
+            if not content:
+                continue
+            if entry_type == "prompt":
+                title = "用户需求"
+                content = self.prompt_bubble_display_text(content).strip() or self.prompt_text_from_system_prompt(content).strip()
+            elif entry_type == "ai":
+                title = "AI 输出"
+            elif entry_type == "result":
+                title = "执行结果"
+            else:
+                title = entry_type or "记录"
+            if fmt == "md":
+                lines.append(f"## {title}")
+                lines.append("")
+                lines.append(content)
+                lines.append("")
+            else:
+                lines.append(f"===== {title} =====")
+                lines.append(content)
+                lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def export_conversation_text(self, fmt: str):
+        ext = "md" if fmt == "md" else "txt"
+        path = os.path.join(self.export_dir(), f"agent-qt-{self.thread_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.{ext}")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.conversation_export_text(fmt))
+        except OSError as exc:
+            styled_warning(self, "导出失败", str(exc))
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
+        self.add_status_bubble(f"已导出：{path}")
+
+    def export_conversation_screenshot(self):
+        self.chat_column.adjustSize()
+        size = self.chat_column.sizeHint()
+        width = max(self.chat_column.width(), size.width(), 640)
+        height = max(self.chat_column.height(), size.height(), 240)
+        pixmap = QPixmap(width, height)
+        pixmap.fill(QColor(COLORS["surface"]))
+        painter = QPainter(pixmap)
+        self.chat_column.render(painter)
+        painter.end()
+        path = os.path.join(self.export_dir(), f"agent-qt-{self.thread_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png")
+        if not pixmap.save(path, "PNG"):
+            styled_warning(self, "导出失败", "长截图保存失败。")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
+        self.add_status_bubble(f"已导出长截图：{path}")
+
+    def show_share_menu(self):
+        menu = QMenu(self)
+        md_action = QAction("分享为 Markdown (.md)", self)
+        md_action.triggered.connect(lambda: self.export_conversation_text("md"))
+        menu.addAction(md_action)
+        txt_action = QAction("分享为 TXT (.txt)", self)
+        txt_action.triggered.connect(lambda: self.export_conversation_text("txt"))
+        menu.addAction(txt_action)
+        screenshot_action = QAction("分享为长截图 (.png)", self)
+        screenshot_action.triggered.connect(self.export_conversation_screenshot)
+        menu.addAction(screenshot_action)
+        menu.exec(self.copy_prompt_btn.mapToGlobal(self.copy_prompt_btn.rect().bottomLeft()))
+
     def run_python_runtime_setup(self, action: str):
         if action == "install":
             self.run_python_runtime_install_terminal()
@@ -5864,7 +6288,7 @@ class ChatPage(QWidget):
 
         def on_finished(ok: bool, message: str):
             self.python_runtime_setup_worker = None
-            self.copy_prompt_btn.setText("复制系统提示词")
+            self.update_prompt_tools_responsive()
             if ok:
                 self.add_status_bubble(message)
             else:
@@ -5889,7 +6313,7 @@ class ChatPage(QWidget):
             self.copy_prompt_btn.setText("Python安装中")
 
     def on_python_runtime_install_terminal_finished(self, exit_code: int):
-        self.copy_prompt_btn.setText("复制系统提示词")
+        self.update_prompt_tools_responsive()
         if exit_code == 0:
             python_bin = ensure_agent_runtime(create=False)
             if python_bin:
@@ -5910,7 +6334,7 @@ class ChatPage(QWidget):
 
         def on_finished(ok: bool, message: str):
             self.automation_setup_worker = None
-            self.copy_prompt_btn.setText("复制系统提示词")
+            self.update_prompt_tools_responsive()
             if ok:
                 if action == "start":
                     self.automation_enabled = True
@@ -5943,7 +6367,7 @@ class ChatPage(QWidget):
         proc = self.terminal_panel.add_process(cmd, cwd, "插件依赖安装", interactive=False)
         if proc is not None:
             if proc.process is not None:
-                proc.process.finished.connect(lambda _code, _status: self.copy_prompt_btn.setText("复制系统提示词"))
+                proc.process.finished.connect(lambda _code, _status: self.update_prompt_tools_responsive())
             self.terminal_panel.expand()
             self.update_status_bar()
             self.copy_prompt_btn.setText("插件安装中")
@@ -6335,7 +6759,7 @@ class ChatPage(QWidget):
 
     def automation_history_text_for_entry(self, entry: Dict[str, object]) -> str:
         entry_type = str(entry.get("type") or "")
-        content = str(entry.get("content") or "").strip()
+        content = str(entry.get("context_content") or entry.get("content") or "").strip()
         if not content:
             return ""
         if entry_type == "prompt":
@@ -6348,7 +6772,8 @@ class ChatPage(QWidget):
         if entry_type == "ai":
             return "【AI 回复】\n" + self.compact_automation_entry_text(content)
         if entry_type == "result":
-            return "【本地执行结果和文件变更】\n" + self.compact_automation_entry_text(content)
+            high_signal = strip_low_value_context_blocks(content)
+            return "【本地执行结果和文件变更】\n" + self.compact_automation_entry_text(high_signal)
         return ""
 
     def automation_history_chunks(self, skip_entry_id: str = "") -> List[str]:
@@ -6439,9 +6864,15 @@ class ChatPage(QWidget):
             return
         full_prompt = self.build_system_prompt("")
         self.copy_prompt_btn.setText("已添加")
-        QTimer.singleShot(1200, lambda: self.copy_prompt_btn.setText("复制系统提示词"))
+        QTimer.singleShot(1200, self.reset_primary_button_text)
         self.add_prompt_bubble(full_prompt, save=True, animate=True)
         self.scroll_to_bottom()
+
+    def on_primary_action_button(self):
+        if self.automation_enabled:
+            self.show_share_menu()
+            return
+        self.append_prompt_bubble_from_toolbar()
 
     def copy_prompt_bubble(self, bubble: ChatBubble):
         prompt_input = getattr(bubble, "prompt_input", None)
@@ -6547,7 +6978,7 @@ class ChatPage(QWidget):
         full_prompt = self.build_system_prompt("")
         QApplication.clipboard().setText(self.display_prompt_text(full_prompt))
         self.copy_prompt_btn.setText("已复制")
-        QTimer.singleShot(1200, lambda: self.copy_prompt_btn.setText("复制系统提示词"))
+        QTimer.singleShot(1200, self.reset_primary_button_text)
         self.add_prompt_bubble(full_prompt, save=True, animate=True)
         self.scroll_to_bottom()
 
@@ -7037,7 +7468,15 @@ class ChatPage(QWidget):
         self.add_chat_widget(self.result_bubble, animate=True)
         
         self.cmd_outputs = []
-        self.pending_snapshot = snapshot_project(self.project_root)
+        self.pending_snapshot = {}
+        self.pending_internal_git_commit = ""
+        if self.change_tracker is not None:
+            try:
+                self.pending_internal_git_commit = self.change_tracker.prepare_before()
+            except Exception:
+                self.pending_internal_git_commit = ""
+        if not self.pending_internal_git_commit:
+            self.pending_snapshot = snapshot_project(self.project_root)
         self.pending_long_running_launches = 0
         
         self.worker = ExecuteWorker(commands, self.project_root)
@@ -7063,9 +7502,17 @@ class ChatPage(QWidget):
         self.worker = None
         if worker is not None:
             worker.deleteLater()
-        after_snapshot = snapshot_project(self.project_root)
-        change_records = build_change_records(self.pending_snapshot, after_snapshot)
+        change_records: List[Dict[str, object]] = []
+        if self.change_tracker is not None and self.pending_internal_git_commit:
+            try:
+                change_records = self.change_tracker.capture_changes(self.pending_internal_git_commit)
+            except Exception:
+                change_records = []
+        if not change_records and self.pending_snapshot:
+            after_snapshot = snapshot_project(self.project_root)
+            change_records = build_change_records(self.pending_snapshot, after_snapshot)
         self.pending_snapshot = {}
+        self.pending_internal_git_commit = ""
         long_running_launches = self.pending_long_running_launches
         self.pending_long_running_launches = 0
         log_with_changes = full_log
@@ -7073,6 +7520,7 @@ class ChatPage(QWidget):
             log_with_changes += format_change_summary(change_records, include_diff=True)
         elif long_running_launches:
             log_with_changes += "\n\nFiles changed:\n未检测到文件改动。若命令正在底部终端继续运行，保存/生成文件后需要等待进程结束或再执行一次检查。"
+        context_content = build_execution_context_content(full_log, change_records, long_running_launches)
         self.result_bubble.update_content(log_with_changes)
         if change_records:
             change_card = ChangeSummaryCard(change_records, parent=self.chat_container)
@@ -7082,6 +7530,7 @@ class ChatPage(QWidget):
         result_entry = {
             "type": "result",
             "content": log_with_changes,
+            "context_content": context_content,
             "changes": [serialize_change_record(record) for record in change_records],
             "undone": False,
         }
@@ -7093,7 +7542,7 @@ class ChatPage(QWidget):
         self.update_status_bar()
         self.update_automation_composer_state()
         if self.automation_enabled and self.automation_loop_active:
-            self.request_next_automation_step(log_with_changes, skip_entry_id=str(result_entry.get("id") or ""))
+            self.request_next_automation_step(context_content, skip_entry_id=str(result_entry.get("id") or ""))
         elif self.automation_enabled:
             self.show_automation_composer(focus=False)
         else:
