@@ -6776,11 +6776,9 @@ class ChatPage(QWidget):
 
     def add_status_bubble(self, text: str):
         self.hide_empty_state()
-        bubble = ChatBubble(
-            "system",
+        bubble = ExecutionLogPanel(
             text,
             parent=self.chat_container,
-            scrollable=False,
             max_content_height=120,
         )
         self.add_chat_widget(bubble, animate=True)
@@ -7775,10 +7773,7 @@ class ChatPage(QWidget):
         
         if not commands:
             if self.automation_loop_active:
-                self.stop_automation_loop(
-                    f"AI 没有返回可执行命令，也没有返回完成标识 `{AUTOMATION_DONE_MARKER}`，自动化循环已暂停。",
-                    ensure_manual_entry=True,
-                )
+                self.stop_automation_loop("", ensure_manual_entry=True)
                 self.scroll_to_bottom()
                 return
             warning_bubble = ChatBubble(
