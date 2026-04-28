@@ -28,6 +28,7 @@ from playwright.sync_api import Request, WebSocket, sync_playwright
 logger = logging.getLogger(__name__)
 INVALID_PAYLOAD_DEBUG_PATH = Path("/tmp/deepseek_web_last_invalid_payload.txt")
 SALVAGED_PAYLOAD_DEBUG_PATH = Path("/tmp/deepseek_web_last_salvaged_payload.txt")
+PAGINATION_NEXT_PROBE_ATTR = "data-deerflow-page-next-probe-id"
 COPY_CAPTURE_INIT_SCRIPT = """
 () => {
   const install = () => {
@@ -251,6 +252,7 @@ DEFAULT_RESPONSE_TIMEOUT_MS = _env_int("DEEPSEEK_WEB_RESPONSE_TIMEOUT_MS", 600_0
 DEFAULT_MAX_CONTINUE_CLICKS = _env_int("DEEPSEEK_WEB_MAX_CONTINUE_CLICKS", 12, minimum=0, maximum=50)
 DEFAULT_COPY_PROBE_MAX_MS = _env_int("DEEPSEEK_WEB_COPY_PROBE_MAX_MS", 500, minimum=0, maximum=10_000)
 DEFAULT_COPY_CANDIDATE_MAX_DISTANCE = _env_int("DEEPSEEK_WEB_COPY_CANDIDATE_MAX_DISTANCE", 900, minimum=0)
+DEFAULT_MAX_RESPONSE_PAGE_CLICKS = _env_int("DEEPSEEK_WEB_MAX_RESPONSE_PAGE_CLICKS", 30, minimum=0, maximum=100)
 COPY_TOOLTIP_WAIT_MS = _env_int("DEEPSEEK_WEB_COPY_TOOLTIP_WAIT_MS", 140, minimum=0, maximum=5_000)
 COPY_FALLBACK_CLICK_DISTANCE = _env_int("DEEPSEEK_WEB_COPY_FALLBACK_CLICK_DISTANCE", 80, minimum=0, maximum=2_000)
 LOG_TIMING = os.environ.get("DEEPSEEK_WEB_LOG_TIMING", "1").strip().lower() not in {
@@ -275,6 +277,7 @@ PLAIN_BASH_FORMAT_PROMPT = (
     "【非常重要：这是 plain bash agent 模式，不要使用 JSON 工具协议】\n"
     "你正在配合一个外部 runner。runner 会执行你返回的单个 fenced bash 代码块，并把输出发回给你。\n"
     "需要操作文件、运行测试、读取目录时，只返回一个 ```bash 代码块。不要返回 JSON、结构化工具调用字段、XML 或解释性前后缀。\n"
+    "如果你预估本轮最终回复会超过约 2 万字，不要一次性输出全部内容；先交付可执行的当前批次，剩余内容在末尾用 ```plaintext 的 TODO 简短列出，等待下一轮继续。\n"
     "任务完成时，先用 bash 验证产物和测试，再输出 FINAL: 加简短总结。\n"
 )
 
@@ -863,6 +866,62 @@ def clean_plain_visible_assistant_text(text: str) -> str:
     result = "\n".join(cleaned)
     result = re.sub(r"\n{4,}", "\n\n\n", result).strip()
     return strip_deepseek_empty_text_tail(result)
+
+
+def merge_deepseek_response_pages(parts: list[str]) -> str:
+    """Merge visible DeepSeek answer pages without duplicating overlap."""
+    merged = ""
+    for raw_part in parts:
+        part = clean_plain_visible_assistant_text(raw_part)
+        if not part:
+            continue
+        if not merged:
+            merged = part
+            continue
+        if part in merged:
+            continue
+        if merged in part:
+            merged = part
+            continue
+
+        max_overlap = min(len(merged), len(part), 2000)
+        overlap = 0
+        for size in range(max_overlap, 39, -1):
+            if merged.endswith(part[:size]):
+                overlap = size
+                break
+        if overlap:
+            merged = (merged + part[overlap:]).strip()
+        else:
+            merged = (merged.rstrip() + "\n\n" + part.lstrip()).strip()
+    return merged
+
+
+def choose_deepseek_response_page_text(previous_parts: list[str], latest_text: str) -> str:
+    """Prefer DeepSeek's latest response version, merging only clear continuation chunks."""
+    latest = clean_plain_visible_assistant_text(latest_text)
+    if not previous_parts:
+        return latest
+
+    previous = merge_deepseek_response_pages(previous_parts)
+    if not latest:
+        return previous
+    if not previous:
+        return latest
+    if previous in latest:
+        return latest
+    if latest in previous:
+        return previous
+
+    max_overlap = min(len(previous), len(latest), 2000)
+    for size in range(max_overlap, 79, -1):
+        if previous.endswith(latest[:size]):
+            return (previous + latest[size:]).strip()
+
+    # DeepSeek uses "1 / 2" style controls for alternate response versions.
+    # When there is no textual overlap, the latest page is usually the intended
+    # completed version rather than a continuation chunk.
+    return latest
 
 
 def has_unclosed_markdown_fence(text: str) -> bool:
@@ -1818,6 +1877,7 @@ class DeepSeekWebBridge:
         copy_probe_max_ms: int = DEFAULT_COPY_PROBE_MAX_MS,
         copy_candidate_max_distance: int = DEFAULT_COPY_CANDIDATE_MAX_DISTANCE,
         max_continue_clicks: int = DEFAULT_MAX_CONTINUE_CLICKS,
+        max_response_page_clicks: int = DEFAULT_MAX_RESPONSE_PAGE_CLICKS,
         fast_new_chat: bool = False,
     ) -> None:
         self.url = url
@@ -1845,6 +1905,7 @@ class DeepSeekWebBridge:
         self.copy_probe_max_ms = max(0, int(copy_probe_max_ms))
         self.copy_candidate_max_distance = max(0, int(copy_candidate_max_distance))
         self.max_continue_clicks = max(0, int(max_continue_clicks))
+        self.max_response_page_clicks = max(0, int(max_response_page_clicks))
         self.fast_new_chat = fast_new_chat
 
         self._playwright = None
@@ -3979,6 +4040,290 @@ class DeepSeekWebBridge:
             return ""
         return text.strip() if isinstance(text, str) else ""
 
+    def inspect_assistant_pagination(self, target: Locator) -> dict[str, Any] | None:
+        try:
+            result = target.evaluate(
+                """(el, probeAttr) => {
+                    const buttonSelector = 'button,[role="button"],div[role="button"]';
+                    for (const node of document.querySelectorAll(`[${probeAttr}]`)) {
+                        node.removeAttribute(probeAttr);
+                    }
+
+                    const isVisible = (node) => {
+                        if (!(node instanceof HTMLElement)) {
+                            return false;
+                        }
+                        const style = window.getComputedStyle(node);
+                        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') {
+                            return false;
+                        }
+                        const rect = node.getBoundingClientRect();
+                        return !!rect.width && !!rect.height;
+                    };
+
+                    const target = el instanceof HTMLElement ? el : null;
+                    if (!target) {
+                        return null;
+                    }
+
+                    const targetRect = target.getBoundingClientRect();
+                    const parsePageLabel = (text) => {
+                        const match = String(text || '').trim().match(/^(\\d+)\\s*\\/\\s*(\\d+)$/);
+                        if (!match) {
+                            return null;
+                        }
+                        const current = Number(match[1]);
+                        const total = Number(match[2]);
+                        if (!Number.isFinite(current) || !Number.isFinite(total) || current < 1 || total < 2 || current > total) {
+                            return null;
+                        }
+                        return { current, total, text: `${current} / ${total}` };
+                    };
+                    const labelFor = (node) => [
+                        node.getAttribute('aria-label') || '',
+                        node.getAttribute('title') || '',
+                        node.innerText || '',
+                        node.textContent || '',
+                    ].join(' ').trim();
+                    const isDisabled = (button) => {
+                        const ariaDisabled = String(button.getAttribute('aria-disabled') || '').toLowerCase();
+                        return Boolean(button.disabled)
+                            || ariaDisabled === 'true'
+                            || button.getAttribute('disabled') !== null
+                            || String(button.className || '').toLowerCase().includes('disabled');
+                    };
+                    const buttonDirectionScore = (button, pageNode) => {
+                        const label = labelFor(button).toLowerCase();
+                        let score = 0;
+                        if (/(copy|复制|clipboard|thumb|like|dislike|regenerate|重新生成|download|下载)/i.test(label)) {
+                            score -= 140;
+                        }
+                        if (/(下一页|下一个|next|newer|forward|右|right)/i.test(label)) {
+                            score += 200;
+                        }
+                        if (/(上一页|上一个|prev|previous|back|左|left)/i.test(label)) {
+                            score -= 200;
+                        }
+                        const raw = labelFor(button);
+                        if (/[>›»→]/.test(raw)) {
+                            score += 150;
+                        }
+                        if (/[<‹«←]/.test(raw)) {
+                            score -= 150;
+                        }
+                        const svgText = [...button.querySelectorAll('svg,path')]
+                            .map((node) => [
+                                node.getAttribute('d') || '',
+                                node.getAttribute('class') || '',
+                                node.getAttribute('data-icon') || '',
+                            ].join(' '))
+                            .join(' ')
+                            .toLowerCase();
+                        if (/(right|next|chevron-right|arrow-right)/.test(svgText)) {
+                            score += 120;
+                        }
+                        if (/(left|prev|previous|chevron-left|arrow-left)/.test(svgText)) {
+                            score -= 120;
+                        }
+                        const rect = button.getBoundingClientRect();
+                        const pageRect = pageNode.getBoundingClientRect();
+                        const gapRight = rect.left - pageRect.right;
+                        const gapLeft = pageRect.left - rect.right;
+                        if (gapRight >= -2 && gapRight <= 90) {
+                            score += 130;
+                        } else if (gapRight > 90) {
+                            score += 20;
+                        } else if (gapLeft >= -2 && gapLeft <= 90) {
+                            score -= 130;
+                        } else if (gapLeft > 90) {
+                            score -= 20;
+                        }
+                        return score;
+                    };
+
+                    let parent = target;
+                    const bars = [];
+                    for (let depth = 0; depth < 10 && parent; depth += 1) {
+                        for (const child of parent.children) {
+                            if (!(child instanceof HTMLElement)) {
+                                continue;
+                            }
+                            if (child === target || child.contains(target)) {
+                                continue;
+                            }
+                            if (!isVisible(child)) {
+                                continue;
+                            }
+                            const buttons = [...child.querySelectorAll(buttonSelector)].filter(isVisible);
+                            if (buttons.length < 2 || buttons.length > 12) {
+                                continue;
+                            }
+                            const text = (child.innerText || child.textContent || '').trim();
+                            if (!/\\d+\\s*\\/\\s*\\d+/.test(text)) {
+                                continue;
+                            }
+                            const rect = child.getBoundingClientRect();
+                            const distance = Math.abs(rect.top - targetRect.bottom) + Math.abs(rect.left - targetRect.left);
+                            bars.push({ node: child, buttons, distance, depth });
+                        }
+                        parent = parent.parentElement;
+                    }
+
+                    const fallbackNodes = [];
+                    for (const node of document.querySelectorAll('body *')) {
+                        if (!(node instanceof HTMLElement) || !isVisible(node)) {
+                            continue;
+                        }
+                        const text = (node.innerText || node.textContent || '').trim();
+                        if (!/^\\d+\\s*\\/\\s*\\d+$/.test(text)) {
+                            continue;
+                        }
+                        const rect = node.getBoundingClientRect();
+                        const distance = Math.abs(rect.top - targetRect.bottom) + Math.abs(rect.left - targetRect.left);
+                        if (distance > 1200) {
+                            continue;
+                        }
+                        fallbackNodes.push({ node, distance, depth: 99 });
+                    }
+
+                    const candidates = [];
+                    for (const bar of bars) {
+                        const nodes = [bar.node, ...bar.node.querySelectorAll('*')];
+                        for (const node of nodes) {
+                            if (!(node instanceof HTMLElement) || !isVisible(node)) {
+                                continue;
+                            }
+                            const pageInfo = parsePageLabel(node.innerText || node.textContent || '');
+                            if (!pageInfo) {
+                                continue;
+                            }
+                            const pageRect = node.getBoundingClientRect();
+                            const orderedButtons = [...bar.buttons].sort((a, b) => {
+                                const aScore = buttonDirectionScore(a, node);
+                                const bScore = buttonDirectionScore(b, node);
+                                if (aScore !== bScore) {
+                                    return bScore - aScore;
+                                }
+                                const aRect = a.getBoundingClientRect();
+                                const bRect = b.getBoundingClientRect();
+                                return Math.abs(aRect.left - pageRect.right) - Math.abs(bRect.left - pageRect.right);
+                            });
+                            const nextButton = orderedButtons.find((button) => buttonDirectionScore(button, node) >= 100);
+                            candidates.push({
+                                ...pageInfo,
+                                distance: Math.round(bar.distance),
+                                depth: bar.depth,
+                                actionBarText: (bar.node.innerText || bar.node.textContent || '').trim().slice(0, 200),
+                                nextButton: nextButton || null,
+                                nextScore: nextButton ? buttonDirectionScore(nextButton, node) : 0,
+                            });
+                        }
+                    }
+
+                    for (const item of fallbackNodes) {
+                        const pageInfo = parsePageLabel(item.node.innerText || item.node.textContent || '');
+                        if (!pageInfo) {
+                            continue;
+                        }
+                        const pageRect = item.node.getBoundingClientRect();
+                        const buttons = [...document.querySelectorAll(buttonSelector)]
+                            .filter(isVisible)
+                            .filter((button) => {
+                                const rect = button.getBoundingClientRect();
+                                const verticalOverlap = rect.bottom >= pageRect.top - 18 && rect.top <= pageRect.bottom + 18;
+                                const horizontalNear = Math.abs(rect.left - pageRect.right) <= 220 || Math.abs(rect.right - pageRect.left) <= 220;
+                                return verticalOverlap && horizontalNear;
+                            })
+                            .sort((a, b) => buttonDirectionScore(b, item.node) - buttonDirectionScore(a, item.node));
+                        const nextButton = buttons.find((button) => buttonDirectionScore(button, item.node) >= 100);
+                        candidates.push({
+                            ...pageInfo,
+                            distance: Math.round(item.distance),
+                            depth: item.depth,
+                            actionBarText: pageInfo.text,
+                            nextButton: nextButton || null,
+                            nextScore: nextButton ? buttonDirectionScore(nextButton, item.node) : 0,
+                        });
+                    }
+
+                    candidates.sort((a, b) => {
+                        if (a.depth !== b.depth) {
+                            return a.depth - b.depth;
+                        }
+                        if (a.distance !== b.distance) {
+                            return a.distance - b.distance;
+                        }
+                        if (a.total !== b.total) {
+                            return b.total - a.total;
+                        }
+                        return b.current - a.current;
+                    });
+
+                    const best = candidates[0];
+                    if (!best) {
+                        return null;
+                    }
+                    const canAdvance = best.current < best.total
+                        && best.nextButton instanceof HTMLElement
+                        && !isDisabled(best.nextButton);
+                    if (canAdvance) {
+                        best.nextButton.setAttribute(probeAttr, 'next');
+                    }
+                    return {
+                        current: best.current,
+                        total: best.total,
+                        text: best.text,
+                        canAdvance,
+                        nextProbeId: canAdvance ? 'next' : '',
+                        distance: best.distance,
+                        depth: best.depth,
+                        nextScore: best.nextScore,
+                        actionBarText: best.actionBarText,
+                    };
+                }""",
+                PAGINATION_NEXT_PROBE_ATTR,
+            )
+        except Exception:
+            logger.debug("Failed to inspect DeepSeek assistant pagination.", exc_info=True)
+            return None
+        return result if isinstance(result, dict) else None
+
+    def click_next_assistant_page(
+        self,
+        page: Page,
+        target: Locator,
+        *,
+        trace: DeepSeekTrace | None = None,
+    ) -> dict[str, Any] | None:
+        state = self.inspect_assistant_pagination(target)
+        if not isinstance(state, dict) or not state.get("canAdvance"):
+            return state if isinstance(state, dict) else None
+        try:
+            button = page.locator(f'[{PAGINATION_NEXT_PROBE_ATTR}="next"]').first
+            button.click(timeout=1500)
+            page.wait_for_timeout(max(450, min(self.stable_poll_interval_ms, 1200)))
+        except Exception:
+            logger.debug("Failed to click DeepSeek assistant pagination next button.", exc_info=True)
+            return state
+
+        state["clicked"] = True
+        logger.warning(
+            "DeepSeek clicked response pagination current=%s total=%s text=%r distance=%s",
+            state.get("current"),
+            state.get("total"),
+            state.get("text"),
+            state.get("distance"),
+        )
+        if trace is not None:
+            trace.set("response_pagination_current", state.get("current"))
+            trace.set("response_pagination_total", state.get("total"))
+            trace.set(
+                "response_pagination_clicks",
+                int(trace.values.get("response_pagination_clicks") or 0) + 1,
+            )
+            trace.mark("response_pagination_clicked")
+        return state
+
     def inspect_copy_button_candidates(self, target: Locator, *, limit: int = 24) -> list[dict[str, Any]]:
         try:
             result = target.evaluate(
@@ -4320,6 +4665,8 @@ class DeepSeekWebBridge:
             if timed_out():
                 break
 
+            pagination_state = self.inspect_assistant_pagination(target)
+            has_pagination_controls = isinstance(pagination_state, dict) and int(pagination_state.get("total") or 0) > 1
             copy_button_candidates = self.inspect_copy_button_candidates(target, limit=24)
             for candidate in copy_button_candidates:
                 if timed_out():
@@ -4384,6 +4731,7 @@ class DeepSeekWebBridge:
                 no_label_close_fallback = (
                     not label_lower
                     and not lowered
+                    and not has_pagination_controls
                     and COPY_FALLBACK_CLICK_DISTANCE > 0
                     and normalized_distance <= COPY_FALLBACK_CLICK_DISTANCE
                     and str(assistant_candidate.get("text", "")).strip()
@@ -4790,6 +5138,8 @@ class DeepSeekWebBridge:
         continue_clicks = 0
         stable_copy_text = ""
         stable_copy_seen = 0
+        response_page_clicks = 0
+        response_page_parts: list[str] = []
 
         def assistant_has_advanced(current_count: int, current_index: int, current_text: str) -> bool:
             if self.force_new_chat:
@@ -4814,6 +5164,8 @@ class DeepSeekWebBridge:
             nonlocal stable_transport_seen
             nonlocal last_text
             nonlocal last_transport_text
+            nonlocal stable_copy_text
+            nonlocal stable_copy_seen
 
             if self.max_continue_clicks <= 0 or continue_clicks >= self.max_continue_clicks:
                 return False
@@ -4823,6 +5175,8 @@ class DeepSeekWebBridge:
             generation_busy_seen = True
             stable_seen = 0
             stable_transport_seen = 0
+            stable_copy_text = ""
+            stable_copy_seen = 0
             last_text = ""
             last_transport_text = ""
             deadline = max(deadline, time.time() + (self.response_timeout_ms / 1000))
@@ -4835,6 +5189,66 @@ class DeepSeekWebBridge:
                 reason,
                 continue_clicks,
                 self.max_continue_clicks,
+            )
+            return True
+
+        def response_text_for_return(text: str) -> str:
+            if plain_protocol and response_page_parts:
+                return choose_deepseek_response_page_text(response_page_parts, text)
+            return text
+
+        def try_advance_response_page(text: str, reason: str) -> bool:
+            nonlocal response_page_clicks
+            nonlocal deadline
+            nonlocal generation_busy_seen
+            nonlocal stable_seen
+            nonlocal stable_transport_seen
+            nonlocal stable_copy_text
+            nonlocal stable_copy_seen
+            nonlocal last_text
+            nonlocal last_transport_text
+            if self.max_response_page_clicks <= 0 or response_page_clicks >= self.max_response_page_clicks:
+                return False
+            target = self.best_assistant_locator(locator)
+            if target is None:
+                return False
+            state = self.click_next_assistant_page(page, target, trace=trace)
+            if not isinstance(state, dict):
+                return False
+            try:
+                current_page = int(state.get("current") or 0)
+                total_pages = int(state.get("total") or 0)
+            except Exception:
+                current_page = 0
+                total_pages = 0
+            if trace is not None and total_pages > 1:
+                trace.set("response_pagination_detected", f"{current_page}/{total_pages}")
+            if not state.get("clicked"):
+                return False
+            if plain_protocol and text:
+                response_page_parts.append(text)
+                merged_preview = merge_deepseek_response_pages(response_page_parts)
+                if merged_preview:
+                    self.update_response_preview(merged_preview, source=f"page_{current_page}")
+            response_page_clicks += 1
+            generation_busy_seen = True
+            stable_seen = 0
+            stable_transport_seen = 0
+            stable_copy_text = ""
+            stable_copy_seen = 0
+            last_text = ""
+            last_transport_text = ""
+            deadline = max(deadline, time.time() + (self.response_timeout_ms / 1000))
+            if trace is not None:
+                trace.set("response_pagination_last_reason", reason)
+                trace.set("response_pagination_clicks_local", response_page_clicks)
+                trace.set("response_pagination_max_clicks", self.max_response_page_clicks)
+            logger.warning(
+                "DeepSeek wait_for_response advanced response page reason=%s page=%d/%d clicks=%d",
+                reason,
+                current_page,
+                total_pages,
+                response_page_clicks,
             )
             return True
 
@@ -5014,18 +5428,22 @@ class DeepSeekWebBridge:
                         continue
                 if has_advanced and self.can_submit_next_turn(page):
                     copied = self.try_copy_last_assistant_text(page, plain_protocol=plain_protocol)
+                    if copied and plain_protocol and self._matches_current_request_response_candidate(copied):
+                        if try_advance_response_page(copied, "copy_button"):
+                            continue
                     if copied and (not plain_protocol or not is_likely_truncated_plain_text(copied)) and self._matches_current_request_response_candidate(copied):
+                        final_copied = response_text_for_return(copied)
                         if trace is not None:
-                            trace.set("response_chars", len(copied))
+                            trace.set("response_chars", len(final_copied))
                             trace.set("response_ready_reason", "copy_button")
                             trace.mark("response_stable")
                         logger.warning(
                             "DeepSeek wait_for_response returning clipboard copy assistant_chars=%d copied_chars=%d transport_candidates=%d",
                             len(current),
-                            len(copied),
+                            len(final_copied),
                             transport_capture.candidate_count if transport_capture is not None else 0,
                         )
-                        return copied
+                        return final_copied
                 if has_advanced and not plain_protocol:
                     try:
                         extract_json_object(current)
@@ -5121,6 +5539,13 @@ class DeepSeekWebBridge:
             if has_advanced and current and stable_seen >= self.stable_rounds:
                 if try_continue_generation("stable_text"):
                     continue
+                if (
+                    plain_protocol
+                    and self.can_submit_next_turn(page)
+                    and not self.has_continue_generation_button(page)
+                    and try_advance_response_page(current, "stable_text_pagination")
+                ):
+                    continue
                 if plain_protocol and self.can_submit_next_turn(page) and not self.has_continue_generation_button(page):
                     copied = self.try_copy_last_assistant_text(
                         page,
@@ -5134,32 +5559,38 @@ class DeepSeekWebBridge:
                             stable_copy_text = copied
                             stable_copy_seen = 1
                         if stable_copy_seen >= max(2, self.stable_rounds):
+                            if try_advance_response_page(copied, "copy_button_plain_terminal_stable"):
+                                continue
+                            final_copied = response_text_for_return(copied)
                             if trace is not None:
-                                trace.set("response_chars", len(copied))
+                                trace.set("response_chars", len(final_copied))
                                 trace.set("response_ready_reason", "copy_button_plain_terminal_stable")
                                 trace.mark("response_stable")
                             logger.warning(
                                 "DeepSeek wait_for_response returning terminal stable plain clipboard copy dom_chars=%d copied_chars=%d stable_copy_seen=%d",
                                 len(current),
-                                len(copied),
+                                len(final_copied),
                                 stable_copy_seen,
                             )
-                            return copied
+                            return final_copied
                 if (
                     plain_protocol
                     and has_agent_qt_completion_line(current)
                     and self.can_submit_next_turn(page)
                     and self._matches_current_request_response_candidate(current)
                 ):
+                    if try_advance_response_page(current, "plain_completion_line"):
+                        continue
+                    final_current = response_text_for_return(current)
                     if trace is not None:
-                        trace.set("response_chars", len(current))
+                        trace.set("response_chars", len(final_current))
                         trace.set("response_ready_reason", "plain_completion_line")
                         trace.mark("response_stable")
                     logger.warning(
                         "DeepSeek wait_for_response returning plain text with completion line chars=%d",
-                        len(current),
+                        len(final_current),
                     )
-                    return current
+                    return final_current
                 if is_placeholder_assistant_payload_text(current):
                     if placeholder_wait_rounds < placeholder_wait_limit:
                         placeholder_wait_rounds += 1
@@ -5175,17 +5606,21 @@ class DeepSeekWebBridge:
                             plain_protocol=plain_protocol,
                         )
                         short_fragment_copy_retry_done = True
+                        if copied and plain_protocol and self._matches_current_request_response_candidate(copied):
+                            if try_advance_response_page(copied, "copy_button_short_fragment_retry"):
+                                continue
                         if copied and (not plain_protocol or not is_likely_truncated_plain_text(copied)) and self._matches_current_request_response_candidate(copied):
+                            final_copied = response_text_for_return(copied)
                             if trace is not None:
-                                trace.set("response_chars", len(copied))
+                                trace.set("response_chars", len(final_copied))
                                 trace.set("response_ready_reason", "copy_button_short_fragment_retry")
                                 trace.mark("response_stable")
                             logger.warning(
                                 "DeepSeek wait_for_response recovered short fragment via copy retry fragment=%r copied_chars=%d",
                                 current[:40],
-                                len(copied),
+                                len(final_copied),
                             )
-                            return copied
+                            return final_copied
                     if short_fragment_extra_wait_rounds < max(self.stable_rounds * 4, 10):
                         short_fragment_extra_wait_rounds += 1
                         logger.warning(
@@ -5203,17 +5638,21 @@ class DeepSeekWebBridge:
                             max_total_ms=max(self.copy_probe_max_ms * 3, 1500),
                             plain_protocol=plain_protocol,
                         )
+                    if copied and plain_protocol and self._matches_current_request_response_candidate(copied):
+                        if try_advance_response_page(copied, "copy_button_incomplete_command_retry"):
+                            continue
                     if copied and not is_suspicious_incomplete_command_text(copied) and (not plain_protocol or not is_likely_truncated_plain_text(copied)) and self._matches_current_request_response_candidate(copied):
+                        final_copied = response_text_for_return(copied)
                         if trace is not None:
-                            trace.set("response_chars", len(copied))
+                            trace.set("response_chars", len(final_copied))
                             trace.set("response_ready_reason", "copy_button_incomplete_command_retry")
                             trace.mark("response_stable")
                         logger.warning(
                             "DeepSeek wait_for_response recovered incomplete command via copy retry current_chars=%d copied_chars=%d",
                             len(current),
-                            len(copied),
+                            len(final_copied),
                         )
-                        return copied
+                        return final_copied
                     if incomplete_command_extra_wait_rounds < max(self.stable_rounds * 100, 300):
                         incomplete_command_extra_wait_rounds += 1
                         logger.warning(
@@ -5241,24 +5680,29 @@ class DeepSeekWebBridge:
                         plain_protocol=True,
                     )
                     if copied and self._matches_current_request_response_candidate(copied):
+                        if try_advance_response_page(copied, "copy_button_plain_stable_text"):
+                            continue
                         if is_likely_truncated_plain_text(copied):
                             page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
                             continue
+                        final_copied = response_text_for_return(copied)
                         if trace is not None:
-                            trace.set("response_chars", len(copied))
+                            trace.set("response_chars", len(final_copied))
                             trace.set("response_ready_reason", "copy_button_plain_stable_text")
                             trace.mark("response_stable")
                         logger.warning(
                             "DeepSeek wait_for_response returning stable plain clipboard copy dom_chars=%d copied_chars=%d",
                             len(current),
-                            len(copied),
+                            len(final_copied),
                         )
-                        return copied
+                        return final_copied
                 if trace is not None:
                     trace.set("response_chars", len(current))
                     trace.set("response_ready_reason", "stable_text")
                     trace.mark("response_stable")
                 if plain_protocol and is_likely_truncated_plain_text(current):
+                    if try_advance_response_page(current, "stable_text_truncated"):
+                        continue
                     logger.warning(
                         "DeepSeek wait_for_response postponing likely truncated plain text chars=%d",
                         len(current),
@@ -5266,7 +5710,9 @@ class DeepSeekWebBridge:
                     page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
                     continue
                 if self._matches_current_request_response_candidate(current):
-                    return current
+                    if plain_protocol and try_advance_response_page(current, "stable_text"):
+                        continue
+                    return response_text_for_return(current)
             page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
 
         if best_seen_text and len(best_seen_text.strip()) >= 200:
