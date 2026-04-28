@@ -53,6 +53,7 @@ _AGENT_RUNTIME_ERROR = ""
 _APP_SETTINGS: Optional[Dict[str, object]] = None
 _AGENT_RUNTIME_ENABLED: Optional[bool] = None
 _AUTOMATION_ENABLED: Optional[bool] = None
+QT_WIDGET_MAX_HEIGHT = 16777215
 DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 
@@ -4168,6 +4169,7 @@ class ChatBubble(QFrame):
         self.setup_ui()
     
     def setup_ui(self):
+        self.setObjectName("chatBubblePlainSystemLog" if self.plain_system_log else "chatBubble")
         colors = {
             "user": (COLORS["card_user"], COLORS["border"], "你"),
             "ai": (COLORS["card_ai"], "#d7ccff", "AI 输出"),
@@ -4178,12 +4180,12 @@ class ChatBubble(QFrame):
         setattr(self, '_border', border)
         
         if self.plain_system_log:
-            self.setStyleSheet("QFrame { background: transparent; border: none; margin: 0; }")
+            self.setStyleSheet("QFrame#chatBubblePlainSystemLog { background: transparent; border: none; margin: 0; }")
         elif self.flat:
-            self.setStyleSheet("QFrame { background: transparent; border: none; margin: 2px 0; }")
+            self.setStyleSheet("QFrame#chatBubble { background: transparent; border: none; margin: 2px 0; }")
         elif self.compact_user:
             self.setStyleSheet(f"""
-                QFrame {{
+                QFrame#chatBubble {{
                     background: #edf5ff;
                     border: 1px solid #cfe0ff;
                     border-radius: 18px;
@@ -4191,11 +4193,11 @@ class ChatBubble(QFrame):
                 }}
             """)
         else:
-            self.setStyleSheet(f"QFrame {{ background: {bg}; border: 1px solid {border}; border-radius: 18px; margin: 4px 0; }}")
+            self.setStyleSheet(f"QFrame#chatBubble {{ background: {bg}; border: 1px solid {border}; border-radius: 18px; margin: 4px 0; }}")
         
         layout = QVBoxLayout(self)
         if self.plain_system_log:
-            layout.setContentsMargins(2, 6, 2, 6)
+            layout.setContentsMargins(0, 4, 0, 4)
         elif self.flat:
             layout.setContentsMargins(2, 10, 2, 10)
         elif self.compact_user:
@@ -4709,6 +4711,8 @@ class ChatBubble(QFrame):
             for widget in self.markdown_widgets:
                 if not isinstance(widget, QTextBrowser):
                     continue
+                widget.setMinimumHeight(0)
+                widget.setMaximumHeight(QT_WIDGET_MAX_HEIGHT)
                 available_width = max(120, widget.viewport().width() - 10)
                 metrics = widget.fontMetrics()
                 text = widget.toPlainText()
@@ -4730,6 +4734,8 @@ class ChatBubble(QFrame):
             for code_box in self.markdown_code_widgets:
                 if not code_box.isVisible():
                     continue
+                code_box.setMinimumHeight(0)
+                code_box.setMaximumHeight(QT_WIDGET_MAX_HEIGHT)
                 metrics = code_box.fontMetrics()
                 text = code_box.toPlainText()
                 line_count = max(1, len(text.splitlines()) or 1)
@@ -6895,7 +6901,10 @@ class ChatPage(QWidget):
             bubble = self.automation_preview_bubble
             self.automation_preview_bubble = None
             self.chat_layout.removeWidget(bubble)
+            bubble.hide()
+            bubble.setParent(None)
             bubble.deleteLater()
+            self.chat_container.adjustSize()
 
     def update_automation_preview_status(self, chars: Optional[int] = None):
         bubble = self.automation_preview_bubble
