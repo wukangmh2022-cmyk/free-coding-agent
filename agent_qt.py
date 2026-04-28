@@ -27,6 +27,7 @@ import time
 import tempfile
 import locale
 import signal
+import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -58,6 +59,7 @@ _AGENT_RUNTIME_ENABLED: Optional[bool] = None
 _AUTOMATION_ENABLED: Optional[bool] = None
 QT_WIDGET_MAX_HEIGHT = 16777215
 DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+logger = logging.getLogger(__name__)
 
 
 def app_settings_path() -> str:
@@ -4559,7 +4561,48 @@ class AutomationPreviewWorker(QThread):
                 self.preview_signal.emit(preview)
             except Exception:
                 pass
-            self.msleep(120)
+            self.msleep(220)
+
+
+class MarkdownRenderWorker(QThread):
+    rendered = Signal(int, str, list, list, dict)
+
+    def __init__(self, request_id: int, text: str):
+        super().__init__()
+        self.request_id = request_id
+        self.text = text
+
+    def run(self):
+        total_started = time.perf_counter()
+        split_started = time.perf_counter()
+        parts = split_markdown_fenced_blocks(self.text)
+        split_ms = int((time.perf_counter() - split_started) * 1000)
+        html_ms = 0
+        rendered_parts: List[Dict[str, str]] = []
+        for part in parts:
+            if part["type"] == "code":
+                rendered_parts.append(part)
+                continue
+            html_started = time.perf_counter()
+            markdown_text = part.get("text", "")
+            rendered_parts.append({
+                "type": "markdown",
+                "text": markdown_text,
+                "html": markdown_with_pipe_tables_to_html(markdown_text),
+            })
+            html_ms += int((time.perf_counter() - html_started) * 1000)
+        signatures = [
+            (part["type"], (part.get("lang", "") if part["type"] == "code" else ""))
+            for part in rendered_parts
+        ]
+        stats = {
+            "chars": len(self.text or ""),
+            "parts": len(rendered_parts),
+            "split_ms": split_ms,
+            "html_ms": html_ms,
+            "total_ms": int((time.perf_counter() - total_started) * 1000),
+        }
+        self.rendered.emit(self.request_id, self.text, rendered_parts, signatures, stats)
 
 # ============================================================
 # 对话气泡
@@ -4606,6 +4649,12 @@ class ChatBubble(QFrame):
         self.markdown_code_widgets: List[QPlainTextEdit] = []
         self.markdown_part_signatures: List[tuple] = []
         self.stabilize_markdown_height = False
+        self.async_markdown_render = False
+        self._markdown_render_seq = 0
+        self._markdown_render_worker: Optional[MarkdownRenderWorker] = None
+        self._markdown_render_pending = False
+        self._streaming_height_adjust_min_interval_ms = 240
+        self._last_streaming_height_adjust_at = 0.0
         self._stable_markdown_heights: Dict[int, int] = {}
         self.min_content_height = 34 if compact_user else 58
         self._height_adjust_scheduled = False
@@ -4826,7 +4875,8 @@ class ChatBubble(QFrame):
         )
         self.content_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.adjust_content_height()
-        self.schedule_content_height_adjustment()
+        if not (self.markdown and self.expand_to_content and self.async_markdown_render):
+            self.schedule_content_height_adjustment()
         layout.addWidget(self.content_label)
 
     def clear_markdown_widgets(self):
@@ -4963,7 +5013,7 @@ class ChatBubble(QFrame):
             }}
         """
 
-    def add_markdown_text_widget(self, text: str, layout: QVBoxLayout):
+    def add_markdown_text_widget(self, text: str, layout: QVBoxLayout, html_text: Optional[str] = None):
         viewer = QLabel()
         viewer.setTextFormat(Qt.TextFormat.RichText)
         viewer.setWordWrap(True)
@@ -4971,7 +5021,7 @@ class ChatBubble(QFrame):
         viewer.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
-        viewer.setText(markdown_with_pipe_tables_to_html(text))
+        viewer.setText(html_text if html_text is not None else markdown_with_pipe_tables_to_html(text))
         viewer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         viewer.setStyleSheet(self.markdown_text_style())
         viewer.markdown_source = text
@@ -5039,6 +5089,8 @@ class ChatBubble(QFrame):
     def update_markdown_parts_in_place(self, parts: List[Dict[str, str]], signatures: List[tuple]) -> bool:
         if signatures != self.markdown_part_signatures or len(parts) != len(self.markdown_widgets):
             return False
+        apply_started = time.perf_counter()
+        set_text_ms = 0
         code_index = 0
         changed = False
         for part, widget in zip(parts, self.markdown_widgets):
@@ -5071,25 +5123,36 @@ class ChatBubble(QFrame):
                     return False
                 if getattr(widget, "markdown_source", None) != text:
                     widget.markdown_source = text
-                    widget.setText(markdown_with_pipe_tables_to_html(text))
+                    html_started = time.perf_counter()
+                    widget.setText(part.get("html") or markdown_with_pipe_tables_to_html(text))
+                    set_text_ms += int((time.perf_counter() - html_started) * 1000)
                     changed = True
         if changed:
+            height_started = time.perf_counter()
             self.adjust_content_height()
-            self.schedule_content_height_adjustment()
-            QTimer.singleShot(80, self.adjust_content_height)
-            QTimer.singleShot(180, self.adjust_content_height)
+            height_ms = int((time.perf_counter() - height_started) * 1000)
+            if not self.async_markdown_render:
+                self.schedule_content_height_adjustment()
+                QTimer.singleShot(80, self.adjust_content_height)
+                QTimer.singleShot(180, self.adjust_content_height)
+            total_ms = int((time.perf_counter() - apply_started) * 1000)
+            if total_ms >= 80 or height_ms >= 50 or set_text_ms >= 50:
+                logger.warning(
+                    "Markdown UI apply slow changed=in_place chars=%d parts=%d set_text_ms=%d height_ms=%d total_ms=%d",
+                    len(self.visible_content()),
+                    len(parts),
+                    set_text_ms,
+                    height_ms,
+                    total_ms,
+                )
         return True
 
-    def render_markdown_parts(self, layout: Optional[QVBoxLayout] = None):
+    def render_precomputed_markdown_parts(self, parts: List[Dict[str, str]], signatures: List[tuple], layout: Optional[QVBoxLayout] = None, stats: Optional[Dict[str, int]] = None):
         if layout is None:
             layout = self.layout()
         if layout is None:
             return
-        parts = split_markdown_fenced_blocks(self.visible_content())
-        signatures = [
-            (part["type"], (part.get("lang", "") if part["type"] == "code" else ""))
-            for part in parts
-        ]
+        apply_started = time.perf_counter()
         if self.update_markdown_parts_in_place(parts, signatures):
             return
         code_scroll_states = self.capture_markdown_code_scroll_state()
@@ -5099,13 +5162,67 @@ class ChatBubble(QFrame):
             if part["type"] == "code":
                 self.add_markdown_code_widget(part.get("lang", ""), part.get("text", ""), layout)
             else:
-                self.add_markdown_text_widget(part.get("text", ""), layout)
+                self.add_markdown_text_widget(part.get("text", ""), layout, part.get("html"))
+        height_started = time.perf_counter()
         self.adjust_content_height()
-        self.schedule_content_height_adjustment()
-        QTimer.singleShot(80, self.adjust_content_height)
-        QTimer.singleShot(180, self.adjust_content_height)
+        height_ms = int((time.perf_counter() - height_started) * 1000)
+        if not self.async_markdown_render:
+            self.schedule_content_height_adjustment()
+            QTimer.singleShot(80, self.adjust_content_height)
+            QTimer.singleShot(180, self.adjust_content_height)
         self.restore_markdown_code_scroll_state(code_scroll_states)
         QTimer.singleShot(0, lambda states=code_scroll_states: self.restore_markdown_code_scroll_state(states))
+        total_ms = int((time.perf_counter() - apply_started) * 1000)
+        compute_ms = int((stats or {}).get("total_ms", 0))
+        if total_ms >= 80 or height_ms >= 50 or compute_ms >= 80:
+            logger.warning(
+                "Markdown render timing chars=%d parts=%d compute_ms=%d split_ms=%d html_ms=%d ui_ms=%d height_ms=%d",
+                len(self.visible_content()),
+                len(parts),
+                compute_ms,
+                int((stats or {}).get("split_ms", 0)),
+                int((stats or {}).get("html_ms", 0)),
+                total_ms,
+                height_ms,
+            )
+
+    def render_markdown_parts(self, layout: Optional[QVBoxLayout] = None):
+        split_started = time.perf_counter()
+        parts = split_markdown_fenced_blocks(self.visible_content())
+        split_ms = int((time.perf_counter() - split_started) * 1000)
+        signatures = [
+            (part["type"], (part.get("lang", "") if part["type"] == "code" else ""))
+            for part in parts
+        ]
+        self.render_precomputed_markdown_parts(parts, signatures, layout=layout, stats={"split_ms": split_ms, "total_ms": split_ms})
+
+    def schedule_async_markdown_render(self):
+        self._markdown_render_seq += 1
+        if self._markdown_render_worker is not None and self._markdown_render_worker.isRunning():
+            self._markdown_render_pending = True
+            return
+        self.start_async_markdown_render()
+
+    def start_async_markdown_render(self):
+        request_id = self._markdown_render_seq
+        text = self.visible_content()
+        worker = MarkdownRenderWorker(request_id, text)
+        self._markdown_render_worker = worker
+        worker.rendered.connect(self.apply_async_markdown_render)
+        worker.finished.connect(lambda worker=worker: self.finish_async_markdown_render(worker))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def apply_async_markdown_render(self, request_id: int, text: str, parts: List[Dict[str, str]], signatures: List[tuple], stats: Dict[str, int]):
+        if request_id == self._markdown_render_seq and text == self.visible_content():
+            self.render_precomputed_markdown_parts(parts, signatures, stats=stats)
+
+    def finish_async_markdown_render(self, worker: MarkdownRenderWorker):
+        if self._markdown_render_worker is worker:
+            self._markdown_render_worker = None
+        if self._markdown_render_pending:
+            self._markdown_render_pending = False
+            QTimer.singleShot(0, self.start_async_markdown_render)
 
     def visible_content(self) -> str:
         return str(getattr(self, "display_content", self.content) or "")
@@ -5115,13 +5232,17 @@ class ChatBubble(QFrame):
         if self.compact_user:
             self.content_label.setPlainText(text)
         elif self.markdown and self.expand_to_content:
-            self.render_markdown_parts()
+            if self.async_markdown_render:
+                self.schedule_async_markdown_render()
+            else:
+                self.render_markdown_parts()
         elif self.markdown:
             self.content_label.setMarkdown(text)
         else:
             self.content_label.setPlainText(text)
-        self.adjust_content_height()
-        self.schedule_content_height_adjustment()
+        if not (self.markdown and self.expand_to_content and self.async_markdown_render):
+            self.adjust_content_height()
+            self.schedule_content_height_adjustment()
         self.updateGeometry()
         parent = self.parentWidget()
         if parent is not None:
@@ -7582,6 +7703,7 @@ class ChatPage(QWidget):
             expand_to_content=True,
             flat=True,
         )
+        frame.async_markdown_render = True
         role_label = frame.findChild(QLabel)
         if role_label is not None:
             role_label.setText("AI 正在回复")
@@ -7656,7 +7778,7 @@ class ChatPage(QWidget):
 
     def schedule_automation_preview_render(self):
         if not self.automation_preview_render_timer.isActive():
-            self.automation_preview_render_timer.start(60)
+            self.automation_preview_render_timer.start(140)
 
     def flush_automation_preview_render(self):
         bubble = self.automation_preview_bubble

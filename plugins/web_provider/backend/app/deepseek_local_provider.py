@@ -181,7 +181,7 @@ DEERFLOW_SESSION_STATE_PATH = os.environ.get(
     "~/.deerflow/deepseek-web-deerflow-session.json",
 )
 DEERFLOW_FORCE_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FORCE_NEW_CHAT_DEERFLOW", "1") == "1"
-DEERFLOW_FAST_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FAST_NEW_CHAT_DEERFLOW", "1").strip().lower() not in {
+DEERFLOW_FAST_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FAST_NEW_CHAT_DEERFLOW", "0").strip().lower() not in {
     "0",
     "false",
     "off",
@@ -190,7 +190,7 @@ DEERFLOW_FAST_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FAST_NEW_CHAT_DEERFLOW", "
 }
 DEERFLOW_STABLE_POLL_INTERVAL_MS = _int_env(
     "DEEPSEEK_WEB_STABLE_POLL_INTERVAL_MS_DEERFLOW",
-    300,
+    1200,
     minimum=100,
     maximum=3_000,
 )

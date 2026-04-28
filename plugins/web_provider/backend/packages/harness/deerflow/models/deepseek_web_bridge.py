@@ -4673,7 +4673,7 @@ class DeepSeekWebBridge:
         *,
         transport_capture: DeepSeekTransportCapture | None = None,
         trace: DeepSeekTrace | None = None,
-        timeout_ms: int = 4500,
+        timeout_ms: int = 1200,
     ) -> bool:
         locator = self.assistant_locator(page)
         deadline = time.time() + max(0.5, timeout_ms / 1000)
