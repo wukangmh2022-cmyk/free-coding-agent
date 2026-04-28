@@ -3507,7 +3507,7 @@ class DeepSeekWebBridge:
                     trace.set("assistant_chars_before", len(before_last_text))
                     trace.set("assistant_index_before", before_last_index)
                 try:
-                    self.fill_input(input_box, prompt)
+                    self.fill_input(page, input_box, prompt)
                     if trace is not None:
                         trace.mark("prompt_filled")
                     logger.warning("DeepSeek submit_prompt prompt filled prompt_chars=%d", len(prompt))
@@ -4577,7 +4577,7 @@ class DeepSeekWebBridge:
             "DeepSeek input box not found. Please login in the persistent browser profile and keep the page on chat view."
         )
 
-    def fill_input(self, input_box: Locator, prompt: str) -> None:
+    def fill_input(self, page: Page, input_box: Locator, prompt: str) -> None:
         logger.warning("DeepSeek fill_input click start")
         try:
             input_box.click(timeout=500)
@@ -4591,16 +4591,31 @@ class DeepSeekWebBridge:
         except Exception:
             logger.debug("DeepSeek native fill failed; falling back to direct value injection.", exc_info=True)
 
-        logger.warning("DeepSeek fill_input tag read start")
-        try:
-            tag_name = input_box.evaluate("(node) => node.tagName.toLowerCase()", timeout=500)
-        except Exception:
-            logger.debug("DeepSeek input tag read failed; assuming textarea for direct injection.", exc_info=True)
-            tag_name = "textarea"
-        logger.warning("DeepSeek fill_input inject start tag=%s chars=%d", tag_name, len(prompt))
-        if tag_name in {"input", "textarea"}:
-            input_box.evaluate(
-                """(node, value) => {
+        logger.warning("DeepSeek fill_input page-level inject start chars=%d", len(prompt))
+        result = page.evaluate(
+            """({ selectors, value }) => {
+                const isVisible = (node) => {
+                    if (!(node instanceof HTMLElement)) return false;
+                    const style = window.getComputedStyle(node);
+                    if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
+                    const rect = node.getBoundingClientRect();
+                    return !!rect.width && !!rect.height;
+                };
+                const candidates = [];
+                for (const selector of selectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                        if (node instanceof HTMLElement && isVisible(node)) candidates.push(node);
+                    }
+                }
+                if (document.activeElement instanceof HTMLElement && isVisible(document.activeElement)) {
+                    candidates.push(document.activeElement);
+                }
+                const node = candidates[candidates.length - 1];
+                if (!(node instanceof HTMLElement)) {
+                    return { ok: false, reason: 'input-not-found' };
+                }
+                const tag = node.tagName.toLowerCase();
+                if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
                     const proto = node instanceof HTMLTextAreaElement
                         ? HTMLTextAreaElement.prototype
                         : HTMLInputElement.prototype;
@@ -4610,22 +4625,20 @@ class DeepSeekWebBridge:
                     } else {
                         node.value = value;
                     }
-                    node.dispatchEvent(new Event('input', { bubbles: true }));
-                }""",
-                prompt,
-                timeout=1000,
-            )
-            logger.warning("DeepSeek fill_input inject done tag=%s", tag_name)
-            return
-        input_box.evaluate(
-            """(node, value) => {
-                node.textContent = value;
-                node.dispatchEvent(new Event('input', { bubbles: true }));
+                } else {
+                    node.textContent = value;
+                }
+                node.focus();
+                node.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                node.dispatchEvent(new Event('change', { bubbles: true }));
+                return { ok: true, tag };
             }""",
-            prompt,
-            timeout=1000,
+            {"selectors": list(self.input_selectors), "value": prompt},
+            timeout=1500,
         )
-        logger.warning("DeepSeek fill_input inject done tag=%s", tag_name)
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise RuntimeError(f"DeepSeek input injection failed: {result}")
+        logger.warning("DeepSeek fill_input page-level inject done tag=%s", result.get("tag"))
 
     def try_submit(self, page: Page, input_box: Locator, *, trace: DeepSeekTrace | None = None) -> bool:
         for selector in self.send_selectors:

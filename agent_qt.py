@@ -26,6 +26,7 @@ import venv
 import time
 import tempfile
 import locale
+import signal
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -4265,9 +4266,62 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         except Exception:
             return False
 
+    def provider_source_mtime(self) -> float:
+        roots = [
+            os.path.join(self.backend_dir, "app"),
+            os.path.join(self.backend_dir, "packages", "harness"),
+        ]
+        newest = 0.0
+        for root in roots:
+            if not os.path.isdir(root):
+                continue
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    if not name.endswith(".py"):
+                        continue
+                    try:
+                        newest = max(newest, os.path.getmtime(os.path.join(dirpath, name)))
+                    except OSError:
+                        pass
+        return newest
+
+    def provider_process_stale(self) -> bool:
+        try:
+            started_at = os.path.getmtime(self.pid_file)
+        except OSError:
+            return False
+        return self.provider_source_mtime() > started_at + 0.5
+
+    def stop_provider_process(self):
+        try:
+            with open(self.pid_file, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip() or "0")
+        except (OSError, ValueError):
+            return
+        if pid <= 0:
+            return
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, timeout=8)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            if not self.health():
+                break
+            time.sleep(0.2)
+        try:
+            os.remove(self.pid_file)
+        except OSError:
+            pass
+
     def start_provider(self) -> str:
-        if self.health():
+        if self.health() and not self.provider_process_stale():
             return f"provider 已运行: {self.base_url}"
+        if self.health():
+            self.stop_provider_process()
         status = self.dependency_status()
         if not status.get("ready"):
             raise RuntimeError("插件依赖未就绪，请先安装/修复插件依赖。\n" + str(status.get("message", "")))
