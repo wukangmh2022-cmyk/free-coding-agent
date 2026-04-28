@@ -4583,16 +4583,22 @@ class DeepSeekWebBridge:
             input_box.click(timeout=500)
         except Exception:
             logger.debug("DeepSeek input click skipped before direct value injection.", exc_info=True)
+
+        try:
+            input_box.fill(prompt, timeout=5000)
+            logger.warning("DeepSeek fill_input native fill done")
+            return
+        except Exception:
+            logger.debug("DeepSeek native fill failed; falling back to direct value injection.", exc_info=True)
+
         logger.warning("DeepSeek fill_input tag read start")
-        tag_name = input_box.evaluate("(node) => node.tagName.toLowerCase()", timeout=1000)
+        try:
+            tag_name = input_box.evaluate("(node) => node.tagName.toLowerCase()", timeout=500)
+        except Exception:
+            logger.debug("DeepSeek input tag read failed; assuming textarea for direct injection.", exc_info=True)
+            tag_name = "textarea"
         logger.warning("DeepSeek fill_input inject start tag=%s chars=%d", tag_name, len(prompt))
         if tag_name in {"input", "textarea"}:
-            try:
-                input_box.fill(prompt, timeout=5000)
-                logger.warning("DeepSeek fill_input native fill done tag=%s", tag_name)
-                return
-            except Exception:
-                logger.debug("DeepSeek native fill failed; falling back to direct value injection.", exc_info=True)
             input_box.evaluate(
                 """(node, value) => {
                     const proto = node instanceof HTMLTextAreaElement

@@ -181,6 +181,19 @@ DEERFLOW_SESSION_STATE_PATH = os.environ.get(
     "~/.deerflow/deepseek-web-deerflow-session.json",
 )
 DEERFLOW_FORCE_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FORCE_NEW_CHAT_DEERFLOW", "1") == "1"
+DEERFLOW_FAST_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FAST_NEW_CHAT_DEERFLOW", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+DEERFLOW_STABLE_POLL_INTERVAL_MS = _int_env(
+    "DEEPSEEK_WEB_STABLE_POLL_INTERVAL_MS_DEERFLOW",
+    300,
+    minimum=100,
+    maximum=3_000,
+)
 DEERFLOW_STICKY_MARKER = os.environ.get("DEEPSEEK_WEB_STICKY_MARKER_DEERFLOW", "flowflow__system_prompt_v2")
 DEERFLOW_STICKY_REANCHOR_MESSAGES = int(os.environ.get("DEEPSEEK_WEB_STICKY_REANCHOR_MESSAGES_DEERFLOW", "24"))
 
@@ -304,6 +317,8 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         sticky_marker=DEERFLOW_STICKY_MARKER,
         sticky_reanchor_messages=DEERFLOW_STICKY_REANCHOR_MESSAGES,
         session_state_path=DEERFLOW_SESSION_STATE_PATH,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
+        fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
         forced_expert_mode_enabled=DEFAULT_EXPERT_MODE_ENABLED,
     ),
     "deepseek-web-deerflow-sticky": ModelSpec(
@@ -314,6 +329,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         sticky_reanchor_messages=DEERFLOW_STICKY_REANCHOR_MESSAGES,
         session_state_path=DEERFLOW_SESSION_STATE_PATH,
         reuse_persisted_chat=True,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
         forced_expert_mode_enabled=DEFAULT_EXPERT_MODE_ENABLED,
     ),
     "DeepSeekV4": ModelSpec(
@@ -326,6 +342,8 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         reuse_persisted_chat=False,
         forced_thinking_enabled=False,
         forced_expert_mode_enabled=DEFAULT_EXPERT_MODE_ENABLED,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
+        fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
     ),
     "DeepSeekV4-thinking": ModelSpec(
         model_id="DeepSeekV4-thinking",
@@ -337,6 +355,8 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         reuse_persisted_chat=False,
         forced_thinking_enabled=True,
         forced_expert_mode_enabled=DEFAULT_EXPERT_MODE_ENABLED,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
+        fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
     ),
     "xiaomi-mimo-v2.5-pro": ModelSpec(
         model_id="xiaomi-mimo-v2.5-pro",

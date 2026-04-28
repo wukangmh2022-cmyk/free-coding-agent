@@ -2738,6 +2738,23 @@ def delete_workspace_thread(root: str, thread_id: str, threads: List[Dict[str, o
     remaining = [thread for thread in normalize_threads(threads) if thread.get("id") != thread_id]
     return save_workspace_threads(root, remaining)
 
+def rename_workspace_thread(root: str, thread_id: str, title: str, threads: List[Dict[str, object]]) -> bool:
+    thread_id = safe_thread_id(thread_id)
+    title = title.strip()
+    if not thread_id or not title:
+        return False
+    updated = []
+    found = False
+    for thread in normalize_threads(threads):
+        item = dict(thread)
+        if str(item.get("id")) == thread_id:
+            item["title"] = title
+            found = True
+        updated.append(item)
+    if not found:
+        return False
+    return save_workspace_threads(root, updated)
+
 def make_thread_title(index: int) -> str:
     return f"会话 {index}"
 
@@ -4328,8 +4345,23 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         return self.request_json(
             "GET",
             f"/debug/response-preview?model={urllib.parse.quote(model)}&user={urllib.parse.quote(thread_id)}",
-            timeout=5,
+            timeout=1,
         )
+
+    def log_tail(self, max_chars: int = 3000) -> str:
+        try:
+            with open(self.log_file, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()[-max(1, max_chars):]
+        except OSError:
+            return ""
+
+    def error_with_log_hint(self, message: str) -> str:
+        parts = [str(message or "").strip() or "自动化插件出错。"]
+        parts.append(f"日志文件: {self.log_file}")
+        tail = self.log_tail(1600).strip()
+        if tail:
+            parts.append("最近日志:\n" + tail)
+        return "\n\n".join(parts)
 
     def status_text(self) -> str:
         dep = self.dependency_status()
@@ -4430,7 +4462,7 @@ class AutomationPreviewWorker(QThread):
                 self.preview_signal.emit(preview)
             except Exception:
                 pass
-            self.msleep(250)
+            self.msleep(120)
 
 # ============================================================
 # 对话气泡
@@ -4744,7 +4776,7 @@ class ChatBubble(QFrame):
 
     def markdown_text_style(self) -> str:
         return f"""
-            QTextBrowser {{
+            QTextBrowser, QLabel {{
                 background: transparent;
                 color: {COLORS['text']};
                 border: none;
@@ -4835,15 +4867,14 @@ class ChatBubble(QFrame):
         """
 
     def add_markdown_text_widget(self, text: str, layout: QVBoxLayout):
-        viewer = QTextBrowser()
+        viewer = QLabel()
+        viewer.setTextFormat(Qt.TextFormat.RichText)
+        viewer.setWordWrap(True)
         viewer.setOpenExternalLinks(False)
-        viewer.setReadOnly(True)
-        viewer.setFrameShape(QFrame.Shape.NoFrame)
-        viewer.setViewportMargins(0, 0, 0, 0)
-        viewer.document().setDocumentMargin(0)
-        viewer.setHtml(markdown_with_pipe_tables_to_html(text))
-        viewer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        viewer.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        viewer.setText(markdown_with_pipe_tables_to_html(text))
         viewer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         viewer.setStyleSheet(self.markdown_text_style())
         viewer.markdown_source = text
@@ -4939,11 +4970,11 @@ class ChatBubble(QFrame):
                 code_index += 1
             else:
                 text = part.get("text", "")
-                if not isinstance(widget, QTextBrowser):
+                if not isinstance(widget, QLabel):
                     return False
                 if getattr(widget, "markdown_source", None) != text:
                     widget.markdown_source = text
-                    widget.setHtml(markdown_with_pipe_tables_to_html(text))
+                    widget.setText(markdown_with_pipe_tables_to_html(text))
                     changed = True
         if changed:
             self.adjust_content_height()
@@ -5003,6 +5034,9 @@ class ChatBubble(QFrame):
         self.content = text
         self.update_display_content(text)
 
+    def eventFilter(self, watched, event):
+        return super().eventFilter(watched, event)
+
     def copy_content(self):
         if self.role == "user" and hasattr(self, "prompt_input"):
             self.copy_requested.emit()
@@ -5037,27 +5071,56 @@ class ChatBubble(QFrame):
             self._height_adjust_scheduled = False
             next_stable_heights: Dict[int, int] = {}
             for widget in self.markdown_widgets:
-                if not isinstance(widget, QTextBrowser):
+                if isinstance(widget, QLabel):
+                    text_width = max(120, widget.width())
+                    target_height = max(34, widget.heightForWidth(text_width), widget.sizeHint().height())
+                    source_text = str(getattr(widget, "markdown_source", "") or "")
+                    line_spacing = max(1, widget.fontMetrics().lineSpacing())
+                    source_height = estimate_wrapped_text_height(source_text, widget.fontMetrics(), text_width)
+                    target_height = max(target_height, source_height + line_spacing * 3)
+                    if self.stabilize_markdown_height:
+                        key = id(widget)
+                        target_height = max(int(self._stable_markdown_heights.get(key, 0)), target_height)
+                        next_stable_heights[key] = target_height
+                    if widget.height() != target_height:
+                        widget.setFixedHeight(target_height)
+                        widget.updateGeometry()
                     continue
-                widget.setMinimumHeight(0)
-                widget.setMaximumHeight(QT_WIDGET_MAX_HEIGHT)
-                text_width = max(120, widget.viewport().width() - 10)
-                widget.document().setTextWidth(text_width)
-                line_spacing = max(1, widget.fontMetrics().lineSpacing())
-                document_height = int(widget.document().documentLayout().documentSize().height())
-                content_margin = int(widget.document().documentMargin() * 2)
-                safety_padding = max(72, line_spacing * 4)
-                target_height = max(
-                    34,
-                    document_height + content_margin + safety_padding,
-                )
-                if self.stabilize_markdown_height:
-                    key = id(widget)
-                    target_height = max(int(self._stable_markdown_heights.get(key, 0)), target_height)
-                    next_stable_heights[key] = target_height
-                if widget.height() != target_height:
-                    widget.setFixedHeight(target_height)
-                    widget.updateGeometry()
+                if isinstance(widget, QTextBrowser):
+                    widget.setMinimumHeight(0)
+                    widget.setMaximumHeight(QT_WIDGET_MAX_HEIGHT)
+                    text_width = max(120, widget.viewport().width() - 10)
+                    widget.document().setTextWidth(text_width)
+                    line_spacing = max(1, widget.fontMetrics().lineSpacing())
+                    document_height = int(widget.document().documentLayout().documentSize().height())
+                    content_margin = int(widget.document().documentMargin() * 2)
+                    safety_padding = max(72, line_spacing * 4)
+                    target_height = max(34, document_height + content_margin + safety_padding)
+                    if self.stabilize_markdown_height:
+                        key = id(widget)
+                        target_height = max(int(self._stable_markdown_heights.get(key, 0)), target_height)
+                        next_stable_heights[key] = target_height
+                    if widget.height() != target_height:
+                        widget.setFixedHeight(target_height)
+                        widget.updateGeometry()
+                    bar = widget.verticalScrollBar()
+                    overflow = bar.maximum()
+                    if overflow > 0:
+                        inferred_content_height = overflow + bar.pageStep()
+                        fallback_height = int(widget.height() * 2.5) if inferred_content_height > widget.height() * 1.8 else 0
+                        target_height = max(
+                            target_height + overflow + line_spacing,
+                            inferred_content_height + line_spacing * 2,
+                            fallback_height,
+                        )
+                        widget.setFixedHeight(target_height)
+                        bar.setValue(0)
+                        widget.updateGeometry()
+                    widget.setVerticalScrollBarPolicy(
+                        Qt.ScrollBarPolicy.ScrollBarAsNeeded
+                        if widget.verticalScrollBar().maximum() > 0
+                        else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+                    )
             for code_box in self.markdown_code_widgets:
                 if not code_box.isVisible():
                     continue
@@ -5473,6 +5536,7 @@ class ChangeSummaryCard(QFrame):
 class ThreadCard(QFrame):
     selected = Signal(str)
     delete_requested = Signal(str)
+    rename_requested = Signal(str, str)
 
     def __init__(self, thread: Dict[str, object], active: bool = False, parent=None):
         super().__init__(parent)
@@ -5480,6 +5544,8 @@ class ThreadCard(QFrame):
         self.thread_id = str(thread.get("id", DEFAULT_THREAD_ID))
         self.active = active
         self.deletable = self.thread_id != DEFAULT_THREAD_ID
+        self._editing_title = False
+        self._rename_cancelled = False
         self.setObjectName("threadCard")
         self.setCursor(Qt.PointingHandCursor)
         self.setup_ui()
@@ -5493,6 +5559,24 @@ class ThreadCard(QFrame):
         title.setStyleSheet("background: transparent; border: none; font-size: 12px; font-weight: 900;")
         title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout.addWidget(title)
+        self.title_edit = QLineEdit(str(self.thread.get("title", "会话")))
+        self.title_edit.setMaxLength(80)
+        self.title_edit.setVisible(False)
+        self.title_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.title_edit.editingFinished.connect(self.commit_title_edit)
+        self.title_edit.installEventFilter(self)
+        self.title_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: {COLORS['surface']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['accent']};
+                border-radius: 8px;
+                padding: 4px 6px;
+                font-size: 12px;
+                font-weight: 900;
+            }}
+        """)
+        layout.addWidget(self.title_edit)
         self.delete_btn = QToolButton(self, cursor=Qt.PointingHandCursor)
         self.delete_btn.setText("×")
         self.delete_btn.setToolTip("")
@@ -5533,7 +5617,46 @@ class ThreadCard(QFrame):
             }}
         """)
         self.title_label.setStyleSheet(f"background: transparent; border: none; color: {color}; font-size: 12px; font-weight: 900;")
-        self.delete_btn.setVisible(self.deletable and self.active)
+        self.delete_btn.setVisible(self.deletable and self.active and not self._editing_title)
+
+    def begin_title_edit(self):
+        if self._editing_title:
+            return
+        self._editing_title = True
+        self._rename_cancelled = False
+        self.title_edit.setText(self.title_label.text())
+        self.title_label.setVisible(False)
+        self.title_edit.setVisible(True)
+        self.delete_btn.setVisible(False)
+        self.title_edit.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.title_edit.selectAll()
+
+    def finish_title_edit(self, commit: bool):
+        if not self._editing_title:
+            return
+        self._editing_title = False
+        self.title_edit.setVisible(False)
+        self.title_label.setVisible(True)
+        self.apply_style()
+        if not commit:
+            return
+        title = self.title_edit.text().strip()
+        if title and title != self.title_label.text():
+            self.rename_requested.emit(self.thread_id, title)
+
+    def commit_title_edit(self):
+        if self._rename_cancelled:
+            self.finish_title_edit(False)
+        else:
+            self.finish_title_edit(True)
+
+    def eventFilter(self, watched, event):
+        if watched is self.title_edit and self._editing_title and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape:
+                self._rename_cancelled = True
+                self.finish_title_edit(False)
+                return True
+        return super().eventFilter(watched, event)
 
     def set_active(self, active: bool):
         self.active = active
@@ -5541,12 +5664,12 @@ class ThreadCard(QFrame):
 
     def enterEvent(self, event):
         super().enterEvent(event)
-        if self.deletable:
+        if self.deletable and not self._editing_title:
             self.delete_btn.setVisible(True)
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
-        if self.deletable and not self.active:
+        if self.deletable and not self.active and not self._editing_title:
             self.delete_btn.setVisible(False)
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -5556,6 +5679,14 @@ class ThreadCard(QFrame):
         self.selected.emit(self.thread_id)
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        if self.delete_btn.geometry().contains(event.position().toPoint()):
+            super().mouseDoubleClickEvent(event)
+            return
+        self.selected.emit(self.thread_id)
+        self.begin_title_edit()
+        event.accept()
+
 
 class Sidebar(QFrame):
     file_opened = Signal(str)
@@ -5563,6 +5694,7 @@ class Sidebar(QFrame):
     thread_selected = Signal(str)
     new_thread_requested = Signal()
     delete_thread_requested = Signal(str)
+    rename_thread_requested = Signal(str, str)
     delete_path_requested = Signal(str)
     
     def __init__(self, parent=None):
@@ -5838,6 +5970,7 @@ class Sidebar(QFrame):
             card = ThreadCard(thread, active=str(thread.get("id")) == self._active_thread_id, parent=self.thread_list)
             card.selected.connect(self.thread_selected.emit)
             card.delete_requested.connect(self.delete_thread_requested.emit)
+            card.rename_requested.connect(self.rename_thread_requested.emit)
             self.thread_cards[card.thread_id] = card
             self.thread_list_layout.insertWidget(self.thread_list_layout.count() - 1, card)
 
@@ -6215,6 +6348,7 @@ class ChatPage(QWidget):
         self.sidebar.thread_selected.connect(self.switch_thread)
         self.sidebar.new_thread_requested.connect(self.create_thread)
         self.sidebar.delete_thread_requested.connect(self.delete_thread)
+        self.sidebar.rename_thread_requested.connect(self.rename_thread)
         self.sidebar.delete_path_requested.connect(self.delete_project_path)
         self.sidebar_btn = QToolButton()
         self.sidebar_btn.setText("›")
@@ -6761,6 +6895,12 @@ class ChatPage(QWidget):
         status_action = QAction("检查插件状态", self)
         status_action.triggered.connect(self.show_automation_status)
         automation_menu.addAction(status_action)
+        open_log_action = QAction("打开插件日志", self)
+        open_log_action.triggered.connect(self.open_automation_log_file)
+        automation_menu.addAction(open_log_action)
+        copy_log_action = QAction("复制插件日志路径", self)
+        copy_log_action.triggered.connect(self.copy_automation_log_path)
+        automation_menu.addAction(copy_log_action)
         install_action = QAction("安装/修复插件依赖", self)
         install_action.triggered.connect(lambda: self.run_automation_setup("install"))
         automation_menu.addAction(install_action)
@@ -6839,6 +6979,20 @@ class ChatPage(QWidget):
 
     def show_automation_status(self):
         styled_warning(self, "自动化插件状态", self.automation_manager.status_text())
+
+    def open_automation_log_file(self):
+        path = self.automation_manager.log_file
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        self.add_status_bubble(f"插件日志：{path}")
+
+    def copy_automation_log_path(self):
+        path = self.automation_manager.log_file
+        QApplication.clipboard().setText(path)
+        self.add_status_bubble(f"已复制插件日志路径：{path}")
 
     def open_automation_plugin_dir(self):
         path = self.automation_manager.plugin_root
@@ -7671,7 +7825,7 @@ class ChatPage(QWidget):
                 self.stop_automation_loop("自动化循环已暂停。", ensure_manual_entry=True)
                 if "网页登录还没有准备好" in error:
                     self.add_status_bubble("需要先完成网页登录。请使用设置里的“打开网页登录”，登录后重新发送。")
-                styled_warning(self, "AI 自动化失败", error)
+                styled_warning(self, "AI 自动化失败", self.automation_manager.error_with_log_hint(error))
             else:
                 self.handle_ai_response_text(text)
             worker.deleteLater()
@@ -7868,6 +8022,20 @@ class ChatPage(QWidget):
             self.thread_id = DEFAULT_THREAD_ID
             self.load_history()
         save_last_thread_id(self.project_root, self.thread_id)
+        self.sidebar.set_threads(self.threads, self.thread_id)
+        self.sidebar.set_tab("threads")
+
+    def rename_thread(self, thread_id: str, title: str):
+        thread_id = safe_thread_id(thread_id)
+        title = title.strip()
+        if not thread_id or not title:
+            return
+        if not rename_workspace_thread(self.project_root, thread_id, title, self.threads):
+            styled_warning(self, "重命名失败", "无法保存这个会话名。")
+            self.sidebar.set_threads(self.threads, self.thread_id)
+            self.sidebar.set_tab("threads")
+            return
+        self.threads = load_workspace_threads(self.project_root)
         self.sidebar.set_threads(self.threads, self.thread_id)
         self.sidebar.set_tab("threads")
 
