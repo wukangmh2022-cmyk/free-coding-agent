@@ -2312,18 +2312,17 @@ def build_execution_context_content(full_log: str, records: List[Dict[str, objec
 
 AUTOMATION_LOOP_MAX_ROUNDS = env_int("AGENT_QT_AUTOMATION_MAX_ROUNDS", 20, minimum=1)
 AUTOMATION_FEEDBACK_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_FEEDBACK_CHARS", 14000, minimum=4000)
-AUTOMATION_CONTEXT_WINDOW_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_TOKENS", 80_000, minimum=32000)
-AUTOMATION_CONTEXT_RESPONSE_RESERVE_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_RESERVE_TOKENS", 16_000, minimum=4000)
-AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_TRIGGER_TOKENS", 45_000, minimum=20000)
+AUTOMATION_CONTEXT_WINDOW_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_TOKENS", 1_000_000, minimum=32000)
+AUTOMATION_CONTEXT_RESPONSE_RESERVE_TOKENS = env_int("AGENT_QT_AUTOMATION_CONTEXT_RESERVE_TOKENS", 32000, minimum=4000)
+AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_TRIGGER_TOKENS", 180000, minimum=20000)
 AUTOMATION_CONTEXT_DISPLAY_TOKENS = env_int(
     "AGENT_QT_AUTOMATION_CONTEXT_DISPLAY_TOKENS",
     AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS,
     minimum=20000,
 )
-AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_RECENT_TOKENS", 24_000, minimum=8000)
-AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_SUMMARY_TOKENS", 18_000, minimum=12000)
-AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 6000, minimum=1200)
-AUTOMATION_CONTEXT_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_CHARS", 60_000, minimum=20_000)
+AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_RECENT_TOKENS", 70000, minimum=8000)
+AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_SUMMARY_TOKENS", 90000, minimum=12000)
+AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 16000, minimum=1200)
 
 
 def is_automation_done_response(text: str) -> bool:
@@ -7982,14 +7981,11 @@ class ChatPage(QWidget):
             plaintext_fence("第二段：历史对话", history_text),
             plaintext_fence("第三段：当前指令", current_prompt),
         ])
-        if len(payload) > AUTOMATION_CONTEXT_CHAR_LIMIT:
-            payload = truncate_middle(payload, AUTOMATION_CONTEXT_CHAR_LIMIT)
         if log_stats:
             logger.warning(
-                "Automation context payload chars=%d tokens=%d char_limit=%d token_budget=%d",
+                "Automation context payload chars=%d tokens=%d token_budget=%d",
                 len(payload),
                 estimate_context_tokens(payload),
-                AUTOMATION_CONTEXT_CHAR_LIMIT,
                 token_budget,
             )
         return payload
