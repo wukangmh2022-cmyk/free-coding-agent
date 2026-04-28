@@ -5241,41 +5241,23 @@ class DeepSeekWebBridge:
                     if not self.can_submit_next_turn(page) and stable_seen < tool_payload_stable_rounds:
                         page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
                         continue
-                if plain_protocol:
-                    for copy_attempt in range(3):
-                        copied = self.try_copy_last_assistant_text(
-                            page,
-                            max_total_ms=max(self.copy_probe_max_ms * 3, 4500),
-                            plain_protocol=True,
-                        )
-                        if copied and self._matches_current_request_response_candidate(copied):
-                            if is_likely_truncated_plain_text(copied):
-                                page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
-                                continue
-                            if trace is not None:
-                                trace.set("response_chars", len(copied))
-                                trace.set("response_ready_reason", "copy_button_plain_stable_text")
-                                trace.set("copy_plain_stable_attempt", copy_attempt + 1)
-                                trace.mark("response_stable")
-                            logger.warning(
-                                "DeepSeek wait_for_response returning stable plain clipboard copy dom_chars=%d copied_chars=%d attempt=%d",
-                                len(current),
-                                len(copied),
-                                copy_attempt + 1,
-                            )
-                            return copied
-                        page.wait_for_timeout(min(self.stable_poll_interval_ms, 300))
                 if trace is not None:
                     trace.set("response_chars", len(current))
                     trace.set("response_ready_reason", "stable_text")
                     trace.mark("response_stable")
                 if plain_protocol and is_likely_truncated_plain_text(current):
-                    logger.warning(
-                        "DeepSeek wait_for_response postponing likely truncated plain text chars=%d",
-                        len(current),
-                    )
-                    page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
-                    continue
+                    if self.can_submit_next_turn(page) and not self.has_continue_generation_button(page):
+                        logger.warning(
+                            "DeepSeek wait_for_response accepting stable plain DOM text despite truncation heuristic; final copy probe may replace it chars=%d",
+                            len(current),
+                        )
+                    else:
+                        logger.warning(
+                            "DeepSeek wait_for_response postponing likely truncated plain text chars=%d",
+                            len(current),
+                        )
+                        page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
+                        continue
                 if self._matches_current_request_response_candidate(current):
                     return current
             page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
