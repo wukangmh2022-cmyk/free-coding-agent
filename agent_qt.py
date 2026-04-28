@@ -142,6 +142,10 @@ def set_automation_enabled_setting(enabled: bool):
     save_app_settings(settings)
 
 
+def developer_error_details_enabled() -> bool:
+    return os.environ.get("AGENT_QT_SHOW_AUTOMATION_TRACEBACK", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def env_int(name: str, default: int, minimum: int = 1) -> int:
     try:
         return max(minimum, int(os.environ.get(name, str(default))))
@@ -2438,6 +2442,11 @@ def text_within_token_budget(text: str, token_limit: int) -> str:
 
 def context_k_label(tokens: int) -> str:
     return f"{max(0, (int(tokens) + 999) // 1000)}k"
+
+
+def looks_like_timeout_error(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(token in lowered for token in ("timed out", "timeout", "超时", "timeouterror"))
 
 
 def build_automation_feedback_prompt(project_root: str, goal: str, execution_log: str, round_number: int, max_rounds: int) -> str:
@@ -7926,10 +7935,15 @@ class ChatPage(QWidget):
                 copy_btn.setEnabled(True)
                 copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
             if error:
-                self.stop_automation_loop("自动化循环已暂停。", ensure_manual_entry=True)
+                is_timeout = looks_like_timeout_error(error)
+                self.stop_automation_loop(
+                    "响应超时，自动化任务已暂停。" if is_timeout else "自动化循环已暂停。",
+                    ensure_manual_entry=True,
+                )
                 if "网页登录还没有准备好" in error:
                     self.add_status_bubble("需要先完成网页登录。请使用设置里的“打开网页登录”，登录后重新发送。")
-                styled_warning(self, "AI 自动化失败", self.automation_manager.error_with_log_hint(error))
+                if not is_timeout or developer_error_details_enabled():
+                    styled_warning(self, "AI 自动化失败", self.automation_manager.error_with_log_hint(error))
             else:
                 self.handle_ai_response_text(text)
             worker.deleteLater()
