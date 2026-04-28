@@ -4153,6 +4153,7 @@ class ChatBubble(QFrame):
         self.markdown = markdown
         self.expand_to_content = expand_to_content
         self.flat = flat
+        self.plain_system_log = flat and role == "system"
         self.show_prompt_input = show_prompt_input
         self.compact_user = compact_user
         self.code_max_height = 260
@@ -4176,7 +4177,9 @@ class ChatBubble(QFrame):
         setattr(self, '_bg', bg)
         setattr(self, '_border', border)
         
-        if self.flat:
+        if self.plain_system_log:
+            self.setStyleSheet("QFrame { background: transparent; border: none; margin: 0; }")
+        elif self.flat:
             self.setStyleSheet("QFrame { background: transparent; border: none; margin: 2px 0; }")
         elif self.compact_user:
             self.setStyleSheet(f"""
@@ -4191,13 +4194,15 @@ class ChatBubble(QFrame):
             self.setStyleSheet(f"QFrame {{ background: {bg}; border: 1px solid {border}; border-radius: 18px; margin: 4px 0; }}")
         
         layout = QVBoxLayout(self)
-        if self.flat:
+        if self.plain_system_log:
+            layout.setContentsMargins(2, 6, 2, 6)
+        elif self.flat:
             layout.setContentsMargins(2, 10, 2, 10)
         elif self.compact_user:
             layout.setContentsMargins(14, 10, 14, 10)
         else:
             layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(6 if self.compact_user else (8 if self.flat else 10))
+        layout.setSpacing(4 if self.plain_system_log else (6 if self.compact_user else (8 if self.flat else 10)))
         
         if self.compact_user:
             self.content_label = QTextBrowser()
@@ -4243,54 +4248,55 @@ class ChatBubble(QFrame):
             self.schedule_content_height_adjustment()
             return
         
-        header = QHBoxLayout()
-        role_label = QLabel(label_text)
-        role_label.setStyleSheet(f"color: {COLORS['text']}; font-weight: 700; font-size: 13px; background: transparent;")
-        header.addWidget(role_label)
-        header.addStretch()
-        if self.show_copy:
-            self.copy_btn = QPushButton(self.copy_text)
-            self.copy_btn.setCursor(Qt.PointingHandCursor)
-            self.copy_btn.setFixedHeight(28)
-            self.copy_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {COLORS['surface']};
-                    color: {COLORS['accent_dark']};
-                    border: 1px solid #d8d0ff;
-                    border-radius: 9px;
-                    padding: 5px 12px;
-                    font-size: 12px;
-                    font-weight: 700;
-                }}
-                QPushButton:hover {{
-                    background: {COLORS['accent_light']};
-                    border-color: {COLORS['accent']};
-                }}
-            """)
-            self.copy_btn.clicked.connect(self.copy_content)
-            header.addWidget(self.copy_btn)
-        if self.show_paste_ai:
-            self.paste_ai_btn = QPushButton("跳过")
-            self.paste_ai_btn.setCursor(Qt.PointingHandCursor)
-            self.paste_ai_btn.setFixedHeight(28)
-            self.paste_ai_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {COLORS['surface']};
-                    color: {COLORS['accent_dark']};
-                    border: 1px solid #d8d0ff;
-                    border-radius: 9px;
-                    padding: 5px 12px;
-                    font-size: 12px;
-                    font-weight: 700;
-                }}
-                QPushButton:hover {{
-                    background: {COLORS['accent_light']};
-                    border-color: {COLORS['accent']};
-                }}
-            """)
-            self.paste_ai_btn.clicked.connect(self.paste_ai_requested.emit)
-            header.addWidget(self.paste_ai_btn)
-        layout.addLayout(header)
+        if not self.plain_system_log:
+            header = QHBoxLayout()
+            role_label = QLabel(label_text)
+            role_label.setStyleSheet(f"color: {COLORS['text']}; font-weight: 700; font-size: 13px; background: transparent;")
+            header.addWidget(role_label)
+            header.addStretch()
+            if self.show_copy:
+                self.copy_btn = QPushButton(self.copy_text)
+                self.copy_btn.setCursor(Qt.PointingHandCursor)
+                self.copy_btn.setFixedHeight(28)
+                self.copy_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {COLORS['surface']};
+                        color: {COLORS['accent_dark']};
+                        border: 1px solid #d8d0ff;
+                        border-radius: 9px;
+                        padding: 5px 12px;
+                        font-size: 12px;
+                        font-weight: 700;
+                    }}
+                    QPushButton:hover {{
+                        background: {COLORS['accent_light']};
+                        border-color: {COLORS['accent']};
+                    }}
+                """)
+                self.copy_btn.clicked.connect(self.copy_content)
+                header.addWidget(self.copy_btn)
+            if self.show_paste_ai:
+                self.paste_ai_btn = QPushButton("跳过")
+                self.paste_ai_btn.setCursor(Qt.PointingHandCursor)
+                self.paste_ai_btn.setFixedHeight(28)
+                self.paste_ai_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {COLORS['surface']};
+                        color: {COLORS['accent_dark']};
+                        border: 1px solid #d8d0ff;
+                        border-radius: 9px;
+                        padding: 5px 12px;
+                        font-size: 12px;
+                        font-weight: 700;
+                    }}
+                    QPushButton:hover {{
+                        background: {COLORS['accent_light']};
+                        border-color: {COLORS['accent']};
+                    }}
+                """)
+                self.paste_ai_btn.clicked.connect(self.paste_ai_requested.emit)
+                header.addWidget(self.paste_ai_btn)
+            layout.addLayout(header)
 
         if self.role == "user" and self.show_prompt_input:
             prompt_row = QHBoxLayout()
@@ -4707,8 +4713,11 @@ class ChatBubble(QFrame):
                 metrics = widget.fontMetrics()
                 text = widget.toPlainText()
                 source_text = str(getattr(widget, "markdown_source", "") or text)
+                widget.document().setTextWidth(max(120, widget.viewport().width() - 10))
+                document_height = int(widget.document().size().height()) + 8
                 target_height = max(
                     34,
+                    document_height,
                     estimate_wrapped_text_height(text, metrics, available_width)
                     + estimate_markdown_table_extra_height(source_text, metrics, available_width),
                 )
@@ -6843,7 +6852,6 @@ class ChatPage(QWidget):
             expand_to_content=True,
             flat=True,
         )
-        frame.stabilize_markdown_height = True
         role_label = frame.findChild(QLabel)
         if role_label is not None:
             role_label.setText("AI 正在回复")
