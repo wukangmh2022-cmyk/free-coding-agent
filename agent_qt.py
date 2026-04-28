@@ -2940,8 +2940,10 @@ def automation_venv_python(root: str) -> str:
 
 def browser_channel_probe_code() -> str:
     return """
+import sys
 from playwright.sync_api import sync_playwright
 channels = ["msedge", "chrome"]
+errors = []
 p = sync_playwright().start()
 try:
     for channel in channels:
@@ -2950,10 +2952,12 @@ try:
             b.close()
             print(channel)
             raise SystemExit(0)
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append(f"{channel}: {str(exc).splitlines()[0] if str(exc) else type(exc).__name__}")
 finally:
     p.stop()
+if errors:
+    print("\\n".join(errors), file=sys.stderr)
 raise SystemExit(1)
 """
 
@@ -3090,6 +3094,9 @@ class AutomationProviderManager:
         except Exception as exc:
             return False, str(exc)
         output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+        if result.returncode != 0:
+            prefix = f"{python_bin} 退出码 {result.returncode}"
+            output = f"{prefix}\n{output}" if output else f"{prefix}，无输出。"
         return result.returncode == 0, output
 
     def dependency_status(self) -> Dict[str, object]:
@@ -3112,6 +3119,7 @@ print(json.dumps({{"missing": missing, "provider_error": ""}}, ensure_ascii=Fals
 raise SystemExit(1 if missing else 0)
 """
         last_output = ""
+        failure_messages = []
         candidates = self.candidate_pythons()
         if not candidates:
             return {
@@ -3123,10 +3131,14 @@ raise SystemExit(1 if missing else 0)
         for python_bin in candidates:
             ok, output = self.run_python_probe(python_bin, probe)
             last_output = output or last_output
+            if not ok:
+                failure_messages.append(f"[{python_bin}]\n{output or 'provider 依赖探测失败，但没有输出。'}")
+                continue
             if ok:
                 browser_ok, browser_output = self.browser_status(python_bin)
                 if not browser_ok:
                     last_output = browser_output or last_output
+                    failure_messages.append(f"[{python_bin}]\n{browser_output or '浏览器探测失败，但没有输出。'}")
                     continue
                 return {
                     "ready": True,
@@ -3149,7 +3161,7 @@ raise SystemExit(1 if missing else 0)
             provider_error = str(payload.get("provider_error") or "")
         except Exception:
             pass
-        message = provider_error or last_output or "依赖检查失败。"
+        message = provider_error or "\n\n".join(failure_messages[-4:]) or last_output or "依赖检查失败。"
         return {
             "ready": False,
             "python": "",
@@ -3174,6 +3186,7 @@ raise SystemExit(1 if missing else 0)
                 os.remove(browser_channel_path)
         except OSError:
             pass
+        channel_detail = channel_output or "未检测到可由 Playwright 启动的系统 Edge/Chrome。"
         probe = """
 from playwright.sync_api import sync_playwright
 p = sync_playwright().start()
@@ -3184,7 +3197,10 @@ finally:
     p.stop()
 print("chromium ok")
 """
-        return self.run_python_probe(python_bin, probe, timeout=60)
+        chromium_ok, chromium_output = self.run_python_probe(python_bin, probe, timeout=60)
+        if chromium_ok:
+            return True, chromium_output
+        return False, f"{channel_detail}\n\nPlaywright Chromium 不可用：\n{chromium_output or '无输出。'}"
 
     def install_dependencies(self, status_callback=None) -> str:
         os.makedirs(self.plugin_root, exist_ok=True)
@@ -3288,7 +3304,7 @@ echo.
 echo [3/3] 检查系统 Edge/Chrome 或安装 Playwright Chromium
 cd /d "{self.backend_dir}"
 set "BROWSER_CHANNEL="
-for /f "usebackq delims=" %%C in (`"%PYTHON_BIN%" -c "{browser_probe}" 2^>nul`) do set "BROWSER_CHANNEL=%%C"
+for /f "usebackq delims=" %C in (`"%PYTHON_BIN%" -c "{browser_probe}" 2^>nul`) do set "BROWSER_CHANNEL=%C"
 if not "%BROWSER_CHANNEL%"=="" (
   echo 使用系统浏览器: %BROWSER_CHANNEL%
   echo %BROWSER_CHANNEL%>"%VENV_DIR%\\..\\browser-channel.txt"
