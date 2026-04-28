@@ -344,7 +344,7 @@ if "%BASE_PYTHON%"=="" (
 if "%BASE_PYTHON%"=="" if exist "%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe"
 if "%BASE_PYTHON%"=="" (
   echo winget 不可用或安装失败，下载 Python 3.12 安装器...
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $u='{WINDOWS_PYTHON_INSTALLER_URL}'; $p=Join-Path $env:TEMP 'agent-qt-python-3.12-installer.exe'; Invoke-WebRequest -Uri $u -OutFile $p; Start-Process -Wait -FilePath $p -ArgumentList '/quiet InstallAllUsers=0 PrependPath=0 Include_pip=1 Include_launcher=1 Include_test=0'"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $u='{WINDOWS_PYTHON_INSTALLER_URL}'; $p=Join-Path $env:TEMP ('agent-qt-python-3.12-' + [guid]::NewGuid().ToString('N') + '.exe'); Invoke-WebRequest -Uri $u -OutFile $p; try {{ Start-Process -Wait -FilePath $p -ArgumentList '/quiet InstallAllUsers=0 PrependPath=0 Include_pip=1 Include_launcher=1 Include_test=0' }} finally {{ Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }}"
 )
 if "%BASE_PYTHON%"=="" (
   for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
@@ -5994,6 +5994,7 @@ class ChatPage(QWidget):
         self.automation_preview_dots_timer.timeout.connect(self.tick_automation_preview_status)
         self.automation_setup_worker: Optional[AutomationSetupWorker] = None
         self.python_runtime_setup_worker: Optional[PythonRuntimeSetupWorker] = None
+        self.python_runtime_install_proc: Optional[ManagedProcess] = None
         self.automation_loop_active = False
         self.automation_loop_round = 0
         self.automation_loop_max_rounds = AUTOMATION_LOOP_MAX_ROUNDS
@@ -6788,11 +6789,21 @@ class ChatPage(QWidget):
         worker.start()
 
     def run_python_runtime_install_terminal(self):
+        if (
+            self.python_runtime_install_proc is not None
+            and self.python_runtime_install_proc.process is not None
+            and self.python_runtime_install_proc.process.state() != QProcess.ProcessState.NotRunning
+        ):
+            styled_warning(self, "Python 运行环境", "已有 Python 环境安装任务正在运行，请等待当前安装结束。")
+            self.terminal_panel.select_process(self.python_runtime_install_proc)
+            self.terminal_panel.expand()
+            return
         cmd = build_python_runtime_install_command()
         cwd = runtime_cache_root()
         os.makedirs(cwd, exist_ok=True)
         proc = self.terminal_panel.add_process(cmd, cwd, "Python 环境安装", interactive=False)
         if proc is not None:
+            self.python_runtime_install_proc = proc
             if proc.process is not None:
                 proc.process.finished.connect(lambda code, _status: self.on_python_runtime_install_terminal_finished(code))
             self.terminal_panel.expand()
@@ -6800,6 +6811,7 @@ class ChatPage(QWidget):
             self.copy_prompt_btn.setText("Python安装中")
 
     def on_python_runtime_install_terminal_finished(self, exit_code: int):
+        self.python_runtime_install_proc = None
         self.update_prompt_tools_responsive()
         if exit_code == 0:
             python_bin = ensure_agent_runtime(create=False)
