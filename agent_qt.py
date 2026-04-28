@@ -2502,6 +2502,132 @@ def plaintext_fence(title: str, content: str) -> str:
     return f"{title}\n{fence}plaintext\n{safe_content}\n{fence}"
 
 
+def automation_context_system_text_for_project(project_root: str) -> str:
+    return SYSTEM_PROMPT.format(
+        project_root=project_root,
+        user_prompt="当前指令见第三段 plaintext，不要把本段当作用户需求重复执行。",
+        done_marker=AUTOMATION_DONE_MARKER,
+        **runtime_environment(),
+    ) + (
+        "\n\n补充说明：provider 每次可能会打开新的网页对话，所以第二段包含 Agent Qt 保存的本会话上下文。"
+        "请把这些上下文视为连续对话历史。上下文按纯文本给出，不是 JSON 或工具调用协议。"
+        f"自动化上下文按 {context_k_label(AUTOMATION_CONTEXT_DISPLAY_TOKENS)} 估算展示；当历史超过约 {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)} 时，"
+        "Agent Qt 会把较早历史 compact 成 plaintext 摘要，近期上下文保留原文后继续。"
+    )
+
+
+def automation_history_text_for_entry_static(entry: Dict[str, object]) -> str:
+    entry_type = str(entry.get("type") or "")
+    content = str(entry.get("context_content") or entry.get("content") or "").strip()
+    if not content:
+        return ""
+    if entry_type == "prompt":
+        match = re.search(r"<!-- agent_qt_user_prompt:([A-Za-z0-9+/=]*) -->\s*$", content)
+        user_text = ""
+        if match:
+            try:
+                user_text = base64.b64decode(match.group(1).encode("ascii")).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                user_text = ""
+        elif PROMPT_BUBBLE_MARKER not in content:
+            user_text = content.strip()
+        if not user_text:
+            return ""
+        return "【用户需求】\n" + truncate_middle(user_text, 2000)
+    if entry_type == "ai":
+        return "【AI 回复】\n" + truncate_middle(content, AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT)
+    if entry_type == "result":
+        return "【本地执行结果和文件变更】\n" + truncate_middle(strip_low_value_context_blocks(content), AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT)
+    return ""
+
+
+def compact_automation_history_chunks_static(chunks: List[str], token_budget: int) -> str:
+    if not chunks:
+        return "（暂无历史对话）"
+    full_text = "\n\n".join(chunks).strip()
+    if estimate_context_tokens(full_text) <= min(token_budget, AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS):
+        return text_within_token_budget(full_text, token_budget)
+
+    recent_reversed: List[str] = []
+    recent_tokens = 0
+    old_count = len(chunks)
+    for index in range(len(chunks) - 1, -1, -1):
+        chunk = chunks[index]
+        chunk_tokens = estimate_context_tokens(chunk)
+        if recent_reversed and recent_tokens + chunk_tokens > AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS:
+            old_count = index + 1
+            break
+        recent_reversed.append(chunk)
+        recent_tokens += chunk_tokens
+        old_count = index
+
+    recent_chunks = list(reversed(recent_reversed))
+    old_text = "\n\n".join(chunks[:old_count]).strip()
+    recent_text = "\n\n".join(recent_chunks).strip()
+    summary_budget = min(
+        AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS,
+        max(4000, token_budget - estimate_context_tokens(recent_text) - 2000),
+    )
+    compact_old = text_within_token_budget(old_text, summary_budget) if old_text else "（无较早历史）"
+    history_text = (
+        "【Compact 历史摘要】\n"
+        "以下是较早对话、执行结果和 diff 的 plaintext 压缩版本；请作为连续上下文参考，不要把它当作新需求重复执行。\n"
+        f"{compact_old}\n\n"
+        "【近期完整历史】\n"
+        f"{recent_text or '（暂无近期历史）'}"
+    )
+    return text_within_token_budget(history_text, token_budget)
+
+
+def build_automation_messages_static(project_root: str, thread_id: str, current_prompt: str, skip_entry_id: str = "") -> List[Dict[str, str]]:
+    system_context = automation_context_system_text_for_project(project_root)
+    current_prompt = str(current_prompt or "").strip()
+    token_budget = max(
+        4000,
+        AUTOMATION_CONTEXT_WINDOW_TOKENS
+        - AUTOMATION_CONTEXT_RESPONSE_RESERVE_TOKENS
+        - estimate_context_tokens(system_context)
+        - estimate_context_tokens(current_prompt),
+    )
+    chunks: List[str] = []
+    for entry in load_workspace_history(project_root, thread_id):
+        if skip_entry_id and str(entry.get("id") or "") == skip_entry_id:
+            continue
+        text = automation_history_text_for_entry_static(entry)
+        if text:
+            chunks.append(text)
+    history_text = compact_automation_history_chunks_static(chunks, token_budget)
+    payload = "\n\n".join([
+        plaintext_fence("第一段：系统提示词", system_context),
+        plaintext_fence("第二段：历史对话", history_text),
+        plaintext_fence("第三段：当前指令", current_prompt),
+    ])
+    logger.warning(
+        "Automation context payload chars=%d tokens=%d token_budget=%d",
+        len(payload),
+        estimate_context_tokens(payload),
+        token_budget,
+    )
+    return [{"role": "user", "content": payload}]
+
+
+def run_automation_chat_helper() -> int:
+    request = json.loads(sys.stdin.read() or "{}")
+    manager = AutomationProviderManager()
+    text = manager.chat(
+        build_automation_messages_static(
+            str(request.get("project_root") or ""),
+            str(request.get("thread_id") or DEFAULT_THREAD_ID),
+            str(request.get("prompt") or ""),
+            str(request.get("skip_entry_id") or ""),
+        ),
+        str(request.get("model") or AUTOMATION_DEFAULT_MODEL),
+        str(request.get("thread_id") or DEFAULT_THREAD_ID),
+    )
+    json.dump({"text": text}, sys.stdout, ensure_ascii=False)
+    return 0
+
+
 def unwrap_provider_text(text: str) -> str:
     """Recover the actual assistant text if a provider still returns a JSON envelope."""
     current = (text or "").strip()
@@ -4544,21 +4670,62 @@ class PythonRuntimeSetupWorker(QThread):
             self.finished_signal.emit(False, str(exc))
 
 
-class AutomationChatWorker(QThread):
+class AutomationChatWorker(QProcess):
     finished_signal = Signal(str, str)
 
-    def __init__(self, manager: AutomationProviderManager, messages: List[Dict[str, str]], model: str, thread_id: str):
+    def __init__(self, project_root: str, prompt: str, model: str, thread_id: str, skip_entry_id: str = ""):
         super().__init__()
-        self.manager = manager
-        self.messages = messages
+        self.project_root = project_root
+        self.prompt = prompt
         self.model = model
         self.thread_id = thread_id
+        self.skip_entry_id = skip_entry_id
+        self._stdout = QByteArray()
+        self._stderr = QByteArray()
+        self.setProgram(sys.executable)
+        self.setArguments([os.path.abspath(__file__), "--agent-qt-chat"])
+        self.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        self.started.connect(self.write_request)
+        self.readyReadStandardOutput.connect(lambda: self._stdout.append(self.readAllStandardOutput()))
+        self.readyReadStandardError.connect(lambda: self._stderr.append(self.readAllStandardError()))
+        self.finished.connect(self.handle_finished)
+        self.errorOccurred.connect(self.handle_error)
 
-    def run(self):
+    def isRunning(self) -> bool:
+        return self.state() != QProcess.ProcessState.NotRunning
+
+    def requestInterruption(self):
+        return
+
+    def wait(self, msecs: int) -> bool:
+        return self.waitForFinished(msecs)
+
+    def write_request(self):
+        payload = {
+            "project_root": self.project_root,
+            "prompt": self.prompt,
+            "model": self.model,
+            "thread_id": self.thread_id,
+            "skip_entry_id": self.skip_entry_id,
+        }
+        self.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        self.closeWriteChannel()
+
+    def handle_error(self, error):
+        if self.state() == QProcess.ProcessState.NotRunning:
+            self.finished_signal.emit("", f"自动化请求进程启动失败: {error}")
+
+    def handle_finished(self, exit_code: int, exit_status):
+        stdout = bytes(self._stdout).decode("utf-8", errors="replace").strip()
+        stderr = bytes(self._stderr).decode("utf-8", errors="replace").strip()
+        if exit_code != 0:
+            self.finished_signal.emit("", stderr or stdout or f"自动化请求进程退出码: {exit_code}")
+            return
         try:
-            self.finished_signal.emit(self.manager.chat(self.messages, self.model, self.thread_id), "")
-        except Exception as exc:
-            self.finished_signal.emit("", str(exc))
+            payload = json.loads(stdout)
+            self.finished_signal.emit(str(payload.get("text") or ""), "")
+        except Exception:
+            self.finished_signal.emit("", stderr or stdout or "自动化请求进程返回格式异常")
 
 
 class AutomationPreviewWorker(QThread):
@@ -7756,6 +7923,7 @@ class ChatPage(QWidget):
         self.automation_preview_last_chars = 0
         self.automation_preview_dots = 0
         self.automation_preview_bubble = self.create_automation_preview_bubble()
+        self.automation_preview_dots_timer.start()
         worker = AutomationPreviewWorker(self.automation_manager, self.automation_model, self.thread_id)
         self.automation_preview_worker = worker
         worker.preview_signal.connect(self.update_automation_preview)
@@ -7793,10 +7961,11 @@ class ChatPage(QWidget):
         status = getattr(bubble, "preview_status", None)
         if status is None:
             return
+        dots = "." * ((self.automation_preview_dots % 3) + 1)
         if self.automation_preview_last_chars > 0:
-            text = f"AI 正在回复... 已生成约 {self.automation_preview_last_chars} 字"
+            text = f"AI 正在回复{dots} 已生成约 {self.automation_preview_last_chars} 字"
         else:
-            text = "AI 正在回复..."
+            text = f"AI 正在回复{dots}"
         if status.text() != text:
             status.setText(text)
 
@@ -8073,12 +8242,12 @@ class ChatPage(QWidget):
             copy_btn.setText("等待 AI...")
         if status_text:
             self.add_status_bubble(status_text)
-        messages = self.build_automation_messages(prompt, skip_entry_id=skip_entry_id)
         worker = AutomationChatWorker(
-            self.automation_manager,
-            messages,
+            self.project_root,
+            prompt,
             self.automation_model,
             self.thread_id,
+            skip_entry_id,
         )
         self.automation_worker = worker
         self.update_automation_composer_state()
@@ -8820,6 +8989,8 @@ class MainWindow(QMainWindow):
         self.chat_page.set_project(path)
 
 def main():
+    if "--agent-qt-chat" in sys.argv:
+        sys.exit(run_automation_chat_helper())
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setFont(QFont("PingFang SC", 13))
