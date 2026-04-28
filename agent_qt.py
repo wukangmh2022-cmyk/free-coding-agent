@@ -4296,14 +4296,36 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         return plugin_python if os.path.exists(plugin_python) else ""
 
     def request_json(self, method: str, path: str, payload: Optional[dict] = None, timeout: int = 30) -> dict:
+        started = time.perf_counter()
+        encode_started = time.perf_counter()
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        encode_ms = int((time.perf_counter() - encode_started) * 1000)
         request = urllib.request.Request(f"{self.base_url}{path}", data=data, method=method)
         if payload is not None:
             request.add_header("Content-Type", "application/json")
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
+            http_started = time.perf_counter()
             with opener.open(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+                raw = response.read()
+            http_ms = int((time.perf_counter() - http_started) * 1000)
+            decode_started = time.perf_counter()
+            decoded = json.loads(raw.decode("utf-8"))
+            decode_ms = int((time.perf_counter() - decode_started) * 1000)
+            total_ms = int((time.perf_counter() - started) * 1000)
+            if total_ms >= 250 or encode_ms >= 80 or decode_ms >= 80:
+                logger.warning(
+                    "Provider request timing method=%s path=%s request_bytes=%d response_bytes=%d encode_ms=%d http_ms=%d decode_ms=%d total_ms=%d",
+                    method,
+                    path,
+                    len(data or b""),
+                    len(raw),
+                    encode_ms,
+                    http_ms,
+                    decode_ms,
+                    total_ms,
+                )
+            return decoded
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             message = detail.strip() or f"HTTP {exc.code}"
@@ -4556,7 +4578,15 @@ class AutomationChatWorker(QThread):
 
     def run(self):
         try:
-            self.finished_signal.emit(self.manager.chat(self.messages, self.model, self.thread_id), "")
+            started = time.perf_counter()
+            text = self.manager.chat(self.messages, self.model, self.thread_id)
+            logger.warning(
+                "Automation chat worker done elapsed_ms=%d message_chars=%d response_chars=%d",
+                int((time.perf_counter() - started) * 1000),
+                sum(len(str(message.get("content") or "")) for message in self.messages),
+                len(text),
+            )
+            self.finished_signal.emit(text, "")
         except Exception as exc:
             self.finished_signal.emit("", str(exc))
 
@@ -4579,7 +4609,16 @@ class AutomationPreviewWorker(QThread):
     def run(self):
         while self._running:
             try:
+                started = time.perf_counter()
                 preview = self.manager.response_preview(self.model, self.thread_id)
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                if elapsed_ms >= 150:
+                    logger.warning(
+                        "Automation preview poll timing elapsed_ms=%d chars=%d source=%s",
+                        elapsed_ms,
+                        int(preview.get("chars") or 0),
+                        str(preview.get("source") or ""),
+                    )
                 signature = (
                     str(preview.get("source") or ""),
                     int(preview.get("chars") or 0),
@@ -6582,6 +6621,11 @@ class ChatPage(QWidget):
         self.automation_preview_dots_timer = QTimer(self)
         self.automation_preview_dots_timer.setInterval(520)
         self.automation_preview_dots_timer.timeout.connect(self.tick_automation_preview_status)
+        self.ui_heartbeat_last = time.perf_counter()
+        self.ui_heartbeat_timer = QTimer(self)
+        self.ui_heartbeat_timer.setInterval(100)
+        self.ui_heartbeat_timer.timeout.connect(self.check_ui_heartbeat)
+        self.ui_heartbeat_timer.start()
         self.automation_setup_worker: Optional[AutomationSetupWorker] = None
         self.python_runtime_setup_worker: Optional[PythonRuntimeSetupWorker] = None
         self.python_runtime_install_proc: Optional[ManagedProcess] = None
@@ -6597,6 +6641,20 @@ class ChatPage(QWidget):
         self.chat_column_width_ratio = 0.94
         self.user_bubble_width_ratio = 0.75
         self.setup_ui()
+
+    def check_ui_heartbeat(self):
+        now = time.perf_counter()
+        delta_ms = int((now - self.ui_heartbeat_last) * 1000)
+        self.ui_heartbeat_last = now
+        if delta_ms >= 280:
+            logger.warning(
+                "UI heartbeat lag delta_ms=%d automation_busy=%s request_running=%s preview_active=%s pending_preview_chars=%d",
+                delta_ms,
+                self.is_automation_busy(),
+                self.is_automation_request_running(),
+                self.automation_preview_bubble is not None,
+                len(self.automation_preview_pending_text or ""),
+            )
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -7785,6 +7843,7 @@ class ChatPage(QWidget):
             self.chat_container.adjustSize()
 
     def update_automation_preview_status(self, chars: Optional[int] = None):
+        started = time.perf_counter()
         bubble = self.automation_preview_bubble
         if bubble is None:
             return
@@ -7799,6 +7858,9 @@ class ChatPage(QWidget):
             text = "AI 正在回复..."
         if status.text() != text:
             status.setText(text)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if elapsed_ms >= 40:
+            logger.warning("Automation preview status UI slow elapsed_ms=%d chars=%d", elapsed_ms, self.automation_preview_last_chars)
 
     def tick_automation_preview_status(self):
         if self.automation_preview_bubble is None:
@@ -7813,6 +7875,7 @@ class ChatPage(QWidget):
             self.automation_preview_render_timer.start(delay)
 
     def flush_automation_preview_render(self):
+        started = time.perf_counter()
         bubble = self.automation_preview_bubble
         if bubble is None:
             return
@@ -7824,8 +7887,12 @@ class ChatPage(QWidget):
         self.automation_preview_last_rendered_text = text
         if should_follow_bottom:
             QTimer.singleShot(0, self.scroll_to_bottom_now)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if elapsed_ms >= 60:
+            logger.warning("Automation preview render UI slow elapsed_ms=%d chars=%d", elapsed_ms, len(text))
 
     def update_automation_preview(self, preview: dict):
+        started = time.perf_counter()
         bubble = self.automation_preview_bubble
         if bubble is None:
             return
@@ -7843,6 +7910,14 @@ class ChatPage(QWidget):
             if text != self.automation_preview_pending_text:
                 self.automation_preview_pending_text = text
                 self.schedule_automation_preview_render()
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if elapsed_ms >= 40:
+            logger.warning(
+                "Automation preview slot UI slow elapsed_ms=%d chars=%d source=%s",
+                elapsed_ms,
+                chars,
+                str(preview.get("source") or ""),
+            )
 
     def build_system_prompt(self, user_text: str) -> str:
         raw_prompt = user_text.strip()
