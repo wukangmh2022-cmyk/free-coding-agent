@@ -55,6 +55,8 @@ jobs:
           assert '"%BASE_PYTHON%" -m venv "%VENV_DIR%"' in plugin_cmd, plugin_cmd
           assert "playwright install chromium" in plugin_cmd, plugin_cmd
           assert "Playwright browser OK" in plugin_cmd, plugin_cmd
+          shell, args = agent_qt.shell_launch_for_command(r"C:\Temp\agent_qt_test.cmd", script_path=r"C:\Temp\agent_qt_test.cmd")
+          assert args[:3] == ["/d", "/c", "call"], (shell, args)
           print("Windows install command checks OK")
           '@ | Set-Content -Path verify_windows_install_commands.py -Encoding UTF8
           python verify_windows_install_commands.py

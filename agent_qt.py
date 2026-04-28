@@ -25,6 +25,7 @@ import urllib.request
 import venv
 import time
 import tempfile
+import locale
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -113,6 +114,10 @@ def set_agent_runtime_enabled(enabled: bool):
     settings = load_app_settings()
     settings["agent_runtime_enabled"] = _AGENT_RUNTIME_ENABLED
     save_app_settings(settings)
+
+
+def agent_runtime_ready() -> bool:
+    return bool(find_existing_runtime_python())
 
 
 def automation_enabled_setting() -> bool:
@@ -483,20 +488,24 @@ def agent_runtime_status_text() -> str:
 def install_agent_python_runtime(status_callback=None) -> str:
     os.makedirs(runtime_cache_root(), exist_ok=True)
     set_agent_runtime_enabled(True)
-    python_bin = ensure_agent_runtime(create=True)
-    if not python_bin:
-        raise RuntimeError(_AGENT_RUNTIME_ERROR or "无法创建 Agent Python 运行环境。")
-    commands = [
-        [python_bin, "-m", "pip", "install", "--upgrade", "pip", *pip_index_args()],
-    ]
-    for command in commands:
-        if status_callback:
-            status_callback("运行: " + " ".join(command[1:]))
-        ok, output = run_runtime_command(command, runtime_cache_root(), timeout=1200)
-        if not ok:
-            raise RuntimeError((output or f"命令失败: {' '.join(command)}")[-3000:])
-    ensure_runtime_shims(python_bin)
-    return python_bin
+    try:
+        python_bin = ensure_agent_runtime(create=True)
+        if not python_bin:
+            raise RuntimeError(_AGENT_RUNTIME_ERROR or "无法创建 Agent Python 运行环境。")
+        commands = [
+            [python_bin, "-m", "pip", "install", "--upgrade", "pip", *pip_index_args()],
+        ]
+        for command in commands:
+            if status_callback:
+                status_callback("运行: " + " ".join(command[1:]))
+            ok, output = run_runtime_command(command, runtime_cache_root(), timeout=1200)
+            if not ok:
+                raise RuntimeError((output or f"命令失败: {' '.join(command)}")[-3000:])
+        ensure_runtime_shims(python_bin)
+        return python_bin
+    except Exception:
+        set_agent_runtime_enabled(False)
+        raise
 
 # ============================================================
 # 系统提示词
@@ -1549,10 +1558,24 @@ def should_use_temp_shell_script(cmd: str) -> bool:
 def write_temp_shell_script(cmd: str) -> str:
     suffix = ".cmd" if platform.system() == "Windows" else ".sh"
     fd, path = tempfile.mkstemp(prefix="agent_qt_", suffix=suffix)
-    newline = "\r\n" if platform.system() == "Windows" else "\n"
-    with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
-        f.write(cmd)
-        if not cmd.endswith(("\n", "\r")):
+    if platform.system() == "Windows":
+        newline = "\r\n"
+        encoding = "utf-8"
+        content = cmd
+        if not content.lstrip().lower().startswith("@echo off"):
+            content = "@echo off\n" + content
+        if "chcp 65001" not in content.lower().splitlines()[:6]:
+            lines = content.splitlines()
+            insert_at = 1 if lines and lines[0].strip().lower() == "@echo off" else 0
+            lines.insert(insert_at, "chcp 65001 >nul")
+            content = "\n".join(lines)
+    else:
+        newline = "\n"
+        encoding = "utf-8"
+        content = cmd
+    with os.fdopen(fd, "w", encoding=encoding, newline=newline) as f:
+        f.write(content)
+        if not content.endswith(("\n", "\r")):
             f.write("\n")
     try:
         os.chmod(path, 0o755)
@@ -1571,6 +1594,29 @@ def shell_launch_args(cmd: str, interactive: bool = False) -> tuple[str, List[st
     if interactive:
         return shell, ["-l"]
     return shell, ["-lc", unbuffer_python_command(cmd)]
+
+
+def shell_launch_for_command(cmd: str, interactive: bool = False, script_path: str = "") -> tuple[str, List[str]]:
+    if platform.system() == "Windows" and script_path:
+        shell = os.environ.get("COMSPEC") or "cmd.exe"
+        return shell, ["/d", "/c", "call", script_path]
+    return shell_launch_args(cmd, interactive=interactive)
+
+
+def decode_process_output(data: bytes) -> str:
+    if not data:
+        return ""
+    encodings = ["utf-8-sig", "utf-8", locale.getpreferredencoding(False), "gb18030"]
+    seen = set()
+    for encoding in encodings:
+        if not encoding or encoding.lower() in seen:
+            continue
+        seen.add(encoding.lower())
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 SNAPSHOT_SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
@@ -3014,8 +3060,8 @@ class ManagedProcess(QWidget):
         launch_cmd = self.cmd
         if not self.interactive and should_use_temp_shell_script(self.cmd):
             self.script_path = write_temp_shell_script(self.cmd)
-            launch_cmd = f'"{self.script_path}"'
-        shell, args = shell_launch_args(launch_cmd, interactive=self.interactive)
+            launch_cmd = self.script_path
+        shell, args = shell_launch_for_command(launch_cmd, interactive=self.interactive, script_path=self.script_path)
         self.process.start(shell, args)
 
     def on_started(self):
@@ -3029,7 +3075,7 @@ class ManagedProcess(QWidget):
     def read_output(self):
         if not self.process:
             return
-        text = self.process.readAllStandardOutput().data().decode('utf-8', errors='replace')
+        text = decode_process_output(self.process.readAllStandardOutput().data())
         if text:
             self.output.append_process_text(text)
 
@@ -6454,6 +6500,8 @@ class ChatPage(QWidget):
         return
 
     def show_settings_menu(self):
+        if agent_runtime_enabled() and not agent_runtime_ready():
+            set_agent_runtime_enabled(False)
         menu = QMenu(self)
         runtime_toggle = SettingsToggleRow(
             "Python 运行环境",
@@ -6461,7 +6509,7 @@ class ChatPage(QWidget):
             agent_runtime_enabled(),
             parent=menu,
         )
-        runtime_toggle.toggled.connect(self.set_python_runtime_enabled)
+        runtime_toggle.toggled.connect(lambda enabled, row=runtime_toggle: self.set_python_runtime_enabled(enabled, row))
         runtime_toggle_action = QWidgetAction(menu)
         runtime_toggle_action.setDefaultWidget(runtime_toggle)
         menu.addAction(runtime_toggle_action)
@@ -6540,7 +6588,18 @@ class ChatPage(QWidget):
     def set_automation_max_rounds(self, rounds: int):
         self.automation_loop_max_rounds = max(1, int(rounds))
 
-    def set_python_runtime_enabled(self, enabled: bool):
+    def set_python_runtime_enabled(self, enabled: bool, toggle_row: Optional[SettingsToggleRow] = None):
+        if enabled and not agent_runtime_ready():
+            set_agent_runtime_enabled(False)
+            if toggle_row is not None:
+                toggle_row.setChecked(False)
+            styled_warning(
+                self,
+                "Python 运行环境",
+                "Agent Python 运行环境尚未安装。已开始创建/修复环境，安装成功后才会启用这个开关。",
+            )
+            self.run_python_runtime_setup("install")
+            return
         set_agent_runtime_enabled(enabled)
         self.refresh_prompt_bubble_buttons()
         self.update_prompt_tools_responsive()
@@ -6729,7 +6788,6 @@ class ChatPage(QWidget):
         worker.start()
 
     def run_python_runtime_install_terminal(self):
-        set_agent_runtime_enabled(True)
         cmd = build_python_runtime_install_command()
         cwd = runtime_cache_root()
         os.makedirs(cwd, exist_ok=True)
@@ -6747,6 +6805,13 @@ class ChatPage(QWidget):
             python_bin = ensure_agent_runtime(create=False)
             if python_bin:
                 ensure_runtime_shims(python_bin)
+                set_agent_runtime_enabled(True)
+                self.refresh_prompt_bubble_buttons()
+                self.update_prompt_tools_responsive()
+                return
+        set_agent_runtime_enabled(False)
+        self.refresh_prompt_bubble_buttons()
+        self.update_prompt_tools_responsive()
 
     def run_automation_setup(self, action: str):
         if action == "install":
