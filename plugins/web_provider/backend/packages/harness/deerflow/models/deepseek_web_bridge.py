@@ -2264,7 +2264,7 @@ class DeepSeekWebBridge:
         )
         trace.mark("submit_prompt_done")
         parse_started = time.perf_counter()
-        payload = self.parse_model_payload(raw_text)
+        payload = self.parse_model_payload(raw_text, output_protocol=output_protocol)
         trace.set("parse_model_payload_ms", int((time.perf_counter() - parse_started) * 1000))
         trace.mark("payload_parsed")
         trace.set("mark_count", len(trace.marks))
@@ -3606,7 +3606,7 @@ class DeepSeekWebBridge:
                 logger.exception("DeepSeek web bridge request failed.")
                 raise
 
-    def parse_model_payload(self, raw_text: str) -> dict[str, Any]:
+    def parse_model_payload(self, raw_text: str, *, output_protocol: str = "openai") -> dict[str, Any]:
         payload: dict[str, Any] | None = None
         stripped = raw_text.strip()
 
@@ -3623,6 +3623,9 @@ class DeepSeekWebBridge:
         if is_low_signal_assistant_payload_text(stripped):
             logger.warning("DeepSeek parse_model_payload suppressed low-signal protocol ack from model output path.")
             return {"content": "", "tool_calls": [], "raw_text": raw_text, "parse_error": "low_signal_payload"}
+
+        if output_protocol == "plain":
+            return {"content": stripped, "tool_calls": [], "raw_text": raw_text}
 
         if stripped.startswith("{"):
             try:
