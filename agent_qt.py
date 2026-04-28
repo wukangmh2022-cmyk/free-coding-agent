@@ -314,97 +314,135 @@ def posix_join(args: List[str]) -> str:
     return " ".join(shlex.quote(str(arg)) for arg in args if str(arg))
 
 
-def cmd_arg(arg: str) -> str:
-    return '"' + str(arg).replace('"', r'\"') + '"'
-
-
-def cmd_join(args: List[str]) -> str:
-    return " ".join(cmd_arg(str(arg)) for arg in args if str(arg))
-
-
 WINDOWS_PYTHON_INSTALLER_URL = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
 
 
-def windows_python_bootstrap_batch() -> str:
-    return f"""set "BASE_PYTHON="
-set "BASE_PYTHON_DIR={os.path.join(runtime_cache_root(), 'python312')}"
-if exist "!BASE_PYTHON_DIR!\\python.exe" set "BASE_PYTHON=!BASE_PYTHON_DIR!\\python.exe"
-if "!BASE_PYTHON!"=="" if exist "!VENV_DIR!\\..\\python312\\python.exe" set "BASE_PYTHON=!VENV_DIR!\\..\\python312\\python.exe"
-for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
-if "!BASE_PYTHON!"=="" (
-  for /f "usebackq delims=" %%P in (`python -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
-)
-if "!BASE_PYTHON!"=="" (
-  echo 未找到 Python 3.9+，尝试安装用户级 Python 3.12...
-  where winget >nul 2>nul
-  if not errorlevel 1 (
-    winget install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements
-  )
-)
-if "!BASE_PYTHON!"=="" (
-  for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
-)
-if "!BASE_PYTHON!"=="" if exist "!LOCALAPPDATA!\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=!LOCALAPPDATA!\\Programs\\Python\\Python312\\python.exe"
-if "!BASE_PYTHON!"=="" (
-  echo winget 不可用或安装后仍未定位到 Python，安装独立 Python 到缓存目录...
-  if not exist "!BASE_PYTHON_DIR!" mkdir "!BASE_PYTHON_DIR!"
-  set "PYTHON_INSTALLER=!TEMP!\\agent-qt-python-3.12-!RANDOM!!RANDOM!.exe"
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{WINDOWS_PYTHON_INSTALLER_URL}' -OutFile $env:PYTHON_INSTALLER"
-  if errorlevel 1 (
-    echo Python 安装器下载失败。
-    del /f /q "!PYTHON_INSTALLER!" >nul 2>nul
-    exit /b 1
-  )
-  "!PYTHON_INSTALLER!" /quiet InstallAllUsers=0 TargetDir="!BASE_PYTHON_DIR!" PrependPath=0 Include_pip=1 Include_launcher=0 Include_test=0
-  set "PYTHON_INSTALL_EXIT=!ERRORLEVEL!"
-  del /f /q "!PYTHON_INSTALLER!" >nul 2>nul
-  if not "!PYTHON_INSTALL_EXIT!"=="0" if not "!PYTHON_INSTALL_EXIT!"=="3010" (
-    echo Python 安装器失败，退出码: !PYTHON_INSTALL_EXIT!
-    exit /b 1
-  )
-)
-if "!BASE_PYTHON!"=="" (
-  for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
-)
-if "!BASE_PYTHON!"=="" if exist "!BASE_PYTHON_DIR!\\python.exe" set "BASE_PYTHON=!BASE_PYTHON_DIR!\\python.exe"
-if "!BASE_PYTHON!"=="" if exist "!LOCALAPPDATA!\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=!LOCALAPPDATA!\\Programs\\Python\\Python312\\python.exe"
-if "!BASE_PYTHON!"=="" (
-  echo 无法安装或定位 Python 3.9+。
-  exit /b 1
-)
-"""
+def ps_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
 
+
+def ps_array(args: List[str]) -> str:
+    return "@(" + ", ".join(ps_quote(str(arg)) for arg in args) + ")"
+
+
+def windows_python_bootstrap_powershell() -> str:
+    base_python_dir = os.path.join(runtime_cache_root(), "python312")
+    return f"""
+$BasePython = $null
+$BasePythonDir = {ps_quote(base_python_dir)}
+
+function Test-AgentQtPython($Path) {{
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {{ return $false }}
+    & $Path -c "import sys; raise SystemExit(sys.version_info < (3, 9))" *> $null
+    return $LASTEXITCODE -eq 0
+}}
+
+function Use-AgentQtPython($Path) {{
+    if (Test-AgentQtPython $Path) {{
+        $script:BasePython = (Resolve-Path -LiteralPath $Path).Path
+        return $true
+    }}
+    return $false
+}}
+
+$candidatePaths = @(
+    (Join-Path $BasePythonDir 'python.exe'),
+    (Join-Path (Join-Path $VenvDir '..') 'python312\\python.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\\Python\\Python312\\python.exe')
+)
+foreach ($candidate in $candidatePaths) {{
+    if (Use-AgentQtPython $candidate) {{ break }}
+}}
+
+if (-not $BasePython) {{
+    $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($pyLauncher) {{
+        $candidate = (& py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2>$null).Trim()
+        if ($candidate) {{ Use-AgentQtPython $candidate | Out-Null }}
+    }}
+}}
+
+if (-not $BasePython) {{
+    $pythonOnPath = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonOnPath) {{
+        $candidate = (& python -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2>$null).Trim()
+        if ($candidate) {{ Use-AgentQtPython $candidate | Out-Null }}
+    }}
+}}
+
+if (-not $BasePython) {{
+    Write-Host "未找到 Python 3.9+，尝试通过 winget 安装用户级 Python 3.12..."
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {{
+        & winget install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements
+        $candidate = (& py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2>$null).Trim()
+        if ($candidate) {{ Use-AgentQtPython $candidate | Out-Null }}
+        if (-not $BasePython) {{
+            Use-AgentQtPython (Join-Path $env:LOCALAPPDATA 'Programs\\Python\\Python312\\python.exe') | Out-Null
+        }}
+    }}
+}}
+
+if (-not $BasePython) {{
+    Write-Host "winget 不可用或安装后仍未定位到 Python，安装独立 Python 到缓存目录..."
+    New-Item -ItemType Directory -Force -Path $BasePythonDir | Out-Null
+    $installer = Join-Path $env:TEMP ("agent-qt-python-3.12-" + [guid]::NewGuid().ToString("N") + ".exe")
+    try {{
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri {ps_quote(WINDOWS_PYTHON_INSTALLER_URL)} -OutFile $installer
+        & $installer /quiet InstallAllUsers=0 TargetDir="$BasePythonDir" PrependPath=0 Include_pip=1 Include_launcher=0 Include_test=0
+        $installExit = $LASTEXITCODE
+        if ($installExit -ne 0 -and $installExit -ne 3010) {{
+            throw "Python 安装器失败，退出码: $installExit"
+        }}
+    }} finally {{
+        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+    }}
+    Use-AgentQtPython (Join-Path $BasePythonDir 'python.exe') | Out-Null
+}}
+
+if (-not $BasePython) {{
+    throw "无法安装或定位 Python 3.9+。"
+}}
+"""
 
 def build_python_runtime_install_command() -> str:
     pip_args_posix = posix_join(pip_index_args())
-    pip_args_cmd = cmd_join(pip_index_args())
     venv_dir = runtime_venv_root()
     python_bin = runtime_python_in_root(venv_dir)
     if platform.system() == "Windows":
-        return f"""@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-set "PYTHONUTF8=1"
-set "PYTHONUNBUFFERED=1"
-set "PIP_DISABLE_PIP_VERSION_CHECK=1"
-set "VENV_DIR={venv_dir}"
-set "PYTHON_BIN={python_bin}"
-echo [Agent Qt] 创建/修复 Agent Python 环境
-echo 缓存目录: {runtime_cache_root()}
-if not exist "%VENV_DIR%" mkdir "%VENV_DIR%"
-if not exist "%PYTHON_BIN%" (
-  echo 创建虚拟环境...
-  {windows_python_bootstrap_batch()}
-  "!BASE_PYTHON!" -m venv "!VENV_DIR!" || exit /b 1
-)
-echo.
-echo 升级 pip
-"%PYTHON_BIN%" -m pip install --upgrade pip {pip_args_cmd} || exit /b 1
-echo.
-echo 验证 Python...
-"%PYTHON_BIN%" -c "import sys; print('Python OK:', sys.executable)" || exit /b 1
-echo.
-echo Python 运行环境安装完成: %PYTHON_BIN%
-echo 后续具体任务需要的库会由 Agent 按需 pip install 到这个环境。
+        return POWERSHELL_COMMAND_PREFIX + f"""$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONUTF8 = '1'
+$env:PYTHONUNBUFFERED = '1'
+$env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
+$VenvDir = {ps_quote(venv_dir)}
+$PythonBin = {ps_quote(python_bin)}
+$PipIndexArgs = {ps_array(pip_index_args())}
+
+Write-Host "[Agent Qt] 创建/修复 Agent Python 环境"
+Write-Host "缓存目录: {runtime_cache_root()}"
+New-Item -ItemType Directory -Force -Path $VenvDir | Out-Null
+if (-not (Test-Path -LiteralPath $PythonBin -PathType Leaf)) {{
+    Write-Host "创建虚拟环境..."
+    {windows_python_bootstrap_powershell()}
+    & $BasePython -m venv $VenvDir
+    if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+}}
+
+Write-Host ""
+Write-Host "升级 pip"
+& $PythonBin -m pip install --upgrade pip @PipIndexArgs
+if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+
+Write-Host ""
+Write-Host "验证 Python..."
+& $PythonBin -c "import sys; print('Python OK:', sys.executable)"
+if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+
+Write-Host ""
+Write-Host "Python 运行环境安装完成: $PythonBin"
+Write-Host "后续具体任务需要的库会由 Agent 按需 pip install 到这个环境。"
 """
     return f"""set -e
 export PYTHONUTF8=1
@@ -531,26 +569,31 @@ def install_agent_python_runtime(status_callback=None) -> str:
 SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 
 ## 协议说明
-本 Agent 采用"占位符 + 代码块"协议：你在 Bash 指令中用注释占位符（如 <!-- HTML block -->）替代大段代码，
-然后将完整代码放在对应的 Markdown 代码块中。Agent 会先缓存所有代码块，再依次执行 Bash 指令并自动替换占位符。
+本 Agent 采用"占位符 + 代码块"协议：你在命令代码块中用注释占位符（如 <!-- HTML block -->）替代大段代码，
+然后将完整代码放在对应的 Markdown 代码块中。Agent 会先缓存所有代码块，再执行命令代码块并自动替换占位符。
 这样既能保持指令清晰，又能直接写入完整文件。
 
 ## 当前运行环境
 - 操作系统: {os_name}
 - 平台标识: {platform_id}
 - 默认 Shell: {shell_name}
+- 本轮命令工具: {command_shell_name}
+- 命令执行方式: {command_execution}
+- 命令代码块语言: {command_block_lang}
 - 路径风格: {path_style}
 - Python 运行时: {python_runtime}
-- **重要：所有 Bash/命令行指令必须匹配当前操作系统，不要输出其他系统的命令。**
+- **重要：所有命令行指令必须匹配当前操作系统和本轮命令工具，不要输出其他系统或其他 shell 的命令。**
+- **Windows 特别重要：如果命令代码块语言是 powershell，就只能写 PowerShell；不要混用 cmd/bat 或 bash。**
 
 ## 推理要求
 - Reasoning Effort: absolute maximum with no shortcuts permitted. You must thoroughly decompose the task, identify the root cause, and stress-test the solution against likely paths, edge cases, and adversarial scenarios before answering.
 - 输出时不要展开隐藏思考链；只给出关键判断、可验证依据、最终方案和必要的执行指令。
 
 ## 输出规则
-1. **所有 Bash 指令放在一个 Markdown fenced bash 代码块中**，不要拆分多个 Bash 块。
+1. **所有命令放在一个 Markdown fenced `{command_block_lang}` 代码块中**，不要拆分多个命令块。
    - 不要输出 JSON 对象，不要输出 content/tool_calls 包装，不要使用结构化工具调用协议。
-   - 不要把 `bash` 作为普通正文单独输出；语言标识只能写在 Markdown 代码围栏里。
+   - 不要把 `{command_block_lang}` 作为普通正文单独输出；语言标识只能写在 Markdown 代码围栏里。
+   - {command_rules}
 2. 大段文件内容用占位符替代，支持的占位符：
    - <!-- HTML block --> 对应 html 代码块
    - <!-- CSS block --> 或 /* CSS block */ 对应 css 代码块
@@ -561,14 +604,14 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
    - <!-- YAML block --> 对应 yaml 代码块
    - <!-- TypeScript block --> 对应 typescript/ts 代码块
    - <!-- 其他任意类型 block --> 对应该类型名的代码块（如 svg/xml/toml 等）
-3. 各代码块在 Bash 块之后单独给出。
+3. 各代码块在命令块之后单独给出。
 4. 指令按顺序排列，先创建目录再写文件，确保可直接执行。
 5. 项目根目录: {project_root}，所有路径使用绝对路径。
-6. **重要：一个 Bash 块包含所有指令，不要输出多个 Bash 块。**
+6. **重要：一个命令块包含所有指令，不要输出多个命令块。**
 7. **重要：二选一的操作只保留一种**（如启动服务器 OR 手动打开，选前者）。
 8. 安装依赖用 pip install，启动后端用 python server.py 或 python3 -m http.server。
 9. 常驻进程命令（python server.py 等）会自动进入后台终端，不要加 & 或 nohup。
-10. 自动化循环中，如果根据执行日志判断任务已经完成，不要再输出 Bash，回复 `{done_marker}` 加简短总结即可；如果未完成，继续输出下一轮完整 Bash 指令。
+10. 自动化循环中，如果根据执行日志判断任务已经完成，不要再输出命令块，回复 `{done_marker}` 加简短总结即可；如果未完成，继续输出下一轮完整命令块。
 
 ---
 
@@ -589,6 +632,7 @@ FORBIDDEN = [
     "rm -rf /", "sudo rm", "sudo reboot", "shutdown",
     "mkfs", "dd if=", ":(){ :|:& };:",
 ]
+POWERSHELL_COMMAND_PREFIX = "__AGENT_QT_POWERSHELL__\n"
 
 COLORS = {
     "bg": "#f6f7fb",
@@ -1188,20 +1232,51 @@ def close_icon(color: str = "#657089", size: int = 16) -> QIcon:
 # 工具函数
 # ============================================================
 def is_safe(cmd: str) -> bool:
+    cmd = strip_shell_command_marker(cmd)
     for bad in FORBIDDEN:
         if bad in cmd:
             return False
     return True
 
+def is_powershell_command(cmd: str) -> bool:
+    return str(cmd or "").startswith(POWERSHELL_COMMAND_PREFIX)
+
+def strip_shell_command_marker(cmd: str) -> str:
+    if is_powershell_command(cmd):
+        return str(cmd)[len(POWERSHELL_COMMAND_PREFIX):]
+    return str(cmd or "")
+
 def runtime_environment() -> Dict[str, str]:
     system = platform.system() or sys.platform
     path_style = "Windows paths (C:\\...)" if system == "Windows" else "POSIX paths (/Users/... 或 /home/...)"
+    if system == "Windows":
+        command_block_lang = "powershell"
+        command_shell_name = "PowerShell"
+        command_execution = "PowerShell 脚本文件（powershell.exe -NoProfile -ExecutionPolicy Bypass -File 临时 .ps1）"
+        command_rules = (
+            "Windows 环境必须输出一个 ```powershell 代码块，内容使用 Windows PowerShell 5.1 兼容语法。"
+            "不要输出 bash/sh 语法，不要使用 cat <<EOF/heredoc、chmod、rm -rf、export、source、nohup、& 后台符号或 POSIX 路径。"
+            "写文件优先使用 New-Item -ItemType Directory -Force、Set-Content -Encoding UTF8、PowerShell here-string；"
+            "切换目录用 Set-Location -LiteralPath；路径使用 C:\\... 或 Join-Path。"
+        )
+    else:
+        command_block_lang = "bash"
+        command_shell_name = os.environ.get("SHELL") or "/bin/sh"
+        command_execution = "Bash/POSIX shell 脚本"
+        command_rules = (
+            "macOS/Linux 环境必须输出一个 ```bash 代码块，内容使用 POSIX shell/bash 语法。"
+            "不要输出 Windows cmd/PowerShell 专用语法。"
+        )
     return {
         "os_name": system,
         "platform_id": sys.platform,
         "shell_name": os.environ.get("SHELL") or os.environ.get("COMSPEC") or "unknown",
         "path_style": path_style,
         "python_runtime": agent_runtime_description(),
+        "command_block_lang": command_block_lang,
+        "command_shell_name": command_shell_name,
+        "command_execution": command_execution,
+        "command_rules": command_rules,
     }
 
 LANG_ALIASES = {
@@ -1213,6 +1288,12 @@ LANG_ALIASES = {
     "yml": ("yml", "yaml"),
     "python": ("python", "py"),
     "py": ("py", "python"),
+    "powershell": ("powershell", "ps1", "pwsh"),
+    "ps1": ("ps1", "powershell", "pwsh"),
+    "pwsh": ("pwsh", "powershell", "ps1"),
+    "cmd": ("cmd", "bat", "batch"),
+    "bat": ("bat", "cmd", "batch"),
+    "batch": ("batch", "cmd", "bat"),
     "bash": ("bash", "sh", "shell", "zsh"),
     "sh": ("sh", "bash", "shell", "zsh"),
     "shell": ("shell", "bash", "sh", "zsh"),
@@ -1391,6 +1472,7 @@ def has_unclosed_shell_quote(text: str) -> bool:
 
 
 def is_interactive_shell_command(cmd: str) -> bool:
+    cmd = strip_shell_command_marker(cmd)
     normalized = " ".join((cmd or "").strip().split()).lower()
     return normalized in {
         "bash",
@@ -1407,14 +1489,14 @@ def is_interactive_shell_command(cmd: str) -> bool:
 
 
 def looks_like_raw_shell_script(text: str) -> bool:
-    """仅在用户粘贴的是纯命令片段时，才允许无 fenced bash 的兼容模式。"""
+    """仅在用户粘贴的是纯命令片段时，才允许无 fenced 命令块的兼容模式。"""
     stripped = (text or "").strip()
     if not stripped or "```" in stripped:
         return False
     lines = [line.strip() for line in stripped.splitlines() if line.strip()]
     if not lines:
         return False
-    if lines[0].lower() in {"bash", "sh", "shell", "zsh"}:
+    if lines[0].lower() in {"bash", "sh", "shell", "zsh", "powershell", "pwsh", "cmd"}:
         return False
     shell_starters = (
         "$ ",
@@ -1455,21 +1537,34 @@ def looks_like_raw_shell_script(text: str) -> bool:
         return False
     return commandish > 0
 
+def command_block_from_blocks(blocks: Dict[str, List[str]]) -> tuple[str, str]:
+    if platform.system() == "Windows":
+        powershell_text = get_code_block(blocks, "powershell") or get_code_block(blocks, "ps1") or get_code_block(blocks, "pwsh") or ""
+        if powershell_text:
+            return powershell_text, "powershell"
+        cmd_text = get_code_block(blocks, "cmd") or get_code_block(blocks, "bat") or get_code_block(blocks, "batch") or ""
+        if cmd_text:
+            return cmd_text, "cmd"
+    return get_code_block(blocks, "bash") or "", "bash"
+
+
 def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
-    """提取 Bash 命令并替换占位符"""
-    bash_text = get_code_block(blocks, 'bash') or ''
-    if not bash_text:
+    """提取当前平台命令块并替换占位符。"""
+    command_text, command_lang = command_block_from_blocks(blocks)
+    if not command_text:
         plain_block = get_code_block(blocks, "text") or ""
         if plain_block and looks_like_raw_shell_script(plain_block):
-            bash_text = plain_block
+            command_text = plain_block
         elif not looks_like_raw_shell_script(text):
             return []
         else:
-            bash_text = text
-    if not bash_text:
+            command_text = text
+    if not command_text:
         return []
-    bash_text = resolve_all_placeholders(bash_text, blocks)
-    lines = bash_text.strip().splitlines()
+    command_text = resolve_all_placeholders(command_text, blocks)
+    if command_lang == "powershell":
+        return [POWERSHELL_COMMAND_PREFIX + command_text.strip()] if command_text.strip() else []
+    lines = command_text.strip().splitlines()
     cmds = []
     i = 0
     while i < len(lines):
@@ -1505,6 +1600,7 @@ def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
     return cmds
 
 def is_long_running(cmd: str) -> bool:
+    cmd = strip_shell_command_marker(cmd)
     detection_cmd = strip_heredoc_bodies_for_detection(cmd).strip() or cmd
     command_text = detection_cmd.lower()
     first_line = detection_cmd.splitlines()[0].lower().strip() if detection_cmd.splitlines() else ""
@@ -1550,6 +1646,7 @@ def is_long_running(cmd: str) -> bool:
 
 def command_for_log(cmd: str) -> str:
     """日志里压缩 heredoc 正文，避免执行结果面板被文件内容淹没。"""
+    cmd = strip_shell_command_marker(cmd)
     lines = cmd.splitlines()
     if len(lines) <= 8:
         return cmd
@@ -1574,9 +1671,14 @@ def should_use_temp_shell_script(cmd: str) -> bool:
     return platform.system() == "Windows" and "\n" in (cmd or "")
 
 def write_temp_shell_script(cmd: str) -> str:
-    suffix = ".cmd" if platform.system() == "Windows" else ".sh"
+    is_ps = is_powershell_command(cmd)
+    suffix = ".ps1" if is_ps else (".cmd" if platform.system() == "Windows" else ".sh")
     fd, path = tempfile.mkstemp(prefix="agent_qt_", suffix=suffix)
-    if platform.system() == "Windows":
+    if is_ps:
+        newline = "\r\n"
+        encoding = "utf-8-sig"
+        content = strip_shell_command_marker(cmd)
+    elif platform.system() == "Windows":
         newline = "\r\n"
         encoding = "utf-8"
         content = cmd
@@ -1615,10 +1717,42 @@ def shell_launch_args(cmd: str, interactive: bool = False) -> tuple[str, List[st
 
 
 def shell_launch_for_command(cmd: str, interactive: bool = False, script_path: str = "") -> tuple[str, List[str]]:
+    if platform.system() == "Windows" and script_path and is_powershell_command(cmd):
+        shell = shutil.which("powershell.exe") or shutil.which("powershell") or "powershell.exe"
+        return shell, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path]
     if platform.system() == "Windows" and script_path:
         shell = os.environ.get("COMSPEC") or "cmd.exe"
         return shell, ["/d", "/c", "call", script_path]
     return shell_launch_args(cmd, interactive=interactive)
+
+
+def run_shell_command_capture(cmd: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    if platform.system() == "Windows" and is_powershell_command(cmd):
+        script_path = write_temp_shell_script(cmd)
+        shell, args = shell_launch_for_command(cmd, script_path=script_path)
+        try:
+            return subprocess.run(
+                [shell, *args],
+                cwd=cwd,
+                env=agent_runtime_env(create=False),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        finally:
+            try:
+                os.remove(script_path)
+            except OSError:
+                pass
+    return subprocess.run(
+        strip_shell_command_marker(cmd),
+        shell=True,
+        cwd=cwd,
+        env=agent_runtime_env(create=False),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
 
 
 def decode_process_output(data: bytes) -> str:
@@ -3075,11 +3209,9 @@ class ManagedProcess(QWidget):
         self.process.started.connect(self.on_started)
         self.process.errorOccurred.connect(self.on_error)
         self.process.finished.connect(self.on_finished)
-        launch_cmd = self.cmd
         if not self.interactive and should_use_temp_shell_script(self.cmd):
             self.script_path = write_temp_shell_script(self.cmd)
-            launch_cmd = self.script_path
-        shell, args = shell_launch_for_command(launch_cmd, interactive=self.interactive, script_path=self.script_path)
+        shell, args = shell_launch_for_command(self.cmd, interactive=self.interactive, script_path=self.script_path)
         self.process.start(shell, args)
 
     def on_started(self):
@@ -3088,7 +3220,7 @@ class ManagedProcess(QWidget):
             self.output.set_input_enabled(True)
         else:
             self.output.set_input_enabled(False)
-            self.output.append_process_text(f"$ {self.cmd}\n# cwd: {self.cwd}\n")
+            self.output.append_process_text(f"$ {strip_shell_command_marker(self.cmd)}\n# cwd: {self.cwd}\n")
 
     def read_output(self):
         if not self.process:
@@ -3520,15 +3652,7 @@ class ExecuteWorker(QThread):
                 self.output_signal.emit(outputs[-1])
                 continue
             try:
-                r = subprocess.run(
-                    cmd,
-                    shell=True,
-                    cwd=cwd,
-                    env=agent_runtime_env(create=False),
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
+                r = run_shell_command_capture(cmd, cwd, timeout=30)
                 out = r.stdout.strip()
                 if r.stderr.strip():
                     out += "\n" + r.stderr.strip()
@@ -3927,56 +4051,73 @@ print("chromium ok")
         ]
         browser_probe = python_exec_base64_code(browser_channel_probe_code())
         if platform.system() == "Windows":
-            return f"""@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-set "PYTHONUTF8=1"
-set "PYTHONUNBUFFERED=1"
-set "PIP_DISABLE_PIP_VERSION_CHECK=1"
-set "PYTHONPATH={self.harness_path()};%PYTHONPATH%"
-set "VENV_DIR={venv_dir}"
-set "PYTHON_BIN={python_bin}"
-echo [Agent Qt] 安装/修复自动化插件依赖
-echo 插件目录: {plugin_root}
-echo Provider 源码: {self.backend_dir or '未找到'}
-if "{self.backend_dir}"=="" (
-  echo 未找到 provider 源码。
-  exit /b 1
-)
-if not exist "%VENV_DIR%" mkdir "%VENV_DIR%"
-if not exist "%PYTHON_BIN%" (
-  echo 创建插件虚拟环境...
-  {windows_python_bootstrap_batch()}
-  "!BASE_PYTHON!" -m venv "!VENV_DIR!" || exit /b 1
-)
-echo.
-echo [1/3] 升级 pip
-"%PYTHON_BIN%" -m pip install {cmd_join(pip_index_args())} --upgrade pip || exit /b 1
-echo.
-echo [2/3] 安装 provider Python 依赖
-"%PYTHON_BIN%" -m pip install {cmd_join(pip_index_args())} {cmd_join(package_args)} || exit /b 1
-echo.
-echo [3/3] 检查系统 Edge/Chrome 或安装 Playwright Chromium
-cd /d "{self.backend_dir}"
-set "BROWSER_CHANNEL="
-for /f "usebackq delims=" %%C in (`"%PYTHON_BIN%" -c "{browser_probe}" 2^>nul`) do set "BROWSER_CHANNEL=%%C"
-if not "%BROWSER_CHANNEL%"=="" (
-  echo 使用系统浏览器: %BROWSER_CHANNEL%
-  echo %BROWSER_CHANNEL%>"%VENV_DIR%\\..\\browser-channel.txt"
-) else (
-  "%PYTHON_BIN%" -m playwright install chromium || exit /b 1
-)
-echo.
-echo 验证 provider 模块...
-"%PYTHON_BIN%" -c "import app.deepseek_local_provider; print('自动化插件依赖 OK')" || exit /b 1
-echo.
-echo 验证 Playwright 浏览器...
-if not "%BROWSER_CHANNEL%"=="" (
-  "%PYTHON_BIN%" -c "from playwright.sync_api import sync_playwright; import os; p=sync_playwright().start(); b=p.chromium.launch(channel=os.environ['BROWSER_CHANNEL'], headless=True); b.close(); p.stop(); print('Playwright browser OK: ' + os.environ['BROWSER_CHANNEL'])" || exit /b 1
-) else (
-  "%PYTHON_BIN%" -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); b.close(); p.stop(); print('Playwright browser OK: chromium')" || exit /b 1
-)
-echo.
-echo 自动化插件依赖安装完成: %PYTHON_BIN%
+            return POWERSHELL_COMMAND_PREFIX + f"""$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONUTF8 = '1'
+$env:PYTHONUNBUFFERED = '1'
+$env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
+$env:PYTHONPATH = {ps_quote(self.harness_path())} + [IO.Path]::PathSeparator + $env:PYTHONPATH
+$VenvDir = {ps_quote(venv_dir)}
+$PythonBin = {ps_quote(python_bin)}
+$PluginRoot = {ps_quote(plugin_root)}
+$BackendDir = {ps_quote(self.backend_dir)}
+$PipIndexArgs = {ps_array(pip_index_args())}
+$PackageArgs = {ps_array(package_args)}
+
+Write-Host "[Agent Qt] 安装/修复自动化插件依赖"
+Write-Host "插件目录: $PluginRoot"
+Write-Host "Provider 源码: {self.backend_dir or '未找到'}"
+if (-not $BackendDir) {{
+    throw "未找到 provider 源码。"
+}}
+
+New-Item -ItemType Directory -Force -Path $VenvDir | Out-Null
+if (-not (Test-Path -LiteralPath $PythonBin -PathType Leaf)) {{
+    Write-Host "创建插件虚拟环境..."
+    {windows_python_bootstrap_powershell()}
+    & $BasePython -m venv $VenvDir
+    if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+}}
+
+Write-Host ""
+Write-Host "[1/3] 升级 pip"
+& $PythonBin -m pip install @PipIndexArgs --upgrade pip
+if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+
+Write-Host ""
+Write-Host "[2/3] 安装 provider Python 依赖"
+& $PythonBin -m pip install @PipIndexArgs @PackageArgs
+if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+
+Write-Host ""
+Write-Host "[3/3] 检查系统 Edge/Chrome 或安装 Playwright Chromium"
+Set-Location -LiteralPath $BackendDir
+$BrowserChannel = (& $PythonBin -c {ps_quote(browser_probe)} 2>$null | Select-Object -Last 1).Trim()
+if ($BrowserChannel) {{
+    Write-Host "使用系统浏览器: $BrowserChannel"
+    Set-Content -LiteralPath (Join-Path $VenvDir '..\\browser-channel.txt') -Value $BrowserChannel -Encoding UTF8
+}} else {{
+    & $PythonBin -m playwright install chromium
+    if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+}}
+
+Write-Host ""
+Write-Host "验证 provider 模块..."
+& $PythonBin -c "import app.deepseek_local_provider; print('自动化插件依赖 OK')"
+if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+
+Write-Host ""
+Write-Host "验证 Playwright 浏览器..."
+if ($BrowserChannel) {{
+    $env:BROWSER_CHANNEL = $BrowserChannel
+    & $PythonBin -c "from playwright.sync_api import sync_playwright; import os; p=sync_playwright().start(); b=p.chromium.launch(channel=os.environ['BROWSER_CHANNEL'], headless=True); b.close(); p.stop(); print('Playwright browser OK: ' + os.environ['BROWSER_CHANNEL'])"
+}} else {{
+    & $PythonBin -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); b.close(); p.stop(); print('Playwright browser OK: chromium')"
+}}
+if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+
+Write-Host ""
+Write-Host "自动化插件依赖安装完成: $PythonBin"
 """
         return f"""set -e
 export PYTHONUTF8=1
@@ -7971,7 +8112,7 @@ class ChatPage(QWidget):
                 return
             warning_bubble = ChatBubble(
                 "system",
-                "⚠️ 未识别到可执行命令\n请确保 AI 输出包含 ```bash 代码块",
+                f"⚠️ 未识别到可执行命令\n请确保 AI 输出包含 ```{runtime_environment()['command_block_lang']} 代码块",
                 parent=self.chat_container,
                 scrollable=False,
                 max_content_height=110,
