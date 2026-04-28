@@ -24,6 +24,7 @@ import urllib.parse
 import urllib.request
 import venv
 import time
+import tempfile
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -316,6 +317,41 @@ def cmd_join(args: List[str]) -> str:
     return " ".join(cmd_arg(str(arg)) for arg in args if str(arg))
 
 
+WINDOWS_PYTHON_INSTALLER_URL = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+
+
+def windows_python_bootstrap_batch() -> str:
+    return f"""set "BASE_PYTHON="
+for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
+if "%BASE_PYTHON%"=="" (
+  for /f "usebackq delims=" %%P in (`python -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
+)
+if "%BASE_PYTHON%"=="" (
+  echo 未找到 Python 3.9+，尝试安装用户级 Python 3.12...
+  where winget >nul 2>nul
+  if not errorlevel 1 (
+    winget install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements
+  )
+)
+if "%BASE_PYTHON%"=="" (
+  for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
+)
+if "%BASE_PYTHON%"=="" if exist "%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe"
+if "%BASE_PYTHON%"=="" (
+  echo winget 不可用或安装失败，下载 Python 3.12 安装器...
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $u='{WINDOWS_PYTHON_INSTALLER_URL}'; $p=Join-Path $env:TEMP 'agent-qt-python-3.12-installer.exe'; Invoke-WebRequest -Uri $u -OutFile $p; Start-Process -Wait -FilePath $p -ArgumentList '/quiet InstallAllUsers=0 PrependPath=0 Include_pip=1 Include_launcher=1 Include_test=0'"
+)
+if "%BASE_PYTHON%"=="" (
+  for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
+)
+if "%BASE_PYTHON%"=="" if exist "%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe"
+if "%BASE_PYTHON%"=="" (
+  echo 无法安装或定位 Python 3.9+。
+  exit /b 1
+)
+"""
+
+
 def build_python_runtime_install_command() -> str:
     pip_args_posix = posix_join(pip_index_args())
     pip_args_cmd = cmd_join(pip_index_args())
@@ -334,7 +370,8 @@ echo 缓存目录: {runtime_cache_root()}
 if not exist "%VENV_DIR%" mkdir "%VENV_DIR%"
 if not exist "%PYTHON_BIN%" (
   echo 创建虚拟环境...
-  py -3 -m venv "%VENV_DIR%" || python -m venv "%VENV_DIR%" || exit /b 1
+  {windows_python_bootstrap_batch()}
+  "%BASE_PYTHON%" -m venv "%VENV_DIR%" || exit /b 1
 )
 echo.
 echo 升级 pip
@@ -1505,6 +1542,23 @@ def unbuffer_python_command(cmd: str) -> str:
     elif first_line.startswith("python ") and not first_line.startswith("python -u "):
         first_line = "python -u " + first_line[len("python "):]
     return first_line + (sep + rest if sep else "")
+
+def should_use_temp_shell_script(cmd: str) -> bool:
+    return platform.system() == "Windows" and "\n" in (cmd or "")
+
+def write_temp_shell_script(cmd: str) -> str:
+    suffix = ".cmd" if platform.system() == "Windows" else ".sh"
+    fd, path = tempfile.mkstemp(prefix="agent_qt_", suffix=suffix)
+    newline = "\r\n" if platform.system() == "Windows" else "\n"
+    with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
+        f.write(cmd)
+        if not cmd.endswith(("\n", "\r")):
+            f.write("\n")
+    try:
+        os.chmod(path, 0o755)
+    except OSError:
+        pass
+    return path
 
 def shell_launch_args(cmd: str, interactive: bool = False) -> tuple[str, List[str]]:
     """为 QProcess 选择当前系统 shell。"""
@@ -2873,6 +2927,7 @@ class ManagedProcess(QWidget):
         self.name = name or cmd[:40]
         self.interactive = interactive
         self.process: Optional[QProcess] = None
+        self.script_path = ""
         self.setup_ui()
         self.start_process()
     
@@ -2956,7 +3011,11 @@ class ManagedProcess(QWidget):
         self.process.started.connect(self.on_started)
         self.process.errorOccurred.connect(self.on_error)
         self.process.finished.connect(self.on_finished)
-        shell, args = shell_launch_args(self.cmd, interactive=self.interactive)
+        launch_cmd = self.cmd
+        if not self.interactive and should_use_temp_shell_script(self.cmd):
+            self.script_path = write_temp_shell_script(self.cmd)
+            launch_cmd = f'"{self.script_path}"'
+        shell, args = shell_launch_args(launch_cmd, interactive=self.interactive)
         self.process.start(shell, args)
 
     def on_started(self):
@@ -2984,6 +3043,12 @@ class ManagedProcess(QWidget):
     def on_finished(self, exit_code: int, _exit_status):
         self.output.set_input_enabled(False)
         self.output.append_process_text(f"\n--- 退出码: {exit_code} ---")
+        if self.script_path:
+            try:
+                os.remove(self.script_path)
+            except OSError:
+                pass
+            self.script_path = ""
 
     def copy_output(self):
         QApplication.clipboard().setText(self.output.toPlainText())
@@ -3481,8 +3546,21 @@ def is_python_executable_candidate(path: str) -> bool:
         return False
     name = os.path.basename(str(path)).lower()
     if platform.system() == "Windows":
-        return name in {"python.exe", "python3.exe", "py.exe"}
+        return name in {"python.exe", "python3.exe"}
     return name in {"python", "python3"} or name.startswith("python")
+
+
+def supports_automation_python(python_bin: str) -> bool:
+    try:
+        result = subprocess.run(
+            [python_bin, "-c", "import sys\nraise SystemExit(sys.version_info[:2] < (3, 9))"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
 
 
 def find_automation_backend() -> str:
@@ -3538,8 +3616,6 @@ class AutomationProviderManager:
             shutil.which("python3") or "",
             shutil.which("python") or "",
         ]
-        if platform.system() == "Windows":
-            system_candidates.insert(0, shutil.which("py") or "")
         current_executable = "" if getattr(sys, "frozen", False) else sys.executable
         candidates = [plugin_python, runtime_python, backend_python, current_executable, *system_candidates]
         seen = set()
@@ -3548,7 +3624,11 @@ class AutomationProviderManager:
             if not candidate or candidate in seen:
                 continue
             seen.add(candidate)
-            if is_python_executable_candidate(candidate) and (os.path.exists(candidate) or shutil.which(candidate)):
+            if (
+                is_python_executable_candidate(candidate)
+                and (os.path.exists(candidate) or shutil.which(candidate))
+                and supports_automation_python(candidate)
+            ):
                 result.append(candidate)
         return result
 
@@ -3801,7 +3881,8 @@ if "{self.backend_dir}"=="" (
 if not exist "%VENV_DIR%" mkdir "%VENV_DIR%"
 if not exist "%PYTHON_BIN%" (
   echo 创建插件虚拟环境...
-  py -3 -m venv "%VENV_DIR%" || python -m venv "%VENV_DIR%" || exit /b 1
+  {windows_python_bootstrap_batch()}
+  "%BASE_PYTHON%" -m venv "%VENV_DIR%" || exit /b 1
 )
 echo.
 echo [1/3] 升级 pip
@@ -3813,7 +3894,7 @@ echo.
 echo [3/3] 检查系统 Edge/Chrome 或安装 Playwright Chromium
 cd /d "{self.backend_dir}"
 set "BROWSER_CHANNEL="
-for /f "usebackq delims=" %C in (`"%PYTHON_BIN%" -c "{browser_probe}" 2^>nul`) do set "BROWSER_CHANNEL=%C"
+for /f "usebackq delims=" %%C in (`"%PYTHON_BIN%" -c "{browser_probe}" 2^>nul`) do set "BROWSER_CHANNEL=%%C"
 if not "%BROWSER_CHANNEL%"=="" (
   echo 使用系统浏览器: %BROWSER_CHANNEL%
   echo %BROWSER_CHANNEL%>"%VENV_DIR%\\..\\browser-channel.txt"
@@ -4339,7 +4420,7 @@ class ChatBubble(QFrame):
             lambda pos, editor=self.content_label: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
         )
         editor_type = "QTextBrowser" if self.markdown else "QPlainTextEdit"
-        font_family = "" if self.markdown else "font-family: 'SF Mono', 'Menlo', monospace;"
+        font_family = "" if self.markdown or (self.flat and self.role == "ai") else "font-family: 'SF Mono', 'Menlo', monospace;"
         flat_system_log = self.flat and self.role == "system"
         content_bg = COLORS["code_bg"] if flat_system_log else ("transparent" if self.flat else COLORS["code_bg"])
         content_border = COLORS["border"] if flat_system_log else ("transparent" if self.flat else COLORS["border"])
@@ -4429,9 +4510,9 @@ class ChatBubble(QFrame):
             QTextBrowser {{
                 background: transparent;
                 color: {COLORS['text']};
-                border: 1px solid transparent;
+                border: none;
                 border-radius: 0;
-                padding: 2px 0;
+                padding: 0;
                 font-size: 12px;
             }}
         """
@@ -4520,6 +4601,9 @@ class ChatBubble(QFrame):
         viewer = QTextBrowser()
         viewer.setOpenExternalLinks(False)
         viewer.setReadOnly(True)
+        viewer.setFrameShape(QFrame.Shape.NoFrame)
+        viewer.setViewportMargins(0, 0, 0, 0)
+        viewer.document().setDocumentMargin(0)
         viewer.setHtml(markdown_with_pipe_tables_to_html(text))
         viewer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -4627,6 +4711,8 @@ class ChatBubble(QFrame):
         if changed:
             self.adjust_content_height()
             self.schedule_content_height_adjustment()
+            QTimer.singleShot(80, self.adjust_content_height)
+            QTimer.singleShot(180, self.adjust_content_height)
         return True
 
     def render_markdown_parts(self, layout: Optional[QVBoxLayout] = None):
@@ -4650,6 +4736,9 @@ class ChatBubble(QFrame):
             else:
                 self.add_markdown_text_widget(part.get("text", ""), layout)
         self.adjust_content_height()
+        self.schedule_content_height_adjustment()
+        QTimer.singleShot(80, self.adjust_content_height)
+        QTimer.singleShot(180, self.adjust_content_height)
         self.restore_markdown_code_scroll_state(code_scroll_states)
         QTimer.singleShot(0, lambda states=code_scroll_states: self.restore_markdown_code_scroll_state(states))
 
@@ -4668,6 +4757,10 @@ class ChatBubble(QFrame):
             self.content_label.setPlainText(text)
         self.adjust_content_height()
         self.schedule_content_height_adjustment()
+        self.updateGeometry()
+        parent = self.parentWidget()
+        if parent is not None:
+            parent.updateGeometry()
 
     def update_content(self, text: str):
         self.content = text
@@ -4713,10 +4806,13 @@ class ChatBubble(QFrame):
                 widget.setMaximumHeight(QT_WIDGET_MAX_HEIGHT)
                 text_width = max(120, widget.viewport().width() - 10)
                 widget.document().setTextWidth(text_width)
-                document_height = int(widget.document().documentLayout().documentSize().height()) + 10
+                line_spacing = max(1, widget.fontMetrics().lineSpacing())
+                document_height = int(widget.document().documentLayout().documentSize().height())
+                content_margin = int(widget.document().documentMargin() * 2)
+                safety_padding = max(72, line_spacing * 4)
                 target_height = max(
                     34,
-                    document_height,
+                    document_height + content_margin + safety_padding,
                 )
                 if self.stabilize_markdown_height:
                     key = id(widget)
@@ -4724,6 +4820,7 @@ class ChatBubble(QFrame):
                     next_stable_heights[key] = target_height
                 if widget.height() != target_height:
                     widget.setFixedHeight(target_height)
+                    widget.updateGeometry()
             for code_box in self.markdown_code_widgets:
                 if not code_box.isVisible():
                     continue
@@ -4741,8 +4838,13 @@ class ChatBubble(QFrame):
                     next_stable_heights[key] = target_height
                 if code_box.height() != target_height:
                     code_box.setFixedHeight(target_height)
+                    code_box.updateGeometry()
             if self.stabilize_markdown_height:
                 self._stable_markdown_heights = next_stable_heights
+            self.updateGeometry()
+            parent = self.parentWidget()
+            if parent is not None:
+                parent.updateGeometry()
             return
         if not hasattr(self, "content_label") or self.content_label is None:
             return
@@ -7511,9 +7613,9 @@ class ChatPage(QWidget):
                 parent=self.chat_container,
                 copy_text="复制 AI 输出",
                 scrollable=True,
-                max_content_height=190,
+                max_content_height=QT_WIDGET_MAX_HEIGHT,
                 markdown=self.automation_enabled,
-                expand_to_content=self.automation_enabled,
+                expand_to_content=True,
                 flat=self.automation_enabled,
             )
             self.add_chat_widget(bubble)
@@ -7730,9 +7832,9 @@ class ChatPage(QWidget):
             parent=self.chat_container,
             copy_text="复制 AI 输出",
             scrollable=True,
-            max_content_height=190,
+            max_content_height=QT_WIDGET_MAX_HEIGHT,
             markdown=self.automation_enabled,
-            expand_to_content=self.automation_enabled,
+            expand_to_content=True,
             flat=self.automation_enabled,
         )
         if insert_index is None:
