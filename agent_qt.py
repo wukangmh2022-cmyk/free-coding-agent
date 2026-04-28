@@ -7243,7 +7243,12 @@ class ChatPage(QWidget):
         if clear_workspace_history(self.project_root, self.thread_id):
             self.history_entries = []
             self.clear_chat_widgets()
-            self.ensure_initial_prompt_bubble()
+            if self.automation_enabled:
+                self.show_automation_composer(focus=False)
+                self.update_automation_composer_state()
+            else:
+                self.ensure_initial_prompt_bubble()
+            self.update_prompt_tools_responsive()
             self.scroll_to_bottom()
         else:
             styled_warning(self, "清空失败", "无法删除当前工作区的 .agent_qt 缓存目录。")
