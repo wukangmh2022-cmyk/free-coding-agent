@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QSpacerItem, QWidgetAction, QAbstractButton
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, Property
-from PySide6.QtGui import QFont, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QKeySequence
+from PySide6.QtGui import QFont, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QKeySequence, QTextDocument
 from PySide6.QtCore import QUrl
 
 try:
@@ -674,6 +674,146 @@ def estimate_wrapped_text_height(text: str, metrics, available_width: int, max_v
             visual_lines = max_visual_lines
             break
     return visual_lines * max(1, metrics.lineSpacing()) + 36
+
+PIPE_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
+
+def is_pipe_table_row(line: str) -> bool:
+    stripped = (line or "").strip()
+    return "|" in stripped and stripped.count("|") >= (2 if stripped.startswith("|") or stripped.endswith("|") else 1)
+
+def is_pipe_table_separator(line: str) -> bool:
+    return PIPE_TABLE_SEPARATOR_RE.match(line or "") is not None
+
+def split_pipe_table_cells(line: str) -> List[str]:
+    stripped = (line or "").strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+def looks_like_pipe_table(lines: List[str], start: int) -> bool:
+    if start + 1 >= len(lines):
+        return False
+    return is_pipe_table_row(lines[start]) and is_pipe_table_separator(lines[start + 1])
+
+def render_markdown_inline_html(text: str) -> str:
+    doc = QTextDocument()
+    doc.setMarkdown(text or "")
+    body = doc.toHtml()
+    match = re.search(r"<body[^>]*>(.*?)</body>", body, re.S | re.I)
+    return match.group(1).strip() if match else body
+
+def markdown_table_to_html(table_lines: List[str]) -> str:
+    if len(table_lines) < 2:
+        return render_markdown_inline_html("\n".join(table_lines))
+    header_cells = split_pipe_table_cells(table_lines[0])
+    aligns: List[str] = []
+    for cell in split_pipe_table_cells(table_lines[1]):
+        raw = cell.replace(" ", "")
+        if raw.startswith(":") and raw.endswith(":"):
+            aligns.append("center")
+        elif raw.endswith(":"):
+            aligns.append("right")
+        else:
+            aligns.append("left")
+    body_rows = [split_pipe_table_cells(line) for line in table_lines[2:] if is_pipe_table_row(line)]
+    column_count = max([len(header_cells), len(aligns), *(len(row) for row in body_rows)] or [0])
+    if column_count <= 0:
+        return ""
+
+    def padded(cells: List[str]) -> List[str]:
+        return cells + [""] * max(0, column_count - len(cells))
+
+    table_style = (
+        "border-collapse:collapse; margin:8px 0 10px 0; width:100%; "
+        f"color:{COLORS['text']};"
+    )
+    header_style = (
+        f"border:1px solid {COLORS['border_strong']}; padding:6px 8px; "
+        f"background:{COLORS['surface_alt']}; font-weight:700;"
+    )
+    cell_style = (
+        f"border:1px solid {COLORS['border_strong']}; padding:6px 8px; "
+        "background:#ffffff;"
+    )
+    parts = [
+        f"<table cellspacing='0' cellpadding='0' style='{table_style}'>",
+        "<thead><tr>",
+    ]
+    for index, cell in enumerate(padded(header_cells)[:column_count]):
+        align = aligns[index] if index < len(aligns) else "left"
+        parts.append(f"<th align='{align}' style='{header_style}'>{render_markdown_inline_html(cell)}</th>")
+    parts.append("</tr></thead>")
+    if body_rows:
+        parts.append("<tbody>")
+        for row in body_rows:
+            parts.append("<tr>")
+            for index, cell in enumerate(padded(row)[:column_count]):
+                align = aligns[index] if index < len(aligns) else "left"
+                parts.append(f"<td align='{align}' style='{cell_style}'>{render_markdown_inline_html(cell)}</td>")
+            parts.append("</tr>")
+        parts.append("</tbody>")
+    parts.append("</table>")
+    return "".join(parts)
+
+def markdown_with_pipe_tables_to_html(markdown_text: str) -> str:
+    lines = (markdown_text or "").splitlines()
+    if not any(looks_like_pipe_table(lines, index) for index in range(max(0, len(lines) - 1))):
+        return render_markdown_inline_html(markdown_text)
+
+    parts: List[str] = []
+    buffer: List[str] = []
+    index = 0
+
+    def flush_buffer():
+        nonlocal buffer
+        if buffer:
+            parts.append(render_markdown_inline_html("\n".join(buffer)))
+            buffer = []
+
+    while index < len(lines):
+        if looks_like_pipe_table(lines, index):
+            flush_buffer()
+            table_lines = [lines[index], lines[index + 1]]
+            index += 2
+            while index < len(lines) and is_pipe_table_row(lines[index]):
+                table_lines.append(lines[index])
+                index += 1
+            parts.append(markdown_table_to_html(table_lines))
+            continue
+        buffer.append(lines[index])
+        index += 1
+    flush_buffer()
+    return "\n".join(part for part in parts if part)
+
+def estimate_markdown_table_extra_height(text: str, metrics, available_width: int) -> int:
+    lines = (text or "").splitlines()
+    extra_height = 0
+    index = 0
+    line_spacing = max(1, metrics.lineSpacing())
+    while index < len(lines):
+        if not looks_like_pipe_table(lines, index):
+            index += 1
+            continue
+        table_lines = [lines[index], lines[index + 1]]
+        index += 2
+        while index < len(lines) and is_pipe_table_row(lines[index]):
+            table_lines.append(lines[index])
+            index += 1
+        column_count = max(len(split_pipe_table_cells(line)) for line in table_lines)
+        column_width = max(80, available_width // max(1, column_count))
+        table_height = 12
+        for line in table_lines:
+            if is_pipe_table_separator(line):
+                continue
+            row_lines = 1
+            for cell in split_pipe_table_cells(line):
+                row_lines = max(row_lines, max(1, (metrics.horizontalAdvance(cell) + column_width - 1) // column_width))
+            table_height += max(28, row_lines * line_spacing + 14)
+        plain_table_height = max(1, len(table_lines)) * line_spacing
+        extra_height += max(0, table_height - plain_table_height)
+    return extra_height
 
 # ============================================================
 # 设置面板控件
@@ -4330,10 +4470,7 @@ class ChatBubble(QFrame):
         viewer = QTextBrowser()
         viewer.setOpenExternalLinks(False)
         viewer.setReadOnly(True)
-        # TODO: QTextBrowser.setMarkdown does not render GitHub-style pipe tables.
-        # Add a lightweight table-to-HTML pass for automation summaries like
-        # "| 文件 | 大小 | 说明 |" so AI output cards preserve tabular structure.
-        viewer.setMarkdown(text)
+        viewer.setHtml(markdown_with_pipe_tables_to_html(text))
         viewer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         viewer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -4435,7 +4572,7 @@ class ChatBubble(QFrame):
                     return False
                 if getattr(widget, "markdown_source", None) != text:
                     widget.markdown_source = text
-                    widget.setMarkdown(text)
+                    widget.setHtml(markdown_with_pipe_tables_to_html(text))
                     changed = True
         if changed:
             self.adjust_content_height()
@@ -4525,7 +4662,12 @@ class ChatBubble(QFrame):
                 available_width = max(120, widget.viewport().width() - 10)
                 metrics = widget.fontMetrics()
                 text = widget.toPlainText()
-                target_height = max(34, estimate_wrapped_text_height(text, metrics, available_width))
+                source_text = str(getattr(widget, "markdown_source", "") or text)
+                target_height = max(
+                    34,
+                    estimate_wrapped_text_height(text, metrics, available_width)
+                    + estimate_markdown_table_extra_height(source_text, metrics, available_width),
+                )
                 if self.stabilize_markdown_height:
                     key = id(widget)
                     target_height = max(int(self._stable_markdown_heights.get(key, 0)), target_height)
