@@ -4676,6 +4676,7 @@ class DeepSeekWebBridge:
         logger.warning("DeepSeek fill_input page-level inject done tag=%s", result.get("tag"))
 
     def paste_input_from_clipboard(self, page: Page, input_box: Locator, prompt: str) -> None:
+        started = time.perf_counter()
         page.evaluate(
             """async (value) => {
                 if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
@@ -4719,6 +4720,11 @@ class DeepSeekWebBridge:
         )
         if not isinstance(length, int) or length < max(1, int(len(prompt) * 0.95)):
             raise RuntimeError(f"DeepSeek clipboard paste length mismatch: {length}/{len(prompt)}")
+        logger.warning(
+            "DeepSeek clipboard paste verified chars=%d elapsed_ms=%d",
+            length,
+            int((time.perf_counter() - started) * 1000),
+        )
 
     def confirm_submission_started(
         self,

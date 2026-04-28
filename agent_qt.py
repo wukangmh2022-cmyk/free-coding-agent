@@ -2323,6 +2323,7 @@ AUTOMATION_CONTEXT_DISPLAY_TOKENS = env_int(
 AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_RECENT_TOKENS", 70000, minimum=8000)
 AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_SUMMARY_TOKENS", 90000, minimum=12000)
 AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 16000, minimum=1200)
+CHAT_HISTORY_INITIAL_RENDER_ENTRIES = env_int("AGENT_QT_HISTORY_INITIAL_RENDER_ENTRIES", 40, minimum=10)
 
 
 def is_automation_done_response(text: str) -> bool:
@@ -6634,6 +6635,8 @@ class ChatPage(QWidget):
         self.automation_loop_max_rounds = AUTOMATION_LOOP_MAX_ROUNDS
         self.automation_loop_goal = ""
         self._ensure_ai_entry_pending = False
+        self._last_status_message = ""
+        self._last_status_at = 0.0
         self.automation_composer: Optional[QFrame] = None
         self.automation_input: Optional[QTextEdit] = None
         self.automation_send_btn: Optional[QToolButton] = None
@@ -7012,6 +7015,25 @@ class ChatPage(QWidget):
         if isinstance(widget, ChatBubble) and getattr(widget, "role", "") == "user":
             widget.setFixedWidth(self.user_bubble_width())
             widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def add_history_trim_notice(self, hidden_count: int):
+        if hidden_count <= 0:
+            return
+        notice = QLabel(f"已折叠较早 {hidden_count} 条历史。完整历史仍会进入自动化上下文。")
+        notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        notice.setStyleSheet(f"""
+            QLabel {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text_secondary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+                padding: 10px 12px;
+                font-size: 12px;
+                font-weight: 800;
+            }}
+        """)
+        notice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.add_chat_widget(notice)
 
     def add_chat_widget(self, widget: QWidget, *, animate: bool = False):
         self.prepare_chat_widget(widget)
@@ -7639,6 +7661,12 @@ class ChatPage(QWidget):
                     button.setText(widget.copy_text)
 
     def add_status_bubble(self, text: str):
+        text = str(text or "").strip()
+        now = time.time()
+        if text and text == self._last_status_message and now - self._last_status_at < 3:
+            return
+        self._last_status_message = text
+        self._last_status_at = now
         self.hide_empty_state()
         bubble = ExecutionLogPanel(
             text,
@@ -8174,8 +8202,6 @@ class ChatPage(QWidget):
                 )
                 if "网页登录还没有准备好" in error:
                     self.add_status_bubble("需要先完成网页登录。请使用设置里的“打开网页登录”，登录后重新发送。")
-                elif quiet_message:
-                    self.add_status_bubble(quiet_message)
                 if (not quiet_message) or developer_error_details_enabled():
                     styled_warning(self, "AI 自动化失败", self.automation_manager.error_with_log_hint(error))
             else:
@@ -8307,6 +8333,7 @@ class ChatPage(QWidget):
             save_workspace_history(self.project_root, self.history_entries, self.thread_id)
 
     def load_history(self):
+        started = time.perf_counter()
         self.history_entries = load_workspace_history(self.project_root, self.thread_id)
         self.setUpdatesEnabled(False)
         try:
@@ -8319,7 +8346,10 @@ class ChatPage(QWidget):
                 self.scroll_to_bottom()
                 return
             self.hide_empty_state()
-            for entry in self.history_entries:
+            render_entries = self.history_entries[-CHAT_HISTORY_INITIAL_RENDER_ENTRIES:]
+            hidden_count = max(0, len(self.history_entries) - len(render_entries))
+            self.add_history_trim_notice(hidden_count)
+            for entry in render_entries:
                 self.restore_history_entry(entry)
             if self.automation_enabled:
                 self.remove_ai_response_frame()
@@ -8330,6 +8360,14 @@ class ChatPage(QWidget):
             self.scroll_to_bottom()
         finally:
             self.setUpdatesEnabled(True)
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            if elapsed_ms >= 250:
+                logger.warning(
+                    "History load timing entries=%d rendered=%d elapsed_ms=%d",
+                    len(self.history_entries),
+                    min(len(self.history_entries), CHAT_HISTORY_INITIAL_RENDER_ENTRIES),
+                    elapsed_ms,
+                )
 
     def switch_thread(self, thread_id: str):
         thread_id = safe_thread_id(thread_id)
