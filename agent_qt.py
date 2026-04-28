@@ -328,47 +328,47 @@ WINDOWS_PYTHON_INSTALLER_URL = "https://www.python.org/ftp/python/3.12.10/python
 def windows_python_bootstrap_batch() -> str:
     return f"""set "BASE_PYTHON="
 set "BASE_PYTHON_DIR={os.path.join(runtime_cache_root(), 'python312')}"
-if exist "%BASE_PYTHON_DIR%\\python.exe" set "BASE_PYTHON=%BASE_PYTHON_DIR%\\python.exe"
-if "%BASE_PYTHON%"=="" if exist "%VENV_DIR%\\..\\python312\\python.exe" set "BASE_PYTHON=%VENV_DIR%\\..\\python312\\python.exe"
+if exist "!BASE_PYTHON_DIR!\\python.exe" set "BASE_PYTHON=!BASE_PYTHON_DIR!\\python.exe"
+if "!BASE_PYTHON!"=="" if exist "!VENV_DIR!\\..\\python312\\python.exe" set "BASE_PYTHON=!VENV_DIR!\\..\\python312\\python.exe"
 for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
-if "%BASE_PYTHON%"=="" (
+if "!BASE_PYTHON!"=="" (
   for /f "usebackq delims=" %%P in (`python -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
 )
-if "%BASE_PYTHON%"=="" (
+if "!BASE_PYTHON!"=="" (
   echo 未找到 Python 3.9+，尝试安装用户级 Python 3.12...
   where winget >nul 2>nul
   if not errorlevel 1 (
     winget install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements
   )
 )
-if "%BASE_PYTHON%"=="" (
+if "!BASE_PYTHON!"=="" (
   for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
 )
-if "%BASE_PYTHON%"=="" if exist "%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe"
-if "%BASE_PYTHON%"=="" (
+if "!BASE_PYTHON!"=="" if exist "!LOCALAPPDATA!\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=!LOCALAPPDATA!\\Programs\\Python\\Python312\\python.exe"
+if "!BASE_PYTHON!"=="" (
   echo winget 不可用或安装后仍未定位到 Python，安装独立 Python 到缓存目录...
-  if not exist "%BASE_PYTHON_DIR%" mkdir "%BASE_PYTHON_DIR%"
-  set "PYTHON_INSTALLER=%TEMP%\\agent-qt-python-3.12-%RANDOM%%RANDOM%.exe"
+  if not exist "!BASE_PYTHON_DIR!" mkdir "!BASE_PYTHON_DIR!"
+  set "PYTHON_INSTALLER=!TEMP!\\agent-qt-python-3.12-!RANDOM!!RANDOM!.exe"
   powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{WINDOWS_PYTHON_INSTALLER_URL}' -OutFile $env:PYTHON_INSTALLER"
   if errorlevel 1 (
     echo Python 安装器下载失败。
-    del /f /q "%PYTHON_INSTALLER%" >nul 2>nul
+    del /f /q "!PYTHON_INSTALLER!" >nul 2>nul
     exit /b 1
   )
-  "%PYTHON_INSTALLER%" /quiet InstallAllUsers=0 TargetDir="%BASE_PYTHON_DIR%" PrependPath=0 Include_pip=1 Include_launcher=0 Include_test=0
-  set "PYTHON_INSTALL_EXIT=%ERRORLEVEL%"
-  del /f /q "%PYTHON_INSTALLER%" >nul 2>nul
-  if not "%PYTHON_INSTALL_EXIT%"=="0" if not "%PYTHON_INSTALL_EXIT%"=="3010" (
-    echo Python 安装器失败，退出码: %PYTHON_INSTALL_EXIT%
+  "!PYTHON_INSTALLER!" /quiet InstallAllUsers=0 TargetDir="!BASE_PYTHON_DIR!" PrependPath=0 Include_pip=1 Include_launcher=0 Include_test=0
+  set "PYTHON_INSTALL_EXIT=!ERRORLEVEL!"
+  del /f /q "!PYTHON_INSTALLER!" >nul 2>nul
+  if not "!PYTHON_INSTALL_EXIT!"=="0" if not "!PYTHON_INSTALL_EXIT!"=="3010" (
+    echo Python 安装器失败，退出码: !PYTHON_INSTALL_EXIT!
     exit /b 1
   )
 )
-if "%BASE_PYTHON%"=="" (
+if "!BASE_PYTHON!"=="" (
   for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2^>nul`) do set "BASE_PYTHON=%%P"
 )
-if "%BASE_PYTHON%"=="" if exist "%BASE_PYTHON_DIR%\\python.exe" set "BASE_PYTHON=%BASE_PYTHON_DIR%\\python.exe"
-if "%BASE_PYTHON%"=="" if exist "%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe"
-if "%BASE_PYTHON%"=="" (
+if "!BASE_PYTHON!"=="" if exist "!BASE_PYTHON_DIR!\\python.exe" set "BASE_PYTHON=!BASE_PYTHON_DIR!\\python.exe"
+if "!BASE_PYTHON!"=="" if exist "!LOCALAPPDATA!\\Programs\\Python\\Python312\\python.exe" set "BASE_PYTHON=!LOCALAPPDATA!\\Programs\\Python\\Python312\\python.exe"
+if "!BASE_PYTHON!"=="" (
   echo 无法安装或定位 Python 3.9+。
   exit /b 1
 )
@@ -382,7 +382,7 @@ def build_python_runtime_install_command() -> str:
     python_bin = runtime_python_in_root(venv_dir)
     if platform.system() == "Windows":
         return f"""@echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 set "PYTHONUTF8=1"
 set "PYTHONUNBUFFERED=1"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
@@ -394,7 +394,7 @@ if not exist "%VENV_DIR%" mkdir "%VENV_DIR%"
 if not exist "%PYTHON_BIN%" (
   echo 创建虚拟环境...
   {windows_python_bootstrap_batch()}
-  "%BASE_PYTHON%" -m venv "%VENV_DIR%" || exit /b 1
+  "!BASE_PYTHON!" -m venv "!VENV_DIR!" || exit /b 1
 )
 echo.
 echo 升级 pip
@@ -3928,7 +3928,7 @@ print("chromium ok")
         browser_probe = python_exec_base64_code(browser_channel_probe_code())
         if platform.system() == "Windows":
             return f"""@echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 set "PYTHONUTF8=1"
 set "PYTHONUNBUFFERED=1"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
@@ -3946,7 +3946,7 @@ if not exist "%VENV_DIR%" mkdir "%VENV_DIR%"
 if not exist "%PYTHON_BIN%" (
   echo 创建插件虚拟环境...
   {windows_python_bootstrap_batch()}
-  "%BASE_PYTHON%" -m venv "%VENV_DIR%" || exit /b 1
+  "!BASE_PYTHON!" -m venv "!VENV_DIR!" || exit /b 1
 )
 echo.
 echo [1/3] 升级 pip
