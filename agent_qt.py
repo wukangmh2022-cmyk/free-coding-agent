@@ -2938,6 +2938,15 @@ def automation_venv_python(root: str) -> str:
     return os.path.join(root, ".venv", "bin", "python")
 
 
+def is_python_executable_candidate(path: str) -> bool:
+    if not path:
+        return False
+    name = os.path.basename(str(path)).lower()
+    if platform.system() == "Windows":
+        return name in {"python.exe", "python3.exe", "py.exe"}
+    return name in {"python", "python3"} or name.startswith("python")
+
+
 def find_automation_backend() -> str:
     app_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
@@ -2980,20 +2989,28 @@ class AutomationProviderManager:
 
     def candidate_pythons(self) -> List[str]:
         plugin_python = automation_venv_python(self.plugin_root)
+        runtime_python = ensure_agent_runtime(create=False)
         backend_python = os.path.join(
             self.backend_dir,
             ".venv",
             "Scripts" if platform.system() == "Windows" else "bin",
             "python.exe" if platform.system() == "Windows" else "python",
         )
-        candidates = [plugin_python, backend_python, sys.executable, shutil.which("python3") or ""]
+        system_candidates = [
+            shutil.which("python3") or "",
+            shutil.which("python") or "",
+        ]
+        if platform.system() == "Windows":
+            system_candidates.insert(0, shutil.which("py") or "")
+        current_executable = "" if getattr(sys, "frozen", False) else sys.executable
+        candidates = [plugin_python, runtime_python, backend_python, current_executable, *system_candidates]
         seen = set()
         result = []
         for candidate in candidates:
             if not candidate or candidate in seen:
                 continue
             seen.add(candidate)
-            if os.path.exists(candidate) or os.path.basename(candidate).startswith("python"):
+            if is_python_executable_candidate(candidate) and (os.path.exists(candidate) or shutil.which(candidate)):
                 result.append(candidate)
         return result
 
