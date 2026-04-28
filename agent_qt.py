@@ -5832,9 +5832,10 @@ class ChatPage(QWidget):
                                           QPushButton:hover {{
                                               background: {COLORS['surface_alt']};
                                           }}
-                                      """)
+        """)
         layout.addWidget(self.status_bar)
         self.update_status_bar()
+        self.update_prompt_tools_responsive()
     
     def set_project(self, path: str):
         self.terminal_panel.close_all_processes()
