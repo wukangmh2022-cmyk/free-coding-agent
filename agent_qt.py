@@ -6850,22 +6850,6 @@ class ChatPage(QWidget):
         self.scroll_area.verticalScrollBar().valueChanged.connect(self.on_chat_scroll_changed)
         right_layout.addWidget(self.scroll_area, 1)
 
-        self.live_preview_host = QFrame()
-        self.live_preview_host.setObjectName("livePreviewHost")
-        self.live_preview_host.setVisible(False)
-        self.live_preview_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.live_preview_host.setStyleSheet(f"""
-            QFrame#livePreviewHost {{
-                background: {COLORS['surface']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 18px;
-            }}
-        """)
-        self.live_preview_layout = QVBoxLayout(self.live_preview_host)
-        self.live_preview_layout.setContentsMargins(12, 8, 12, 8)
-        self.live_preview_layout.setSpacing(0)
-        right_layout.addWidget(self.live_preview_host, 0)
-
         self.automation_composer = QFrame()
         self.automation_composer.setObjectName("automationComposer")
         self.automation_composer.setVisible(False)
@@ -7829,15 +7813,14 @@ class ChatPage(QWidget):
 
     def create_automation_preview_bubble(self) -> QFrame:
         self.hide_empty_state()
-        self.live_preview_host.setVisible(True)
         frame = ChatBubble(
             "ai",
             "",
-            parent=self.live_preview_host,
+            parent=self.chat_container,
             markdown=True,
             expand_to_content=False,
             flat=True,
-            max_content_height=260,
+            max_content_height=560,
         )
         frame.async_markdown_render = False
         role_label = frame.findChild(QLabel)
@@ -7847,8 +7830,7 @@ class ChatPage(QWidget):
         status.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; background: transparent;")
         frame.layout().insertWidget(1, status)
         frame.preview_status = status
-        self.live_preview_layout.addWidget(frame)
-        animate_widget_in(frame)
+        self.add_chat_widget(frame, animate=True)
         self.scroll_to_bottom()
         return frame
 
@@ -7882,11 +7864,11 @@ class ChatPage(QWidget):
         if remove_bubble and self.automation_preview_bubble is not None:
             bubble = self.automation_preview_bubble
             self.automation_preview_bubble = None
-            self.live_preview_layout.removeWidget(bubble)
+            self.chat_layout.removeWidget(bubble)
             bubble.hide()
             bubble.setParent(None)
             bubble.deleteLater()
-            self.live_preview_host.setVisible(False)
+            self.chat_container.adjustSize()
 
     def update_automation_preview_status(self, chars: Optional[int] = None):
         started = time.perf_counter()
