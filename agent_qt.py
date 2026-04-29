@@ -60,6 +60,10 @@ _AGENT_RUNTIME_ENABLED: Optional[bool] = None
 _AUTOMATION_ENABLED: Optional[bool] = None
 QT_WIDGET_MAX_HEIGHT = 16777215
 DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+FALLBACK_PIP_INDEXES = [
+    ("阿里云 PyPI 镜像", "https://mirrors.aliyun.com/pypi/simple"),
+    ("腾讯云 PyPI 镜像", "https://mirrors.cloud.tencent.com/pypi/simple"),
+]
 OFFICIAL_PIP_INDEX_URL = "https://pypi.org/simple"
 logger = logging.getLogger(__name__)
 
@@ -374,6 +378,14 @@ def ps_array(args: List[str]) -> str:
     return "@(" + ", ".join(ps_quote(str(arg)) for arg in args) + ")"
 
 
+def ps_pip_fallback_indexes() -> str:
+    rows = []
+    for label, url in FALLBACK_PIP_INDEXES:
+        host = urllib.parse.urlparse(url).hostname or ""
+        rows.append("@(" + ", ".join(ps_quote(part) for part in (label, url, host)) + ")")
+    return "@(" + ", ".join(rows) + ")"
+
+
 def windows_python_bootstrap_powershell() -> str:
     base_python_dir = os.path.join(runtime_cache_root(), "python312")
     return f"""
@@ -469,7 +481,24 @@ function Invoke-AgentQtPipInstall {
         & $PythonBin -m pip install @script:PipIndexArgs @Arguments
         $lastExit = $LASTEXITCODE
         if ($lastExit -eq 0) { return }
-        Write-Host "配置的 PyPI 镜像失败，回退官方 PyPI..."
+        Write-Host "配置的 PyPI 镜像失败，尝试国内备用镜像..."
+    }
+    if ($script:PipFallbackIndexes -and $script:PipFallbackIndexes.Count -gt 0) {
+        foreach ($fallback in $script:PipFallbackIndexes) {
+            $label = [string]$fallback[0]
+            $indexUrl = [string]$fallback[1]
+            $trustedHost = [string]$fallback[2]
+            if (-not $indexUrl) { continue }
+            Write-Host "尝试 $label..."
+            if ($trustedHost) {
+                & $PythonBin -m pip install --isolated --index-url $indexUrl --trusted-host $trustedHost @Arguments
+            } else {
+                & $PythonBin -m pip install --isolated --index-url $indexUrl @Arguments
+            }
+            $lastExit = $LASTEXITCODE
+            if ($lastExit -eq 0) { return }
+        }
+        Write-Host "国内备用 PyPI 镜像失败，回退官方 PyPI..."
     }
     & $PythonBin -m pip install --isolated --index-url __AGENT_QT_OFFICIAL_PIP_INDEX__ --trusted-host pypi.org --trusted-host files.pythonhosted.org @Arguments
     $lastExit = $LASTEXITCODE
@@ -499,6 +528,7 @@ $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
 $VenvDir = {ps_quote(venv_dir)}
 $PythonBin = {ps_quote(python_bin)}
 $PipIndexArgs = {ps_array(pip_index_args())}
+$PipFallbackIndexes = {ps_pip_fallback_indexes()}
 
 {windows_pip_helpers_powershell()}
 
@@ -5403,6 +5433,7 @@ $PythonBin = {ps_quote(python_bin)}
 $PluginRoot = {ps_quote(plugin_root)}
 $BackendDir = {ps_quote(self.backend_dir)}
 $PipIndexArgs = {ps_array(pip_index_args())}
+$PipFallbackIndexes = {ps_pip_fallback_indexes()}
 $PackageArgs = {ps_array(package_args)}
 
 {windows_pip_helpers_powershell()}
