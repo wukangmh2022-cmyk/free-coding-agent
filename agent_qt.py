@@ -1734,11 +1734,13 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
             return match.group(0)
         return code
 
-    unnumbered = []
-    for match in unnumbered_placeholder_pattern.finditer(bash_text):
-        lang = (match.group('html') or match.group('css') or match.group('slash') or match.group('hash') or '').lower()
-        unnumbered.append(canonical_lang(lang))
-    if unnumbered:
+    def reject_unnumbered_placeholders(text: str):
+        unnumbered = []
+        for match in unnumbered_placeholder_pattern.finditer(text):
+            lang = (match.group('html') or match.group('css') or match.group('slash') or match.group('hash') or '').lower()
+            unnumbered.append(canonical_lang(lang))
+        if not unnumbered:
+            return
         unique_unnumbered = ", ".join(sorted(set(unnumbered)))
         raise ValueError(
             f"不再支持未编号占位符：{unique_unnumbered}。"
@@ -1746,7 +1748,13 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
             "为避免覆盖文件，本轮已停止执行。"
         )
 
-    resolved = placeholder_pattern.sub(replace, bash_text)
+    reject_unnumbered_placeholders(bash_text)
+    resolved = bash_text
+    for _ in range(12):
+        before = resolved
+        resolved = placeholder_pattern.sub(replace, resolved)
+        if before == resolved or not placeholder_pattern.search(resolved):
+            break
     if missing:
         unique_missing = ", ".join(sorted(set(missing)))
         missing_counts = ", ".join(
@@ -1761,6 +1769,7 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
         )
     if placeholder_pattern.search(resolved):
         raise ValueError("仍有未替换的占位符。为避免覆盖文件，本轮已停止执行。")
+    reject_unnumbered_placeholders(resolved)
     return resolved
 
 def find_heredoc_tags(line: str) -> List[str]:
