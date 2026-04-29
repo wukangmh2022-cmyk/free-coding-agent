@@ -28,6 +28,7 @@ import tempfile
 import locale
 import signal
 import logging
+import threading
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -37,7 +38,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QLineEdit, QTreeWidget, QTreeWidgetItem,
     QMenu, QToolButton, QStyle, QPlainTextEdit, QTextBrowser, QStackedWidget,
     QGridLayout, QSizePolicy, QGraphicsOpacityEffect, QAbstractItemView,
-    QSpacerItem, QWidgetAction, QAbstractButton
+    QSpacerItem, QWidgetAction, QAbstractButton, QDialog
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, Property
 from PySide6.QtGui import QFont, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QKeySequence, QTextDocument, QImage
@@ -660,6 +661,8 @@ b. **禁止输出备用方案或二选一方案**：
 7. 安装依赖用 pip install，启动后端用 python server.py 或 python3 -m http.server。
 8. 常驻进程命令（python server.py 等）会自动进入后台终端，不要加 & 或 nohup。
 9. 自动化循环中，如果根据执行日志判断任务已经完成，不要再输出命令块，回复 `{done_marker}` 加简短总结即可；如果未完成，继续输出下一轮完整命令块。
+10. Agent Qt 可能只提供执行日志和文件变更的压缩摘要。需要更多细节时，应自主使用当前命令环境中的 shell、git 和文件读取能力查询；如果摘要提供了内部 git 快照仓库与提交信息，可基于这些信息定向获取完整变更，不要要求用户手动粘贴。
+11. 常驻/后台终端会持续写入项目缓存里的终端注册表与日志文件。终端注册表路径：{terminal_registry_path}。需要了解后台服务状态、报错、PID 或日志时，应自主读取该注册表和对应日志；需要停止某个后台终端时，可按注册表里的 PID 使用当前平台命令关闭。
 
 ## 当前运行环境
 - 操作系统: {os_name} ，平台标识: {platform_id}
@@ -682,6 +685,7 @@ THREADS_INDEX_FILE_NAME = "threads.json"
 WORKSPACE_STATE_FILE_NAME = "workspace.json"
 DEFAULT_THREAD_ID = "default"
 HISTORY_VERSION = 1
+TERMINAL_COMPLETED_HISTORY_LIMIT = 50
 
 FORBIDDEN = [
     "rm -rf /", "sudo rm", "sudo reboot", "shutdown",
@@ -767,6 +771,60 @@ def message_box_style() -> str:
             background: #c83238;
         }}
     """
+
+
+def compact_popup_menu_style() -> str:
+    return f"""
+        QMenu {{
+            background: rgba(238, 243, 252, 238);
+            color: {COLORS['text']};
+            border: none;
+            border-radius: 14px;
+            padding: 6px;
+            font-size: 12px;
+            font-weight: 700;
+        }}
+        QMenu::item {{
+            background: transparent;
+            color: {COLORS['text']};
+            border: none;
+            border-radius: 10px;
+            padding: 7px 28px 7px 12px;
+            min-height: 18px;
+        }}
+        QMenu::item:selected {{
+            background: rgba(255, 255, 255, 120);
+            color: {COLORS['text']};
+        }}
+        QMenu::item:checked {{
+            background: rgba(255, 255, 255, 150);
+            color: {COLORS['text']};
+        }}
+        QMenu::item:disabled {{
+            color: {COLORS['muted']};
+            background: transparent;
+        }}
+        QMenu::separator {{
+            height: 1px;
+            background: rgba(23, 32, 51, 28);
+            margin: 5px 8px;
+        }}
+        QMenu::indicator {{
+            width: 0;
+            height: 0;
+        }}
+        QMenu::right-arrow {{
+            width: 7px;
+            height: 7px;
+            padding-right: 10px;
+        }}
+    """
+
+
+def style_compact_popup_menu(menu: QMenu) -> QMenu:
+    menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    menu.setStyleSheet(compact_popup_menu_style())
+    return menu
 
 def app_global_style() -> str:
     return f"""
@@ -1449,8 +1507,8 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
     placeholder_pattern = re.compile(
         r'<!--\s*(?P<html>\w+)\s+block\s+(?P<html_index>\d+)\s*-->'
         r'|/\*\s*(?P<css>\w+)\s+block\s+(?P<css_index>\d+)\s*\*/'
-        r'|//\s*(?P<slash>\w+)\s+block\s+(?P<slash_index>\d+)\b'
-        r'|#\s*(?P<hash>\w+)\s+block\s+(?P<hash_index>\d+)\b'
+        r'|//\s*(?P<slash>\w+)\s+block\s+(?P<slash_index>\d+)\s*(?=\r?\n|$)'
+        r'|#\s*(?P<hash>\w+)\s+block\s+(?P<hash_index>\d+)\s*(?=\r?\n|$)'
     )
     unnumbered_placeholder_pattern = re.compile(
         r'<!--\s*(?P<html>\w+)\s+block\s*-->'
@@ -1577,6 +1635,66 @@ def is_interactive_shell_command(cmd: str) -> bool:
     }
 
 
+def first_shell_segment(cmd: str) -> str:
+    text = strip_shell_command_marker(cmd).strip()
+    if not text:
+        return ""
+    first_line = strip_heredoc_bodies_for_detection(text).splitlines()[0].strip()
+    for separator in ("&&", "||", ";", "|"):
+        if separator in first_line:
+            first_line = first_line.split(separator, 1)[0].strip()
+    return first_line
+
+
+def is_observation_command(cmd: str) -> bool:
+    first = first_shell_segment(cmd).lower()
+    if not first:
+        return False
+    observation_prefixes = (
+        "sleep ",
+        "tail ",
+        "cat ",
+        "grep ",
+        "rg ",
+        "sed ",
+        "awk ",
+        "head ",
+        "ps ",
+        "pgrep ",
+        "lsof ",
+        "find ",
+        "test ",
+        "[ ",
+        "stat ",
+        "wc ",
+        "jq ",
+        "python - <<",
+        "python3 - <<",
+        "start-sleep ",
+        "get-content ",
+        "select-string ",
+        "get-process ",
+        "where-object ",
+    )
+    return first in {"sleep", "ps", "cat", "tail", "grep", "rg"} or first.startswith(observation_prefixes)
+
+
+def command_kind(cmd: str) -> str:
+    text = strip_heredoc_bodies_for_detection(strip_shell_command_marker(cmd)).lower()
+    first = first_shell_segment(cmd).lower()
+    if any(token in first for token in ("pip ", "pip3 ", "uv pip ", "npm install", "pnpm install", "yarn install", "brew ", "apt ", "apt-get ")):
+        return "install"
+    if any(token in text for token in ("npm run build", "pnpm build", "yarn build", "vite build", "next build", "cargo build", "go build")):
+        return "build"
+    if any(token in text for token in ("curl ", "wget ", "git clone", "git pull", "download", "fetch")):
+        return "data_fetch"
+    if is_long_running(cmd):
+        return "server"
+    if is_observation_command(cmd):
+        return "observe"
+    return "unknown"
+
+
 def looks_like_raw_shell_script(text: str) -> bool:
     """仅在用户粘贴的是纯命令片段时，才允许无 fenced 命令块的兼容模式。"""
     stripped = (text or "").strip()
@@ -1692,7 +1810,9 @@ def is_long_running(cmd: str) -> bool:
     cmd = strip_shell_command_marker(cmd)
     detection_cmd = strip_heredoc_bodies_for_detection(cmd).strip() or cmd
     command_text = detection_cmd.lower()
-    first_line = detection_cmd.splitlines()[0].lower().strip() if detection_cmd.splitlines() else ""
+    first_line = first_shell_segment(detection_cmd).lower()
+    if is_observation_command(cmd):
+        return False
     if any(kw in first_line for kw in ['pip', 'install', 'brew', 'apt', 'git clone']):
         return False
 
@@ -1815,33 +1935,102 @@ def shell_launch_for_command(cmd: str, interactive: bool = False, script_path: s
     return shell_launch_args(cmd, interactive=interactive)
 
 
-def run_shell_command_capture(cmd: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+class BackgroundProcessStarted(Exception):
+    def __init__(self, info: Dict[str, object], output: str = ""):
+        super().__init__("process moved to background")
+        self.info = info
+        self.output = output
+
+
+def command_log_path(project_root: str, name: str) -> tuple[str, str]:
+    terminal_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    log_path = os.path.join(terminal_cache_dir(project_root), f"{terminal_id}-{safe_terminal_log_name(name)}.log")
+    return terminal_id, log_path
+
+
+def remove_temp_script_later(path: str):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def append_process_stream_to_log(process: subprocess.Popen, log_path: str, script_path: str = ""):
+    try:
+        with open(log_path, "a", encoding="utf-8", newline="\n") as f:
+            stream = process.stdout
+            if stream is not None:
+                while True:
+                    chunk = stream.readline()
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    f.flush()
+            exit_code = process.wait()
+            f.write(f"\n--- 退出码: {exit_code} ---")
+    except OSError:
+        try:
+            process.wait()
+        except Exception:
+            pass
+    finally:
+        remove_temp_script_later(script_path)
+
+
+def run_shell_command_capture(cmd: str, cwd: str, timeout: int, project_root: str = "", display_name: str = "") -> subprocess.CompletedProcess:
+    script_path = ""
     if platform.system() == "Windows" and is_powershell_command(cmd):
         script_path = write_temp_shell_script(cmd)
-        shell, args = shell_launch_for_command(cmd, script_path=script_path)
-        try:
-            return subprocess.run(
-                [shell, *args],
-                cwd=cwd,
-                env=agent_runtime_env(create=False),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        finally:
-            try:
-                os.remove(script_path)
-            except OSError:
-                pass
-    return subprocess.run(
-        strip_shell_command_marker(cmd),
-        shell=True,
+    elif should_use_temp_shell_script(cmd):
+        script_path = write_temp_shell_script(cmd)
+    shell, args = shell_launch_for_command(cmd, script_path=script_path)
+    process = subprocess.Popen(
+        [shell, *args],
         cwd=cwd,
         env=agent_runtime_env(create=False),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=timeout,
+        bufsize=1,
     )
+    try:
+        stdout, _stderr = process.communicate(timeout=timeout)
+        remove_temp_script_later(script_path)
+        return subprocess.CompletedProcess([shell, *args], process.returncode, stdout or "", "")
+    except subprocess.TimeoutExpired as exc:
+        if not project_root:
+            process.kill()
+            stdout, _stderr = process.communicate()
+            remove_temp_script_later(script_path)
+            raise subprocess.TimeoutExpired(exc.cmd, exc.timeout, output=stdout)
+        captured = exc.output or ""
+        if isinstance(captured, bytes):
+            captured = decode_process_output(captured)
+        terminal_id, log_path = command_log_path(project_root, display_name or "timeout-command")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"$ {strip_shell_command_marker(cmd)}\n# cwd: {cwd}\n# pid: {process.pid}\n")
+            if captured:
+                f.write(str(captured))
+        thread = threading.Thread(
+            target=append_process_stream_to_log,
+            args=(process, log_path, script_path),
+            daemon=True,
+        )
+        thread.start()
+        raise BackgroundProcessStarted({
+            "id": terminal_id,
+            "cmd": cmd,
+            "cwd": cwd,
+            "name": display_name or "timeout-command",
+            "pid": process.pid,
+            "log_path": log_path,
+            "launch_reason": "timeout",
+            "command_kind": command_kind(cmd),
+            "expected_persistent": True,
+        }, output=str(captured or ""))
 
 
 def decode_process_output(data: bytes) -> str:
@@ -1877,6 +2066,19 @@ def project_cache_key(root: str) -> str:
 
 def project_cache_dir(root: str) -> str:
     return os.path.join(AGENT_HOME_DIR, "projects", project_cache_key(root))
+
+
+def terminal_cache_dir(root: str) -> str:
+    return os.path.join(project_cache_dir(root), "terminals")
+
+
+def terminal_registry_path(root: str) -> str:
+    return os.path.join(terminal_cache_dir(root), "registry.json")
+
+
+def safe_terminal_log_name(name: str) -> str:
+    base = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(name or "terminal")).strip("._-") or "terminal"
+    return base[:48]
 
 
 def snapshot_project(root: str) -> Dict[str, bytes]:
@@ -2109,6 +2311,7 @@ class InternalGitChangeTracker:
                     "diff_rows": [] if is_binary else parse_unified_diff_lines(diff),
                     "binary": is_binary,
                     "internal_git": True,
+                    "internal_git_repo": self.repo_root,
                     "before_commit": before_commit,
                     "after_commit": after_commit,
                     "undoable": undoable,
@@ -2287,6 +2490,19 @@ def format_change_context_summary(records: List[Dict[str, object]]) -> str:
         "Git diff file names:",
         f"{len(records)} files changed{stat_suffix}",
     ]
+    internal_records = [record for record in records if record.get("internal_git")]
+    if internal_records:
+        repo = str(internal_records[0].get("internal_git_repo") or "").strip()
+        before_commit = str(internal_records[0].get("before_commit") or "").strip()
+        after_commit = str(internal_records[0].get("after_commit") or "").strip()
+        lines.extend([
+            "",
+            "Internal git snapshot:",
+            f"repo: {repo or 'unavailable'}",
+            f"before_commit: {before_commit or 'unavailable'}",
+            f"after_commit: {after_commit or 'unavailable'}",
+        ])
+        lines.append("")
     for record in records:
         status = str(record.get("status", "modified"))
         marker = {"added": "A", "deleted": "D"}.get(status, "M")
@@ -2304,11 +2520,40 @@ def format_change_context_summary(records: List[Dict[str, object]]) -> str:
         else:
             lines.append(f"{record.get('path', '')}  (binary/metadata or full-file change)")
     lines.append("")
-    lines.append("未附完整 diff。若下一步需要具体内容，请用 git diff/读取文件命令按文件名查询。")
+    lines.append("未附完整 diff。若下一步需要具体内容，请自主使用可用命令按摘要信息查询。")
     return "\n".join(lines)
 
 
-def build_execution_context_content(full_log: str, records: List[Dict[str, object]], long_running_launches: int = 0) -> str:
+def format_terminal_launch_summary(launches: List[Dict[str, object]]) -> str:
+    if not launches:
+        return ""
+    lines = [
+        "Terminal processes:",
+        f"{len(launches)} terminal process(es) launched or tracked.",
+    ]
+    for item in launches:
+        lines.append(
+            " - "
+            f"id={item.get('id') or 'unknown'}  "
+            f"pid={item.get('pid') or 0}  "
+            f"status={item.get('status') or 'unknown'}  "
+            f"persistent={bool(item.get('persistent'))}  "
+            f"launch_reason={item.get('launch_reason') or 'unknown'}  "
+            f"command_kind={item.get('command_kind') or 'unknown'}  "
+            f"registry={item.get('registry_path') or 'unavailable'}  "
+            f"log={item.get('log_path') or 'unavailable'}  "
+            f"name={item.get('name') or ''}"
+        )
+    lines.append("这些只是终端索引摘要；需要持续日志或关闭进程时，请按 log_path/PID 自主查询或处理。")
+    return "\n".join(lines)
+
+
+def build_execution_context_content(
+    full_log: str,
+    records: List[Dict[str, object]],
+    long_running_launches: int = 0,
+    terminal_launches: Optional[List[Dict[str, object]]] = None,
+) -> str:
     parts = [
         "【执行日志（低密度，自动压缩优先）】",
         low_value_context_block("execution_log", truncate_middle(str(full_log or "").strip(), 6000)),
@@ -2319,15 +2564,52 @@ def build_execution_context_content(full_log: str, records: List[Dict[str, objec
             "【文件变更摘要（高密度，优先保留）】",
             format_change_context_summary(records),
         ])
+    if terminal_launches:
+        parts.extend([
+            "",
+            "【终端进程摘要（高密度，优先保留）】",
+            format_terminal_launch_summary(terminal_launches),
+        ])
     elif long_running_launches:
         parts.extend([
             "",
             "Git diff file names:",
             "未检测到文件改动。若命令正在底部终端继续运行，保存/生成文件后需要等待进程结束或再执行一次检查。",
         ])
-    else:
+    if not records and not terminal_launches and not long_running_launches:
         parts.extend(["", "Git diff file names:", "未检测到文件改动。"])
     return "\n".join(parts)
+
+
+def build_terminal_context_content(info: Dict[str, object]) -> str:
+    name = str(info.get("name") or "终端进程").strip()
+    cmd = strip_shell_command_marker(str(info.get("cmd") or "")).strip()
+    cwd = str(info.get("cwd") or "").strip()
+    exit_code = info.get("exit_code")
+    pid = info.get("pid") or 0
+    log_path = str(info.get("log_path") or "").strip()
+    expected_persistent = bool(info.get("expected_persistent"))
+    launch_reason = str(info.get("launch_reason") or "").strip()
+    kind = str(info.get("command_kind") or "").strip()
+    log = str(info.get("log") or "").strip()
+    header = [
+        f"【终端执行结果（低密度，自动压缩优先）】",
+        f"name: {name}",
+        f"cwd: {cwd or '未知'}",
+        f"pid: {pid}",
+        f"expected_persistent: {expected_persistent}",
+        f"launch_reason: {launch_reason or 'unknown'}",
+        f"command_kind: {kind or 'unknown'}",
+        f"exit_code: {exit_code}",
+        f"log_path: {log_path or 'unavailable'}",
+    ]
+    if cmd:
+        header.append("command:")
+        header.append(cmd)
+    return "\n".join(header + [
+        "",
+        low_value_context_block("terminal_log", truncate_middle(log, 8000)),
+    ])
 
 
 AUTOMATION_LOOP_MAX_ROUNDS = env_int("AGENT_QT_AUTOMATION_MAX_ROUNDS", 20, minimum=1)
@@ -2549,6 +2831,8 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 请基于日志和 diff 判断下一步：
 - 如果任务已经完成，只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。
 - 如果任务还没有完成，继续输出一个完整的 ```{command_block_lang} 代码块，并按既有“占位符 + 后续代码块”协议补齐需要写入的大段文件内容。
+- 如果上一轮把安装、构建、数据拉取或长耗时检查转入后台终端，不要把“已进入后台”当作任务完成。应先按终端摘要里的 log_path/PID/注册表判断它是否仍在运行；如果它仍可能在正常进行，输出一个短暂等待后读取对应日志/注册表的命令块，再由下一轮继续判断。
+- 如果后台终端日志已经显示成功、失败或明确缺失依赖，再基于该日志继续修复、验证或结束任务。
 - 不要重复已经成功完成的步骤；优先修复日志里的错误、补齐缺失文件或做必要验证。
 - 禁止输出备用方案或“如果上面失败就改用...”这类二选一命令；必须自己选择一个最高把握方案，只保留一种可执行路径。
 - 只支持带编号占位符；编号占位符可复用同一个代码块，例如多处 `<!-- Python block 1 -->` 都引用第 1 个 python 代码块。
@@ -2901,6 +3185,109 @@ def create_workspace_thread(root: str, threads: List[Dict[str, object]]) -> Dict
     os.makedirs(history_dir(root, thread_id), exist_ok=True)
     return thread
 
+
+def skills_root(root: str) -> str:
+    return os.path.join(root, HISTORY_DIR_NAME, "skills")
+
+
+def safe_skill_id(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(name or "").strip().lower()).strip("-_")
+    return cleaned[:64] or f"skill-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+
+def strip_markdown_code_fence(text: str) -> str:
+    content = str(text or "").strip()
+    match = re.fullmatch(r"```(?:markdown|md)?\s*(.*?)\s*```", content, flags=re.S | re.I)
+    return match.group(1).strip() if match else content
+
+
+def parse_skill_frontmatter(markdown_text: str) -> Dict[str, str]:
+    content = str(markdown_text or "").strip()
+    data = {"name": "", "description": ""}
+    match = re.match(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", content, flags=re.S)
+    if not match:
+        title_match = re.search(r"^#\s+(.+)$", content, flags=re.M)
+        if title_match:
+            data["name"] = safe_skill_id(title_match.group(1))
+        return data
+    for line in match.group(1).splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        if key in data:
+            data[key] = value.strip().strip('"').strip("'")
+    return data
+
+
+def normalize_skill_markdown(markdown_text: str, fallback_name: str = "") -> str:
+    content = strip_markdown_code_fence(markdown_text)
+    meta = parse_skill_frontmatter(content)
+    name = safe_skill_id(meta.get("name") or fallback_name)
+    description = (meta.get("description") or "Use this skill when the user request matches the instructions below.").strip()
+    body = re.sub(r"^---\s*\n.*?\n---\s*", "", content, flags=re.S).strip()
+    if not body:
+        body = "# Instructions\n\nFollow the user's provided process and constraints for this skill."
+    return f"---\nname: {name}\ndescription: {description}\n---\n\n{body.strip()}\n"
+
+
+def load_workspace_skills(root: str) -> List[Dict[str, str]]:
+    base = skills_root(root)
+    skills: List[Dict[str, str]] = []
+    if not os.path.isdir(base):
+        return skills
+    for entry in sorted(os.listdir(base)):
+        path = os.path.join(base, entry)
+        skill_file = os.path.join(path, "SKILL.md")
+        if not os.path.isdir(path) or not os.path.isfile(skill_file):
+            continue
+        try:
+            with open(skill_file, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            continue
+        meta = parse_skill_frontmatter(content)
+        skills.append({
+            "id": safe_skill_id(entry),
+            "name": meta.get("name") or entry,
+            "description": meta.get("description") or "",
+            "path": skill_file,
+            "dir": path,
+        })
+    return skills
+
+
+def save_workspace_skill(root: str, markdown_text: str) -> Dict[str, str]:
+    content = normalize_skill_markdown(markdown_text)
+    meta = parse_skill_frontmatter(content)
+    skill_id = safe_skill_id(meta.get("name"))
+    base = skills_root(root)
+    path = os.path.join(base, skill_id)
+    suffix = 2
+    while os.path.exists(path):
+        existing_file = os.path.join(path, "SKILL.md")
+        try:
+            with open(existing_file, "r", encoding="utf-8") as f:
+                if f.read() == content:
+                    break
+        except OSError:
+            pass
+        path = os.path.join(base, f"{skill_id}-{suffix}")
+        suffix += 1
+    os.makedirs(path, exist_ok=True)
+    skill_file = os.path.join(path, "SKILL.md")
+    tmp_path = skill_file + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    os.replace(tmp_path, skill_file)
+    return {
+        "id": os.path.basename(path),
+        "name": meta.get("name") or os.path.basename(path),
+        "description": meta.get("description") or "",
+        "path": skill_file,
+        "dir": path,
+    }
+
 def bytes_to_store(value: Optional[bytes]) -> Optional[str]:
     if value is None:
         return None
@@ -2925,6 +3312,9 @@ def serialize_change_record(record: Dict[str, object]) -> Dict[str, object]:
         "diff": str(record.get("diff", "")),
         "binary": bool(record.get("binary", False)),
         "internal_git": bool(record.get("internal_git", False)),
+        "internal_git_repo": str(record.get("internal_git_repo", "")),
+        "before_commit": str(record.get("before_commit", "")),
+        "after_commit": str(record.get("after_commit", "")),
         "undoable": bool(record.get("undoable", True)),
         "undone": bool(record.get("undone", False)),
     }
@@ -2947,6 +3337,9 @@ def deserialize_change_record(record: Dict[str, object]) -> Optional[Dict[str, o
         except (TypeError, ValueError):
             pass
     rebuilt["internal_git"] = bool(record.get("internal_git", False))
+    rebuilt["internal_git_repo"] = str(record.get("internal_git_repo", ""))
+    rebuilt["before_commit"] = str(record.get("before_commit", ""))
+    rebuilt["after_commit"] = str(record.get("after_commit", ""))
     rebuilt["binary"] = bool(record.get("binary", rebuilt.get("binary", False)))
     rebuilt["undoable"] = bool(record.get("undoable", True))
     rebuilt["undone"] = bool(record.get("undone", False))
@@ -3290,17 +3683,45 @@ class TerminalOutputEdit(QPlainTextEdit):
 
 class ManagedProcess(QWidget):
     remove_requested = Signal(object)
+    state_changed = Signal()
     
-    def __init__(self, cmd: str, cwd: str, name: str = "", interactive: bool = False):
+    def __init__(
+        self,
+        cmd: str,
+        cwd: str,
+        name: str = "",
+        interactive: bool = False,
+        terminal_id: str = "",
+        log_path: str = "",
+        expected_persistent: bool = False,
+        launch_reason: str = "",
+        command_kind_value: str = "",
+        external_pid: int = 0,
+    ):
         super().__init__()
         self.cmd = cmd
         self.cwd = cwd
         self.name = name or cmd[:40]
         self.interactive = interactive
+        self.expected_persistent = bool(expected_persistent or interactive)
+        self.launch_reason = launch_reason or ("interactive" if interactive else "manual")
+        self.command_kind = command_kind_value or command_kind(cmd)
+        self.terminal_id = terminal_id or uuid.uuid4().hex
+        self.log_path = log_path
+        self.started_at = datetime.now().isoformat(timespec="seconds")
+        self.finished_at = ""
+        self.exit_code: Optional[int] = None
+        self.pid = int(external_pid or 0)
+        self.external_process = bool(external_pid)
+        self._log_read_pos = 0
+        self.log_poll_timer: Optional[QTimer] = None
         self.process: Optional[QProcess] = None
         self.script_path = ""
         self.setup_ui()
-        self.start_process()
+        if self.external_process:
+            self.attach_external_process()
+        else:
+            self.start_process()
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -3387,13 +3808,78 @@ class ManagedProcess(QWidget):
         shell, args = shell_launch_for_command(self.cmd, interactive=self.interactive, script_path=self.script_path)
         self.process.start(shell, args)
 
+    def attach_external_process(self):
+        self.output.set_input_enabled(False)
+        self.refresh_external_log()
+        self.log_poll_timer = QTimer(self)
+        self.log_poll_timer.timeout.connect(self.refresh_external_log)
+        self.log_poll_timer.start(1000)
+
+    def append_log_file(self, text: str):
+        if not text or not self.log_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        except OSError:
+            pass
+
+    def process_id(self) -> int:
+        if self.pid:
+            return self.pid
+        try:
+            return int(self.process.processId()) if self.process is not None else 0
+        except (RuntimeError, TypeError, ValueError):
+            return 0
+
+    def is_running(self) -> bool:
+        if self.external_process:
+            if self.pid <= 0:
+                return False
+            try:
+                os.kill(self.pid, 0)
+                return True
+            except OSError:
+                return False
+        try:
+            return bool(self.process and self.process.state() != QProcess.ProcessState.NotRunning)
+        except RuntimeError:
+            return False
+
+    def refresh_external_log(self):
+        if not self.log_path or not os.path.isfile(self.log_path):
+            return
+        try:
+            with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._log_read_pos)
+                text = f.read()
+                self._log_read_pos = f.tell()
+        except OSError:
+            return
+        if text:
+            self.output.append_process_text(text)
+        if not self.is_running() and self.log_poll_timer is not None:
+            if not self.finished_at:
+                self.finished_at = datetime.now().isoformat(timespec="seconds")
+            self.log_poll_timer.stop()
+            self.state_changed.emit()
+
     def on_started(self):
+        try:
+            self.pid = int(self.process.processId()) if self.process is not None else 0
+        except (RuntimeError, TypeError, ValueError):
+            self.pid = 0
         if self.interactive:
-            self.output.append_process_text(f"# shell: {self.name}\n# cwd: {self.cwd}\n")
+            text = f"# shell: {self.name}\n# cwd: {self.cwd}\n# pid: {self.process_id()}\n"
+            self.output.append_process_text(text)
+            self.append_log_file(text)
             self.output.set_input_enabled(True)
         else:
             self.output.set_input_enabled(False)
-            self.output.append_process_text(f"$ {strip_shell_command_marker(self.cmd)}\n# cwd: {self.cwd}\n")
+            text = f"$ {strip_shell_command_marker(self.cmd)}\n# cwd: {self.cwd}\n# pid: {self.process_id()}\n"
+            self.output.append_process_text(text)
+            self.append_log_file(text)
 
     def read_output(self):
         if not self.process:
@@ -3401,23 +3887,31 @@ class ManagedProcess(QWidget):
         text = decode_process_output(self.process.readAllStandardOutput().data())
         if text:
             self.output.append_process_text(text)
+            self.append_log_file(text)
 
     def on_error(self, _err):
         try:
             message = self.process.errorString() if self.process else "未知错误"
         except RuntimeError:
             message = "进程已关闭"
-        self.output.append_process_text(f"\n--- 启动失败: {message} ---")
+        text = f"\n--- 启动失败: {message} ---"
+        self.output.append_process_text(text)
+        self.append_log_file(text)
 
     def on_finished(self, exit_code: int, _exit_status):
+        self.exit_code = int(exit_code)
+        self.finished_at = datetime.now().isoformat(timespec="seconds")
         self.output.set_input_enabled(False)
-        self.output.append_process_text(f"\n--- 退出码: {exit_code} ---")
+        text = f"\n--- 退出码: {exit_code} ---"
+        self.output.append_process_text(text)
+        self.append_log_file(text)
         if self.script_path:
             try:
                 os.remove(self.script_path)
             except OSError:
                 pass
             self.script_path = ""
+        self.state_changed.emit()
 
     def copy_output(self):
         QApplication.clipboard().setText(self.output.toPlainText())
@@ -3449,6 +3943,22 @@ class ManagedProcess(QWidget):
         self.process.waitForBytesWritten(800)
     
     def kill(self):
+        if self.external_process:
+            if self.log_poll_timer is not None:
+                self.log_poll_timer.stop()
+            if self.pid > 0 and self.is_running():
+                try:
+                    if platform.system() == "Windows":
+                        subprocess.run(["taskkill", "/PID", str(self.pid), "/T", "/F"], capture_output=True, text=True, timeout=8)
+                    else:
+                        os.kill(self.pid, signal.SIGTERM)
+                except Exception:
+                    pass
+            self.output.set_input_enabled(False)
+            text = "\n--- 已关闭 ---"
+            self.output.append_process_text(text)
+            self.append_log_file(text)
+            return
         if not self.process:
             return
         try:
@@ -3458,7 +3968,9 @@ class ManagedProcess(QWidget):
                     self.process.kill()
                     self.process.waitForFinished(1200)
                 self.output.set_input_enabled(False)
-                self.output.append_process_text("\n--- 已关闭 ---")
+                text = "\n--- 已关闭 ---"
+                self.output.append_process_text(text)
+                self.append_log_file(text)
         except RuntimeError:
             pass
         finally:
@@ -3571,6 +4083,7 @@ class TerminalTabCard(QFrame):
 
 class TerminalPanel(QWidget):
     collapsed_signal = Signal()
+    process_finished_signal = Signal(dict)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3667,10 +4180,90 @@ class TerminalPanel(QWidget):
         layout.addItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
         self.processes: List[ManagedProcess] = []
+        self.completed_terminal_entries: List[Dict[str, object]] = []
         self.setVisible(False)
 
     def set_project_root(self, path: str):
         self.project_root = path
+        self.load_completed_terminal_entries()
+        self.write_process_registry()
+
+    def registry_path(self) -> str:
+        root = self.project_root or os.path.expanduser("~")
+        return terminal_registry_path(root)
+
+    def logs_dir(self) -> str:
+        root = self.project_root or os.path.expanduser("~")
+        return terminal_cache_dir(root)
+
+    def process_registry_entry(self, proc: ManagedProcess) -> Dict[str, object]:
+        return {
+            "id": proc.terminal_id,
+            "name": proc.name,
+            "cmd": strip_shell_command_marker(proc.cmd),
+            "cwd": proc.cwd,
+            "interactive": proc.interactive,
+            "expected_persistent": proc.expected_persistent,
+            "external_process": proc.external_process,
+            "launch_reason": proc.launch_reason,
+            "command_kind": proc.command_kind,
+            "pid": proc.process_id(),
+            "running": proc.is_running(),
+            "status": "running" if proc.is_running() else "exited",
+            "exit_code": proc.exit_code,
+            "started_at": proc.started_at,
+            "finished_at": proc.finished_at,
+            "log_path": proc.log_path,
+        }
+
+    def load_completed_terminal_entries(self):
+        self.completed_terminal_entries = []
+        path = self.registry_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        entries = payload.get("completed_processes")
+        if not isinstance(entries, list):
+            entries = [
+                item for item in payload.get("processes", [])
+                if isinstance(item, dict) and not bool(item.get("running"))
+            ] if isinstance(payload.get("processes"), list) else []
+        self.completed_terminal_entries = [
+            dict(item) for item in entries[-TERMINAL_COMPLETED_HISTORY_LIMIT:]
+            if isinstance(item, dict) and item.get("id")
+        ]
+
+    def remember_completed_process(self, proc: ManagedProcess):
+        entry = self.process_registry_entry(proc)
+        entry["running"] = False
+        entry["status"] = "exited"
+        entry["remembered_at"] = datetime.now().isoformat(timespec="seconds")
+        existing = [item for item in self.completed_terminal_entries if item.get("id") != entry.get("id")]
+        existing.append(entry)
+        self.completed_terminal_entries = existing[-TERMINAL_COMPLETED_HISTORY_LIMIT:]
+
+    def write_process_registry(self):
+        path = self.registry_path()
+        active_entries = [self.process_registry_entry(proc) for proc in self.processes]
+        payload = {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "project_root": self.project_root,
+            "processes": active_entries + self.completed_terminal_entries,
+            "active_processes": active_entries,
+            "completed_processes": self.completed_terminal_entries,
+        }
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        except OSError:
+            pass
 
     def terminal_title(self, cwd: str, index: Optional[int] = None) -> str:
         root = self.project_root or cwd
@@ -3679,14 +4272,39 @@ class TerminalPanel(QWidget):
             return f"{name} {index}"
         return name
     
-    def add_process(self, cmd: str, cwd: str, name: str = "", interactive: bool = False):
+    def add_process(
+        self,
+        cmd: str,
+        cwd: str,
+        name: str = "",
+        interactive: bool = False,
+        expected_persistent: bool = False,
+        launch_reason: str = "",
+        command_kind_value: str = "",
+    ):
         if not interactive and (not cmd.strip() or is_interactive_shell_command(cmd)):
             return None
         label = name.strip() if name.strip() else self.terminal_title(cwd, len(self.processes) + 1)
-        proc = ManagedProcess(cmd, cwd, label, interactive=interactive)
+        terminal_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        log_path = os.path.join(self.logs_dir(), f"{terminal_id}-{safe_terminal_log_name(label)}.log")
+        proc = ManagedProcess(
+            cmd,
+            cwd,
+            label,
+            interactive=interactive,
+            terminal_id=terminal_id,
+            log_path=log_path,
+            expected_persistent=expected_persistent,
+            launch_reason=launch_reason,
+            command_kind_value=command_kind_value,
+        )
         proc.remove_requested.connect(self.remove_process)
+        proc.state_changed.connect(self.write_process_registry)
         if proc.process:
             proc.process.finished.connect(lambda _code, _status, p=proc: self.refresh_process_state(p))
+            proc.process.finished.connect(lambda code, _status, p=proc: self.emit_process_finished_log(p, code))
+            proc.process.started.connect(self.write_process_registry)
+            proc.process.finished.connect(lambda _code, _status: self.write_process_registry())
         self.processes.append(proc)
         self.stack.addWidget(proc)
         card = TerminalTabCard(proc, label, parent=self)
@@ -3700,11 +4318,67 @@ class TerminalPanel(QWidget):
         self.setVisible(True)
         self.refresh_header()
         self.expand()
+        self.write_process_registry()
         return proc
+
+    def add_external_process(self, info: Dict[str, object]):
+        cmd = str(info.get("cmd") or "")
+        cwd = str(info.get("cwd") or self.project_root or os.path.expanduser("~"))
+        label = str(info.get("name") or "timeout-command")
+        proc = ManagedProcess(
+            cmd,
+            cwd,
+            label,
+            interactive=False,
+            terminal_id=str(info.get("id") or ""),
+            log_path=str(info.get("log_path") or ""),
+            expected_persistent=bool(info.get("expected_persistent", True)),
+            launch_reason=str(info.get("launch_reason") or "timeout"),
+            command_kind_value=str(info.get("command_kind") or command_kind(cmd)),
+            external_pid=int(info.get("pid") or 0),
+        )
+        proc.remove_requested.connect(self.remove_process)
+        proc.state_changed.connect(self.write_process_registry)
+        self.processes.append(proc)
+        self.stack.addWidget(proc)
+        card = TerminalTabCard(proc, label, parent=self)
+        card.selected.connect(self.select_process)
+        card.close_requested.connect(self.remove_process)
+        self.tab_cards[proc] = card
+        insert_at = max(0, self.tab_row.count() - 2)
+        self.tab_row.insertWidget(insert_at, card)
+        self.select_process(proc)
+        self.stack.setVisible(True)
+        self.setVisible(True)
+        self.refresh_header()
+        self.expand()
+        self.write_process_registry()
+        return proc
+
+    def emit_process_finished_log(self, proc: ManagedProcess, exit_code: int):
+        try:
+            log = proc.output.toPlainText()
+        except RuntimeError:
+            return
+        self.remember_completed_process(proc)
+        self.write_process_registry()
+        self.process_finished_signal.emit({
+            "cmd": proc.cmd,
+            "cwd": proc.cwd,
+            "name": proc.name,
+            "interactive": proc.interactive,
+            "expected_persistent": proc.expected_persistent,
+            "launch_reason": proc.launch_reason,
+            "command_kind": proc.command_kind,
+            "exit_code": exit_code,
+            "log": log,
+            "log_path": proc.log_path,
+            "pid": proc.process_id(),
+        })
 
     def create_interactive_terminal(self):
         cwd = self.project_root or os.path.expanduser("~")
-        self.add_process("", cwd, self.terminal_title(cwd, len(self.processes) + 1), interactive=True)
+        self.add_process("", cwd, self.terminal_title(cwd, len(self.processes) + 1), interactive=True, expected_persistent=True)
 
     def select_process(self, proc: ManagedProcess):
         if proc not in self.processes:
@@ -3723,6 +4397,7 @@ class TerminalPanel(QWidget):
             return
     
     def remove_process(self, proc: ManagedProcess):
+        self.remember_completed_process(proc)
         proc.kill()
         card = self.tab_cards.pop(proc, None)
         if card:
@@ -3741,6 +4416,7 @@ class TerminalPanel(QWidget):
         else:
             self.select_process(self.processes[min(idx if idx >= 0 else 0, len(self.processes) - 1)])
         self.refresh_header()
+        self.write_process_registry()
 
     def close_all_processes(self):
         for proc in list(self.processes):
@@ -3789,7 +4465,8 @@ class TerminalPanel(QWidget):
 # ============================================================
 class ExecuteWorker(QThread):
     output_signal = Signal(str)
-    long_running_signal = Signal(str, str, str)
+    long_running_signal = Signal(str, str, str, str, str)
+    background_process_signal = Signal(dict)
     finished_signal = Signal(str)
     
     def __init__(self, commands: List[str], cwd: str):
@@ -3821,23 +4498,30 @@ class ExecuteWorker(QThread):
                 continue
             if is_long_running(cmd):
                 outputs.append(f"[{i}] 🔵 后台: {display_cmd}")
-                self.long_running_signal.emit(cmd, cwd, display_cmd.splitlines()[0][:40])
+                self.long_running_signal.emit(cmd, cwd, display_cmd.splitlines()[0][:40], "long_running_pattern", command_kind(cmd))
                 self.output_signal.emit(outputs[-1])
                 continue
             try:
-                r = run_shell_command_capture(cmd, cwd, timeout=30)
+                r = run_shell_command_capture(cmd, cwd, timeout=30, project_root=self.cwd, display_name=display_cmd.splitlines()[0][:40])
                 out = r.stdout.strip()
                 if r.stderr.strip():
                     out += "\n" + r.stderr.strip()
                 if r.returncode != 0:
                     out += f"\n[退出码: {r.returncode}]"
                 outputs.append(f"[{i}] 💻 {display_cmd}\n📤 {out or '(无输出)'}")
+            except BackgroundProcessStarted as exc:
+                info = dict(exc.info)
+                self.background_process_signal.emit(info)
+                outputs.append(
+                    f"[{i}] ⏱️ 超时 → 后台: {display_cmd}\n"
+                    f"pid={info.get('pid') or 0} log={info.get('log_path') or ''}"
+                )
             except subprocess.TimeoutExpired:
                 if is_interactive_shell_command(cmd):
                     outputs.append(f"[{i}] ⚠️ 交互式 Shell 已超时，未创建后台终端: {display_cmd}")
                 else:
                     outputs.append(f"[{i}] ⏱️ 超时 → 后台: {display_cmd}")
-                    self.long_running_signal.emit(cmd, cwd, display_cmd.splitlines()[0][:40])
+                    self.long_running_signal.emit(cmd, cwd, display_cmd.splitlines()[0][:40], "timeout", command_kind(cmd))
             except Exception as e:
                 outputs.append(f"[{i}] ❌ {e}")
             self.output_signal.emit(outputs[-1])
@@ -6083,6 +6767,48 @@ class ThreadCard(QFrame):
         event.accept()
 
 
+class SkillCard(QFrame):
+    selected = Signal(str)
+
+    def __init__(self, skill: Dict[str, str], parent=None):
+        super().__init__(parent)
+        self.skill = skill
+        self.skill_id = str(skill.get("id") or "")
+        self.setObjectName("skillCard")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
+        title = QLabel(str(self.skill.get("name") or self.skill_id or "skill"))
+        title.setStyleSheet(f"background: transparent; border: none; color: {COLORS['text']}; font-size: 12px; font-weight: 900;")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        description = str(self.skill.get("description") or "").strip()
+        if description:
+            desc = QLabel(description)
+            desc.setWordWrap(True)
+            desc.setStyleSheet(f"background: transparent; border: none; color: {COLORS['text_secondary']}; font-size: 11px;")
+            layout.addWidget(desc)
+        self.setStyleSheet(f"""
+            QFrame#skillCard {{
+                background: {COLORS['surface']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+            }}
+            QFrame#skillCard:hover {{
+                background: {COLORS['surface_alt']};
+                border-color: #d8d0ff;
+            }}
+        """)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        self.selected.emit(self.skill_id)
+        super().mousePressEvent(event)
+
+
 class Sidebar(QFrame):
     file_opened = Signal(str)
     back_home_requested = Signal()
@@ -6090,6 +6816,9 @@ class Sidebar(QFrame):
     new_thread_requested = Signal()
     delete_thread_requested = Signal(str)
     rename_thread_requested = Signal(str, str)
+    new_skill_requested = Signal()
+    skill_selected = Signal(str)
+    refresh_skills_requested = Signal()
     delete_path_requested = Signal(str)
     
     def __init__(self, parent=None):
@@ -6103,6 +6832,7 @@ class Sidebar(QFrame):
         self._active_tab = "threads"
         self._active_thread_id = DEFAULT_THREAD_ID
         self.thread_cards: Dict[str, ThreadCard] = {}
+        self.skill_cards: Dict[str, SkillCard] = {}
         
         self.setStyleSheet(f"""
             QFrame {{
@@ -6119,13 +6849,13 @@ class Sidebar(QFrame):
         nav_row.setSpacing(6)
         self.threads_tab_btn = self.create_nav_button("会话列表")
         self.files_tab_btn = self.create_nav_button("项目文件")
-        self.home_tab_btn = self.create_nav_button("返回首页")
+        self.skills_tab_btn = self.create_nav_button("技能列表")
         self.threads_tab_btn.clicked.connect(lambda: self.set_tab("threads"))
         self.files_tab_btn.clicked.connect(lambda: self.set_tab("files"))
-        self.home_tab_btn.clicked.connect(self.back_home_requested.emit)
+        self.skills_tab_btn.clicked.connect(lambda: self.set_tab("skills"))
         nav_row.addWidget(self.threads_tab_btn)
         nav_row.addWidget(self.files_tab_btn)
-        nav_row.addWidget(self.home_tab_btn)
+        nav_row.addWidget(self.skills_tab_btn)
         layout.addLayout(nav_row)
 
         self.root_label = QLabel("未选择目录")
@@ -6189,6 +6919,21 @@ class Sidebar(QFrame):
         self.thread_list_layout.addStretch()
         threads_layout.addWidget(self.thread_list, 1)
         self.stack.addWidget(self.threads_page)
+
+        self.skills_page = QWidget()
+        skills_layout = QVBoxLayout(self.skills_page)
+        skills_layout.setContentsMargins(0, 0, 0, 0)
+        skills_layout.setSpacing(8)
+        skill_label = QLabel("技能")
+        skill_label.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900; background: transparent; border: none;")
+        skills_layout.addWidget(skill_label)
+        self.skill_list = QWidget()
+        self.skill_list_layout = QVBoxLayout(self.skill_list)
+        self.skill_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.skill_list_layout.setSpacing(8)
+        self.skill_list_layout.addStretch()
+        skills_layout.addWidget(self.skill_list, 1)
+        self.stack.addWidget(self.skills_page)
         layout.addWidget(self.stack, 1)
 
         self.bottom_btn = QPushButton("刷新文件树")
@@ -6239,17 +6984,20 @@ class Sidebar(QFrame):
 
     def set_tab(self, tab: str):
         self._active_tab = tab
-        self.stack.setCurrentWidget(self.threads_page if tab == "threads" else self.files_page)
+        page = self.threads_page if tab == "threads" else (self.skills_page if tab == "skills" else self.files_page)
+        self.stack.setCurrentWidget(page)
         self.files_tab_btn.setStyleSheet(self.nav_button_style(tab == "files"))
         self.threads_tab_btn.setStyleSheet(self.nav_button_style(tab == "threads"))
-        self.home_tab_btn.setStyleSheet(self.nav_button_style(False))
-        self.bottom_btn.setText("新建会话" if tab == "threads" else "刷新文件树")
+        self.skills_tab_btn.setStyleSheet(self.nav_button_style(tab == "skills"))
+        self.bottom_btn.setText("新建会话" if tab == "threads" else ("刷新技能列表" if tab == "skills" else "刷新文件树"))
         try:
             self.bottom_btn.clicked.disconnect()
         except (TypeError, RuntimeError):
             pass
         if tab == "threads":
             self.bottom_btn.clicked.connect(self.new_thread_requested.emit)
+        elif tab == "skills":
+            self.bottom_btn.clicked.connect(self.refresh_skills_requested.emit)
         else:
             self.bottom_btn.clicked.connect(lambda: self.refresh_tree(self._root_path))
 
@@ -6373,6 +7121,25 @@ class Sidebar(QFrame):
         self._active_thread_id = safe_thread_id(thread_id)
         for card in self.thread_cards.values():
             card.set_active(card.thread_id == self._active_thread_id)
+
+    def set_skills(self, skills: List[Dict[str, str]]):
+        while self.skill_list_layout.count() > 1:
+            item = self.skill_list_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self.skill_cards = {}
+        if not skills:
+            empty = QLabel("暂无技能。")
+            empty.setWordWrap(True)
+            empty.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none; font-size: 12px; padding: 10px;")
+            self.skill_list_layout.insertWidget(0, empty)
+            return
+        for skill in skills:
+            card = SkillCard(skill, parent=self.skill_list)
+            card.selected.connect(self.skill_selected.emit)
+            self.skill_cards[card.skill_id] = card
+            self.skill_list_layout.insertWidget(self.skill_list_layout.count() - 1, card)
     
     def _populate(self, parent_item, path, dir_icon, file_icon, depth=0):
         if depth > 3:
@@ -6686,11 +7453,14 @@ class ChatPage(QWidget):
         self.project_root = ""
         self.thread_id = DEFAULT_THREAD_ID
         self.threads: List[Dict[str, object]] = [default_thread()]
+        self.skills: List[Dict[str, str]] = []
+        self.selected_skill_ids: set[str] = set()
         self.cmd_outputs = []
         self.pending_snapshot: Dict[str, bytes] = {}
         self.change_tracker: Optional[InternalGitChangeTracker] = None
         self.pending_internal_git_commit = ""
         self.pending_long_running_launches = 0
+        self.pending_terminal_launches: List[Dict[str, object]] = []
         self.history_entries: List[Dict[str, object]] = []
         self.result_bubble: Optional[ExecutionLogPanel] = None
         self.worker: Optional[ExecuteWorker] = None
@@ -6731,6 +7501,8 @@ class ChatPage(QWidget):
         self.automation_input: Optional[QTextEdit] = None
         self.automation_send_btn: Optional[QToolButton] = None
         self.automation_context_mode_btn: Optional[QToolButton] = None
+        self.automation_skill_btn: Optional[QToolButton] = None
+        self.skill_generation_worker: Optional[AutomationChatWorker] = None
         self.last_automation_provider_compaction = "none"
         self.chat_column_max_width = 1480
         self.chat_column_width_ratio = 0.94
@@ -6768,6 +7540,9 @@ class ChatPage(QWidget):
         self.sidebar.new_thread_requested.connect(self.create_thread)
         self.sidebar.delete_thread_requested.connect(self.delete_thread)
         self.sidebar.rename_thread_requested.connect(self.rename_thread)
+        self.sidebar.new_skill_requested.connect(self.show_new_skill_dialog)
+        self.sidebar.skill_selected.connect(self.open_skill_file)
+        self.sidebar.refresh_skills_requested.connect(self.refresh_skills)
         self.sidebar.delete_path_requested.connect(self.delete_project_path)
         self.sidebar_btn = QToolButton()
         self.sidebar_btn.setText("›")
@@ -6993,9 +7768,15 @@ class ChatPage(QWidget):
         self.automation_context_mode_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.automation_context_mode_btn.setPopupMode(QToolButton.InstantPopup)
         self.automation_context_mode_btn.setFixedHeight(22)
-        self.automation_context_mode_btn.setMenu(self.create_automation_context_mode_menu())
         self.update_automation_context_mode_button()
         mode_row.addWidget(self.automation_context_mode_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self.automation_skill_btn = QToolButton(cursor=Qt.CursorShape.PointingHandCursor)
+        self.automation_skill_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.automation_skill_btn.setPopupMode(QToolButton.InstantPopup)
+        self.automation_skill_btn.setFixedHeight(22)
+        self.update_automation_skill_button()
+        mode_row.addSpacing(4)
+        mode_row.addWidget(self.automation_skill_btn, 0, Qt.AlignmentFlag.AlignLeft)
         mode_row.addStretch(1)
         composer_input_layout.addLayout(mode_row)
         composer_layout.addWidget(composer_input_column, 1)
@@ -7034,6 +7815,7 @@ class ChatPage(QWidget):
         
         self.terminal_panel = TerminalPanel()
         self.terminal_panel.collapsed_signal.connect(self.update_status_bar)
+        self.terminal_panel.process_finished_signal.connect(self.on_terminal_process_finished)
         self.terminal_resize_handle = TerminalResizeHandle(self.terminal_panel)
         self.terminal_resize_handle.resize_requested.connect(self.resize_terminal_panel)
         layout.addWidget(self.terminal_resize_handle)
@@ -7066,17 +7848,21 @@ class ChatPage(QWidget):
         self.change_tracker = InternalGitChangeTracker(path)
         self.threads = load_workspace_threads(path)
         save_workspace_threads(path, self.threads)
+        self.skills = load_workspace_skills(path)
+        self.selected_skill_ids = {skill_id for skill_id in self.selected_skill_ids if any(skill.get("id") == skill_id for skill in self.skills)}
         self.thread_id = load_last_thread_id(path, self.threads)
         self.path_label.setText(f"📁 {path}")
         self.terminal_panel.set_project_root(path)
         self.sidebar.refresh_tree(path)
         self.sidebar.set_threads(self.threads, self.thread_id)
+        self.sidebar.set_skills(self.skills)
         self.sidebar.set_tab("threads")
         self.expand_sidebar()
         self.load_history()
         if self.automation_enabled:
             self.run_automation_setup("start")
         self.update_prompt_tools_responsive()
+        self.update_automation_skill_button()
         self.update_status_bar()
 
     def confirm_back_home(self):
@@ -7095,8 +7881,11 @@ class ChatPage(QWidget):
         self.update_prompt_tools_responsive()
 
     def eventFilter(self, watched, event):
-        if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
-            self.update_chat_column_width()
+        try:
+            if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
+                self.update_chat_column_width()
+        except RuntimeError:
+            return False
         return super().eventFilter(watched, event)
 
     def update_chat_column_width(self):
@@ -7312,7 +8101,7 @@ class ChatPage(QWidget):
         return "专家模式 · 约45k"
 
     def create_automation_context_mode_menu(self) -> QMenu:
-        menu = QMenu(self)
+        menu = style_compact_popup_menu(QMenu(self))
         for label, mode in AUTOMATION_CONTEXT_MODES:
             suffix = f" · {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)}" if mode == "simple" else " · 约45k"
             action = QAction(label + suffix, self)
@@ -7322,12 +8111,21 @@ class ChatPage(QWidget):
             menu.addAction(action)
         return menu
 
+    def attach_button_sized_menu(self, button: QToolButton, menu: QMenu):
+        def sync_width():
+            width = button.width() or button.sizeHint().width()
+            menu.setFixedWidth(max(1, width))
+
+        menu.aboutToShow.connect(sync_width)
+        sync_width()
+        button.setMenu(menu)
+
     def update_automation_context_mode_button(self):
         button = self.automation_context_mode_btn
         if button is None:
             return
         button.setText(self.automation_context_mode_label() + " ▾")
-        button.setMenu(self.create_automation_context_mode_menu())
+        self.attach_button_sized_menu(button, self.create_automation_context_mode_menu())
         button.setStyleSheet(f"""
             QToolButton {{
                 background: transparent;
@@ -7348,6 +8146,257 @@ class ChatPage(QWidget):
             }}
         """)
 
+    def selected_skills(self) -> List[Dict[str, str]]:
+        selected = []
+        selected_ids = set(self.selected_skill_ids)
+        for skill in self.skills:
+            if str(skill.get("id") or "") in selected_ids:
+                selected.append(skill)
+        return selected
+
+    def selected_skills_context(self) -> str:
+        chunks: List[str] = []
+        for skill in self.selected_skills():
+            path = str(skill.get("path") or "")
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+            except OSError:
+                continue
+            if content:
+                chunks.append(f"【手动选择的 Skill: {skill.get('name') or skill.get('id')}】\n{content}")
+        return "\n\n".join(chunks).strip()
+
+    def create_automation_skill_menu(self) -> QMenu:
+        menu = style_compact_popup_menu(QMenu(self))
+        if not self.skills:
+            action = QAction("暂无技能", self)
+            action.setEnabled(False)
+            menu.addAction(action)
+        for skill in self.skills:
+            skill_id = str(skill.get("id") or "")
+            label = str(skill.get("name") or skill_id)
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(skill_id in self.selected_skill_ids)
+            action.triggered.connect(lambda checked=False, value=skill_id: self.toggle_automation_skill(value, checked))
+            menu.addAction(action)
+        if self.skills:
+            menu.addSeparator()
+            clear_action = QAction("清空选择", self)
+            clear_action.triggered.connect(self.clear_automation_skills)
+            clear_action.setEnabled(bool(self.selected_skill_ids))
+            menu.addAction(clear_action)
+        return menu
+
+    def update_automation_skill_button(self):
+        button = self.automation_skill_btn
+        if button is None:
+            return
+        count = len(self.selected_skills())
+        button.setText((f"技能 {count}" if count else "技能") + " ▾")
+        self.attach_button_sized_menu(button, self.create_automation_skill_menu())
+        button.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {COLORS['text_secondary']};
+                border: none;
+                border-radius: 8px;
+                padding: 2px 7px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QToolButton:hover {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text']};
+            }}
+            QToolButton::menu-indicator {{
+                image: none;
+                width: 0;
+            }}
+        """)
+
+    def toggle_automation_skill(self, skill_id: str, checked: bool):
+        if checked:
+            self.selected_skill_ids.add(skill_id)
+        else:
+            self.selected_skill_ids.discard(skill_id)
+        self.update_automation_skill_button()
+        self.update_automation_composer_state()
+
+    def clear_automation_skills(self):
+        self.selected_skill_ids.clear()
+        self.update_automation_skill_button()
+        self.update_automation_composer_state()
+
+    def refresh_skills(self):
+        if not self.project_root:
+            return
+        self.skills = load_workspace_skills(self.project_root)
+        valid = {str(skill.get("id") or "") for skill in self.skills}
+        self.selected_skill_ids = {skill_id for skill_id in self.selected_skill_ids if skill_id in valid}
+        self.sidebar.set_skills(self.skills)
+        self.update_automation_skill_button()
+        self.update_automation_composer_state()
+
+    def open_skill_file(self, skill_id: str):
+        skill = next((item for item in self.skills if item.get("id") == skill_id), None)
+        path = str((skill or {}).get("path") or "")
+        if path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def build_skill_generation_prompt(self, raw_text: str) -> str:
+        return f"""请把用户粘贴的内容整理成一个 Codex Skill 的标准 SKILL.md。
+
+要求：
+- 只输出 Markdown 文档本身，不要解释，不要包裹代码围栏。
+- 必须包含 YAML frontmatter，且只有必要字段：
+  ---
+  name: kebab-case-skill-name
+  description: Use when ...
+  ---
+- name 使用英文 kebab-case，简短稳定。
+- description 用英文，清楚说明什么时候触发这个 skill。
+- 正文用 Markdown，保留用户真正需要的流程、约束、模板、判断标准。
+- 内容要精炼，不写 README、安装说明、变更日志等无关材料。
+- 不要编造用户没有提供的事实；信息不足时写成可执行的通用约束。
+
+用户粘贴内容：
+```text
+{raw_text.strip()}
+```"""
+
+    def show_new_skill_dialog(self):
+        if not self.project_root:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("新建技能")
+        dialog.setMinimumSize(760, 620)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        hint = QLabel("粘贴任意内容，用简单模式 DeepSeek 整理成标准 SKILL.md；预览确认后保存到当前工作区技能列表。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px;")
+        layout.addWidget(hint)
+
+        source_edit = QTextEdit()
+        source_edit.setAcceptRichText(False)
+        source_edit.setPlaceholderText("粘贴流程、规则、模板、偏好或任意说明...")
+        source_edit.setFixedHeight(150)
+        source_edit.setStyleSheet(f"""
+            QTextEdit {{
+                background: {COLORS['surface']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+                padding: 10px;
+                font-size: 12px;
+            }}
+        """)
+        layout.addWidget(source_edit)
+
+        preview = QTextEdit()
+        preview.setAcceptRichText(False)
+        preview.setPlaceholderText("生成后的 SKILL.md 会显示在这里，可手动微调后保存。")
+        preview.setStyleSheet(source_edit.styleSheet())
+        layout.addWidget(preview, 1)
+
+        status = QLabel("")
+        status.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px;")
+        layout.addWidget(status)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        generate_btn = QPushButton("生成预览", cursor=Qt.PointingHandCursor)
+        save_btn = QPushButton("保存技能", cursor=Qt.PointingHandCursor)
+        cancel_btn = QPushButton("取消", cursor=Qt.PointingHandCursor)
+        save_btn.setEnabled(False)
+        for btn in (generate_btn, save_btn, cancel_btn):
+            btn.setFixedHeight(32)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 9px;
+                    padding: 6px 14px;
+                    font-size: 12px;
+                    font-weight: 800;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS['accent_light']};
+                    color: {COLORS['accent_dark']};
+                }}
+                QPushButton:disabled {{
+                    color: {COLORS['muted']};
+                    background: {COLORS['surface_alt']};
+                }}
+            """)
+            row.addWidget(btn)
+        layout.addLayout(row)
+
+        def finish_generation(text: str, error: str):
+            self.skill_generation_worker = None
+            generate_btn.setEnabled(True)
+            if error:
+                status.setText("生成失败：" + error[-500:])
+                return
+            content = normalize_skill_markdown(text, "custom-skill")
+            preview.setPlainText(content)
+            save_btn.setEnabled(True)
+            status.setText("已生成预览，可编辑后保存。")
+
+        def generate():
+            raw = source_edit.toPlainText().strip()
+            if not raw:
+                status.setText("请先粘贴内容。")
+                return
+            generate_btn.setEnabled(False)
+            save_btn.setEnabled(False)
+            status.setText("正在调用简单模式 DeepSeek 生成...")
+            worker = AutomationChatWorker(
+                self.automation_manager,
+                [{"role": "user", "content": self.build_skill_generation_prompt(raw)}],
+                "DeepSeekV4-simple",
+                self.thread_id + "-skill",
+            )
+            self.skill_generation_worker = worker
+            worker.finished_signal.connect(finish_generation)
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
+
+        def cleanup_worker():
+            worker = self.skill_generation_worker
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+                worker.terminate()
+                worker.wait(800)
+                self.skill_generation_worker = None
+
+        def save():
+            content = preview.toPlainText().strip()
+            if not content:
+                status.setText("没有可保存的 SKILL.md。")
+                return
+            try:
+                skill = save_workspace_skill(self.project_root, content)
+            except OSError as exc:
+                status.setText("保存失败：" + str(exc))
+                return
+            self.refresh_skills()
+            self.selected_skill_ids.add(str(skill.get("id") or ""))
+            self.update_automation_skill_button()
+            self.sidebar.set_tab("skills")
+            dialog.accept()
+
+        generate_btn.clicked.connect(generate)
+        save_btn.clicked.connect(save)
+        cancel_btn.clicked.connect(lambda: (cleanup_worker(), dialog.reject()))
+        dialog.finished.connect(lambda _result: cleanup_worker())
+        dialog.exec()
+
     def set_automation_context_mode(self, mode: str):
         self.automation_context_mode = "simple" if str(mode).strip().lower() == "simple" else "expert"
         set_automation_context_mode_setting(self.automation_context_mode)
@@ -7362,14 +8411,8 @@ class ChatPage(QWidget):
     def show_settings_menu(self):
         if agent_runtime_enabled() and not agent_runtime_ready():
             set_agent_runtime_enabled(False)
-        if self.automation_enabled:
-            dep = self.automation_manager.dependency_status()
-            if not dep.get("ready"):
-                self.automation_enabled = False
-                set_automation_enabled_setting(False)
-                self.stop_automation_preview(remove_bubble=True)
-                self.hide_automation_composer()
-        menu = QMenu(self)
+        menu = style_compact_popup_menu(QMenu(self))
+        self._settings_menu = menu
         runtime_toggle = SettingsToggleRow(
             "Python 运行环境",
             "让命令优先使用 Agent 缓存 Python",
@@ -7393,7 +8436,7 @@ class ChatPage(QWidget):
         menu.addAction(automation_toggle_action)
         menu.addSeparator()
 
-        runtime_menu = menu.addMenu("Python 运行环境")
+        runtime_menu = style_compact_popup_menu(menu.addMenu("Python 运行环境"))
         runtime_status_action = QAction("检查运行环境", self)
         runtime_status_action.triggered.connect(self.show_python_runtime_status)
         runtime_menu.addAction(runtime_status_action)
@@ -7407,9 +8450,8 @@ class ChatPage(QWidget):
         runtime_copy_action.triggered.connect(self.copy_python_runtime_path)
         runtime_menu.addAction(runtime_copy_action)
 
-        automation_menu = menu.addMenu("自动化插件")
-
-        model_menu = automation_menu.addMenu("模型")
+        automation_menu = style_compact_popup_menu(menu.addMenu("自动化插件"))
+        model_menu = style_compact_popup_menu(automation_menu.addMenu("模型"))
         for label, model_id in AUTOMATION_MODELS:
             action = QAction(label, self)
             action.setCheckable(True)
@@ -7417,7 +8459,7 @@ class ChatPage(QWidget):
             action.triggered.connect(lambda _checked=False, value=model_id: self.set_automation_model(value))
             model_menu.addAction(action)
 
-        rounds_menu = automation_menu.addMenu("自动化最大轮数")
+        rounds_menu = style_compact_popup_menu(automation_menu.addMenu("自动化最大轮数"))
         for rounds in (8, 12, 20, 50, 100):
             action = QAction(f"{rounds} 轮", self)
             action.setCheckable(True)
@@ -7449,11 +8491,16 @@ class ChatPage(QWidget):
         automation_menu.addAction(copy_plugin_dir_action)
 
         menu.addSeparator()
+        home_action = QAction("返回首页", self)
+        home_action.triggered.connect(self.confirm_back_home)
+        menu.addAction(home_action)
+        menu.addSeparator()
         for title in ("字号大小（待实现）", "主题颜色（待实现）", "语言设置（待实现）"):
             action = QAction(title, self)
             action.setEnabled(False)
             menu.addAction(action)
-        menu.exec(self.settings_btn.mapToGlobal(self.settings_btn.rect().bottomRight()))
+        menu.aboutToHide.connect(lambda menu=menu: setattr(self, "_settings_menu", None))
+        menu.popup(self.settings_btn.mapToGlobal(self.settings_btn.rect().bottomRight()))
 
     def set_automation_model(self, model_id: str):
         self.automation_model = model_id
@@ -7593,6 +8640,8 @@ class ChatPage(QWidget):
                 title = "AI 输出"
             elif entry_type == "result":
                 title = "执行结果"
+            elif entry_type == "terminal_result":
+                title = "终端执行结果"
             else:
                 title = entry_type or "记录"
             if fmt == "md":
@@ -7892,6 +8941,9 @@ class ChatPage(QWidget):
             return
         busy = self.is_automation_busy()
         self.automation_input.setEnabled(not busy and not self.is_execution_running())
+        if self.automation_skill_btn is not None:
+            self.automation_skill_btn.setEnabled(not busy and not self.is_execution_running())
+            self.update_automation_skill_button()
         if busy:
             self.automation_input.setPlaceholderText("AI 正在处理...")
             self.automation_send_btn.setIcon(line_icon("pause", "#ffffff", 20))
@@ -8157,6 +9209,7 @@ class ChatPage(QWidget):
             project_root=self.project_root,
             user_prompt=prompt,
             done_marker=AUTOMATION_DONE_MARKER,
+            terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
             **runtime_environment(),
         ) + f"\n{PROMPT_BUBBLE_MARKER}{base64.b64encode(raw_prompt.encode('utf-8')).decode('ascii')} -->"
 
@@ -8165,6 +9218,7 @@ class ChatPage(QWidget):
             project_root=self.project_root,
             user_prompt="当前指令见第三段 plaintext，不要把本段当作用户需求重复执行。",
             done_marker=AUTOMATION_DONE_MARKER,
+            terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
             **runtime_environment(),
         )
 
@@ -8194,7 +9248,13 @@ class ChatPage(QWidget):
         return truncate_middle(str(text or "").strip(), limit)
 
     def automation_context_system_text(self) -> str:
-        return self.build_automation_system_text() + (
+        skills_context = self.selected_skills_context()
+        skills_text = (
+            "\n\n【本轮手动启用的技能】\n"
+            "以下 SKILL.md 由用户手动选择，只在本轮提示词中作为约束和流程参考；不要自行寻找或猜测其他技能。\n"
+            f"{skills_context}"
+        ) if skills_context else ""
+        return self.build_automation_system_text() + skills_text + (
             "\n\n补充说明：provider 每次可能会打开新的网页对话，所以第二段包含 Agent Qt 保存的本会话上下文。"
             "请把这些上下文视为连续对话历史。上下文按纯文本给出，不是 JSON 或工具调用协议。"
             f"自动化上下文按 {context_k_label(AUTOMATION_CONTEXT_DISPLAY_TOKENS)} 估算展示；当历史超过约 {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)} 时，"
@@ -8215,6 +9275,8 @@ class ChatPage(QWidget):
             "Files changed:",
             "Git diff file names:",
             "Git diff hunks:",
+            "Terminal processes:",
+            "Internal git snapshot:",
             "Traceback",
             "Error:",
             "ERROR:",
@@ -8225,6 +9287,11 @@ class ChatPage(QWidget):
             stripped = line.strip()
             if (
                 any(stripped.startswith(pattern) for pattern in high_signal_patterns)
+                or "registry=" in stripped
+                or "log=" in stripped
+                or "pid=" in stripped
+                or "launch_reason=" in stripped
+                or "command_kind=" in stripped
                 or re.match(r"^[AMD]\s+\S+", stripped)
                 or stripped.startswith("@@")
             ):
@@ -8277,10 +9344,14 @@ class ChatPage(QWidget):
             return "【AI 回复摘要】\n" + self.summarize_automation_text(content, ai_limit)
         if entry_type == "result":
             if detail == "full":
-                high_signal = strip_low_value_context_blocks(content)
-                return "【本地执行结果和文件变更】\n" + self.compact_automation_entry_text(high_signal)
+                return "【本地执行结果和文件变更】\n" + self.compact_automation_entry_text(content)
             result_limit = 2400 if detail == "lean" else 1100
             return "【本地执行结果摘要】\n" + self.summarize_result_history_text(content, result_limit)
+        if entry_type == "terminal_result":
+            if detail == "full":
+                return "【终端执行结果】\n" + self.compact_automation_entry_text(content)
+            result_limit = 1800 if detail == "lean" else 800
+            return "【终端执行结果摘要】\n" + self.summarize_automation_text(content, result_limit)
         return ""
 
     def collapse_repeated_history_chunks(self, chunks: List[str]) -> List[str]:
@@ -8436,9 +9507,10 @@ class ChatPage(QWidget):
         return estimate_context_tokens(self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id, log_stats=False))
 
     def automation_context_placeholder_text(self) -> str:
+        skill_suffix = f" · 已选 {len(self.selected_skills())} 个技能" if self.selected_skill_ids else ""
         if self.automation_context_mode == "simple":
-            return f"简单模式 · 上下文到约 {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)} 自动压缩 · 输入下一步需求..."
-        return "专家模式 · DeepSeek Web 约45k 上下文阈值 · 输入下一步需求..."
+            return f"简单模式 · 上下文到约 {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)} 自动压缩{skill_suffix} · 输入下一步需求..."
+        return f"专家模式 · DeepSeek Web 约45k 上下文阈值{skill_suffix} · 输入下一步需求..."
 
     def build_automation_messages(self, current_prompt: str, skip_entry_id: str = "") -> List[Dict[str, str]]:
         return [{"role": "user", "content": self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id)}]
@@ -8828,6 +9900,14 @@ class ChatPage(QWidget):
                 if bool(entry.get("undone", False)):
                     change_card.mark_undone(len(records), 0)
                 self.add_chat_widget(change_card)
+        elif entry_type == "terminal_result":
+            bubble = ExecutionLogPanel(
+                str(entry.get("content", "")),
+                parent=self.chat_container,
+                max_content_height=210,
+                title="终端执行结果",
+            )
+            self.add_chat_widget(bubble)
 
     def update_change_history_state(self, entry_id: str, undone: bool):
         if not entry_id:
@@ -9128,10 +10208,12 @@ class ChatPage(QWidget):
         if not self.pending_internal_git_commit:
             self.pending_snapshot = snapshot_project(self.project_root)
         self.pending_long_running_launches = 0
+        self.pending_terminal_launches = []
         
         self.worker = ExecuteWorker(commands, self.project_root)
         self.worker.output_signal.connect(self.on_output)
         self.worker.long_running_signal.connect(self.on_long_running)
+        self.worker.background_process_signal.connect(self.on_background_process_started)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
         self.update_automation_composer_state()
@@ -9141,11 +10223,83 @@ class ChatPage(QWidget):
         self.cmd_outputs.append(output)
         self.result_bubble.update_content('\n'.join(self.cmd_outputs))
     
-    def on_long_running(self, cmd: str, cwd: str, name: str):
-        self.terminal_panel.add_process(cmd, cwd, name)
+    def on_long_running(self, cmd: str, cwd: str, name: str, launch_reason: str = "long_running_pattern", kind: str = "unknown"):
+        proc = self.terminal_panel.add_process(
+            cmd,
+            cwd,
+            name,
+            expected_persistent=True,
+            launch_reason=launch_reason,
+            command_kind_value=kind or command_kind(cmd),
+        )
+        if proc is not None:
+            if proc.process is not None and not proc.process_id():
+                try:
+                    proc.process.waitForStarted(800)
+                except RuntimeError:
+                    pass
+            self.terminal_panel.write_process_registry()
+            self.pending_terminal_launches.append({
+                "id": proc.terminal_id,
+                "name": proc.name,
+                "cmd": strip_shell_command_marker(proc.cmd),
+                "cwd": proc.cwd,
+                "pid": proc.process_id(),
+                "status": "running" if proc.is_running() else "starting",
+                "persistent": True,
+                "launch_reason": launch_reason,
+                "command_kind": kind or command_kind(cmd),
+                "log_path": proc.log_path,
+                "registry_path": self.terminal_panel.registry_path(),
+                "_proc": proc,
+            })
         self.pending_long_running_launches += 1
         self.update_status_bar()
         self.keep_ai_response_visible()
+
+    def on_background_process_started(self, info: Dict[str, object]):
+        proc = self.terminal_panel.add_external_process(info)
+        if proc is not None:
+            self.pending_terminal_launches.append({
+                "id": proc.terminal_id,
+                "name": proc.name,
+                "cmd": strip_shell_command_marker(proc.cmd),
+                "cwd": proc.cwd,
+                "pid": proc.process_id(),
+                "status": "running" if proc.is_running() else "starting",
+                "persistent": proc.expected_persistent,
+                "launch_reason": proc.launch_reason,
+                "command_kind": proc.command_kind,
+                "log_path": proc.log_path,
+                "registry_path": self.terminal_panel.registry_path(),
+                "_proc": proc,
+            })
+        self.pending_long_running_launches += 1
+        self.update_status_bar()
+        self.keep_ai_response_visible()
+
+    def on_terminal_process_finished(self, info: Dict[str, object]):
+        log = str(info.get("log") or "").strip()
+        if not log:
+            return
+        content = build_terminal_context_content(info)
+        self.append_history({
+            "type": "terminal_result",
+            "content": content,
+            "context_content": content,
+            "terminal": {
+                "name": str(info.get("name") or ""),
+                "cmd": str(info.get("cmd") or ""),
+                "cwd": str(info.get("cwd") or ""),
+                "exit_code": info.get("exit_code"),
+                "interactive": bool(info.get("interactive")),
+                "expected_persistent": bool(info.get("expected_persistent")),
+                "launch_reason": str(info.get("launch_reason") or ""),
+                "command_kind": str(info.get("command_kind") or ""),
+                "pid": info.get("pid") or 0,
+                "log_path": str(info.get("log_path") or ""),
+            },
+        })
     
     def on_finished(self, full_log: str):
         worker = self.worker
@@ -9165,6 +10319,16 @@ class ChatPage(QWidget):
         self.pending_internal_git_commit = ""
         long_running_launches = self.pending_long_running_launches
         self.pending_long_running_launches = 0
+        terminal_launches = []
+        for item in self.pending_terminal_launches:
+            normalized = dict(item)
+            proc = normalized.pop("_proc", None)
+            if isinstance(proc, ManagedProcess):
+                normalized["pid"] = proc.process_id()
+                normalized["status"] = "running" if proc.is_running() else "exited"
+                normalized["log_path"] = proc.log_path
+            terminal_launches.append(normalized)
+        self.pending_terminal_launches = []
         log_with_changes = full_log
         if change_records:
             log_with_changes += format_change_summary(change_records, include_diff=True)
@@ -9172,7 +10336,7 @@ class ChatPage(QWidget):
             log_with_changes += "\n\nFiles changed:\n未检测到文件改动。若命令正在底部终端继续运行，保存/生成文件后需要等待进程结束或再执行一次检查。"
         elif not log_with_changes.strip():
             log_with_changes = "命令执行完成，未产生终端输出或文件变更。"
-        context_content = build_execution_context_content(full_log, change_records, long_running_launches)
+        context_content = build_execution_context_content(full_log, change_records, long_running_launches, terminal_launches)
         self.result_bubble.update_content(log_with_changes)
         if change_records:
             change_card = ChangeSummaryCard(change_records, parent=self.chat_container)
