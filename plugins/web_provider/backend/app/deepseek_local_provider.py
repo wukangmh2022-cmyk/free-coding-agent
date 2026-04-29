@@ -1036,6 +1036,7 @@ async def run_on_bridge_slot(
     request_id: str,
     route: str,
     operation,
+    prewarm_after: bool = True,
 ):
     started_at = time.perf_counter()
     try:
@@ -1093,7 +1094,8 @@ async def run_on_bridge_slot(
     finally:
         released_at = time.perf_counter()
         pool.release(slot)
-        pool.prewarm_available(spec, limit=DEEPSEEK_WEB_PREWARM_SLOTS)
+        if prewarm_after:
+            pool.prewarm_available(spec, limit=DEEPSEEK_WEB_PREWARM_SLOTS)
         logger.warning(
             "provider[%s] %s released bridge slot=%d pool=%s available=%d lifetime_ms=%d",
             request_id,
@@ -2691,6 +2693,7 @@ async def open_login(model: str = DEFAULT_MODEL_ID) -> dict[str, Any]:
         request_id=request_id,
         route="/debug/open-login",
         operation=lambda bridge, _slot_spec: bridge.open_login_page(),
+        prewarm_after=False,
     )
     return {"model": spec.model_id, **result}
 

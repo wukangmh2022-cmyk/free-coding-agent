@@ -68,6 +68,13 @@ OFFICIAL_PIP_INDEX_URL = "https://pypi.org/simple"
 logger = logging.getLogger(__name__)
 
 
+def subprocess_no_window_kwargs(extra_creationflags: int = 0) -> Dict[str, object]:
+    if platform.system() != "Windows":
+        return {}
+    flags = int(extra_creationflags or 0) | int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+    return {"creationflags": flags} if flags else {}
+
+
 def app_settings_path() -> str:
     return os.path.join(AGENT_HOME_DIR, "settings.json")
 
@@ -637,6 +644,7 @@ def run_runtime_command(command: List[str], cwd: str, timeout: int = 900) -> tup
             capture_output=True,
             text=True,
             timeout=timeout,
+            **subprocess_no_window_kwargs(),
         )
     except Exception as exc:
         return False, str(exc)
@@ -914,12 +922,16 @@ def message_box_style() -> str:
 
 
 def compact_popup_menu_style() -> str:
+    is_windows = platform.system() == "Windows"
+    menu_bg = COLORS["surface"] if is_windows else "rgba(238, 243, 252, 238)"
+    menu_radius = 0 if is_windows else 14
+    item_radius = 0 if is_windows else 10
     return f"""
         QMenu {{
-            background: rgba(238, 243, 252, 238);
+            background: {menu_bg};
             color: {COLORS['text']};
             border: none;
-            border-radius: 14px;
+            border-radius: {menu_radius}px;
             padding: 6px;
             font-size: 12px;
             font-weight: 700;
@@ -928,7 +940,7 @@ def compact_popup_menu_style() -> str:
             background: transparent;
             color: {COLORS['text']};
             border: none;
-            border-radius: 10px;
+            border-radius: {item_radius}px;
             padding: 7px 28px 7px 12px;
             min-height: 18px;
         }}
@@ -962,19 +974,23 @@ def compact_popup_menu_style() -> str:
 
 
 def style_compact_popup_menu(menu: QMenu) -> QMenu:
-    menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, platform.system() != "Windows")
     menu.setStyleSheet(compact_popup_menu_style())
     return menu
 
 
 def style_skill_popup_menu(menu: QMenu) -> QMenu:
-    menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    is_windows = platform.system() == "Windows"
+    menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, not is_windows)
+    menu_bg = COLORS["surface"] if is_windows else "rgba(238, 243, 252, 238)"
+    menu_radius = 0 if is_windows else 14
+    item_radius = 0 if is_windows else 9
     menu.setStyleSheet(f"""
         QMenu {{
-            background: rgba(238, 243, 252, 238);
+            background: {menu_bg};
             color: {COLORS['text']};
             border: none;
-            border-radius: 14px;
+            border-radius: {menu_radius}px;
             padding: 5px;
             font-size: 11px;
             font-weight: 700;
@@ -983,7 +999,7 @@ def style_skill_popup_menu(menu: QMenu) -> QMenu:
             background: transparent;
             color: {COLORS['text']};
             border: none;
-            border-radius: 9px;
+            border-radius: {item_radius}px;
             padding: 5px 18px 5px 10px;
             min-height: 16px;
         }}
@@ -2213,6 +2229,7 @@ def run_shell_command_capture(cmd: str, cwd: str, timeout: int, project_root: st
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        **subprocess_no_window_kwargs(),
     )
     try:
         stdout, _stderr = process.communicate(timeout=timeout)
@@ -2348,6 +2365,7 @@ class InternalGitChangeTracker:
             capture_output=True,
             text=text,
             check=check,
+            **subprocess_no_window_kwargs(),
         )
 
     def ensure_repo(self) -> bool:
@@ -2355,7 +2373,14 @@ class InternalGitChangeTracker:
             return False
         os.makedirs(self.repo_root, exist_ok=True)
         if not os.path.isdir(os.path.join(self.repo_root, ".git")):
-            subprocess.run([self.git, "init", "-q"], cwd=self.repo_root, capture_output=True, text=True, check=False)
+            subprocess.run(
+                [self.git, "init", "-q"],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+                **subprocess_no_window_kwargs(),
+            )
         for key, value in (
             ("user.name", "Agent Qt Internal Git"),
             ("user.email", "agent-qt-internal@example.invalid"),
@@ -4496,7 +4521,13 @@ class ManagedProcess(QWidget):
             if self.pid > 0 and self.is_running():
                 try:
                     if platform.system() == "Windows":
-                        subprocess.run(["taskkill", "/PID", str(self.pid), "/T", "/F"], capture_output=True, text=True, timeout=8)
+                        subprocess.run(
+                            ["taskkill", "/PID", str(self.pid), "/T", "/F"],
+                            capture_output=True,
+                            text=True,
+                            timeout=8,
+                            **subprocess_no_window_kwargs(),
+                        )
                     else:
                         os.kill(self.pid, signal.SIGTERM)
                 except Exception:
@@ -5156,6 +5187,7 @@ def supports_automation_python(python_bin: str) -> bool:
             capture_output=True,
             text=True,
             timeout=8,
+            **subprocess_no_window_kwargs(),
         )
     except Exception:
         return False
@@ -5278,6 +5310,7 @@ class AutomationProviderManager:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                **subprocess_no_window_kwargs(),
             )
         except Exception as exc:
             return False, str(exc)
@@ -5423,6 +5456,7 @@ print("chromium ok")
                 capture_output=True,
                 text=True,
                 timeout=900,
+                **subprocess_no_window_kwargs(),
             )
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "").strip()
@@ -5438,6 +5472,7 @@ print("chromium ok")
                 capture_output=True,
                 text=True,
                 timeout=900,
+                **subprocess_no_window_kwargs(),
             )
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "").strip()
@@ -5686,7 +5721,13 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
             return
         try:
             if platform.system() == "Windows":
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, timeout=8)
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    **subprocess_no_window_kwargs(),
+                )
             else:
                 os.kill(pid, signal.SIGTERM)
         except Exception:
@@ -5722,7 +5763,9 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
             "stderr": subprocess.STDOUT,
         }
         if platform.system() == "Windows":
-            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            popen_kwargs.update(
+                subprocess_no_window_kwargs(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+            )
         else:
             popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(
