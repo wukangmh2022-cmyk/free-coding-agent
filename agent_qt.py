@@ -469,6 +469,27 @@ if (-not $BasePython) {{
 
 def windows_pip_helpers_powershell() -> str:
     return """
+function Set-AgentQtPipDefaultSource {
+    param(
+        [Parameter(Mandatory=$true)][string]$PythonBin,
+        [Parameter(Mandatory=$true)][string]$IndexUrl,
+        [string]$TrustedHost = ''
+    )
+    if (-not $IndexUrl) { return }
+    Write-Host "记录当前 Python 环境默认 pip 源: $IndexUrl"
+    & $PythonBin -m pip config --site set global.index-url $IndexUrl *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "写入 pip index-url 配置失败，继续安装流程。"
+        return
+    }
+    if ($TrustedHost) {
+        & $PythonBin -m pip config --site set global.trusted-host $TrustedHost *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "写入 pip trusted-host 配置失败，继续安装流程。"
+        }
+    }
+}
+
 function Invoke-AgentQtPipInstall {
     param(
         [Parameter(Mandatory=$true)][string]$PythonBin,
@@ -480,7 +501,20 @@ function Invoke-AgentQtPipInstall {
         Write-Host "尝试使用配置的 PyPI 镜像..."
         & $PythonBin -m pip install @script:PipIndexArgs @Arguments
         $lastExit = $LASTEXITCODE
-        if ($lastExit -eq 0) { return }
+        if ($lastExit -eq 0) {
+            $configuredIndex = ''
+            $configuredHost = ''
+            for ($i = 0; $i -lt $script:PipIndexArgs.Count; $i++) {
+                if ($script:PipIndexArgs[$i] -in @('-i', '--index-url') -and $i + 1 -lt $script:PipIndexArgs.Count) {
+                    $configuredIndex = [string]$script:PipIndexArgs[$i + 1]
+                }
+                if ($script:PipIndexArgs[$i] -eq '--trusted-host' -and $i + 1 -lt $script:PipIndexArgs.Count) {
+                    $configuredHost = [string]$script:PipIndexArgs[$i + 1]
+                }
+            }
+            Set-AgentQtPipDefaultSource -PythonBin $PythonBin -IndexUrl $configuredIndex -TrustedHost $configuredHost
+            return
+        }
         Write-Host "配置的 PyPI 镜像失败，尝试国内备用镜像..."
     }
     if ($script:PipFallbackIndexes -and $script:PipFallbackIndexes.Count -gt 0) {
@@ -496,13 +530,19 @@ function Invoke-AgentQtPipInstall {
                 & $PythonBin -m pip install --isolated --index-url $indexUrl @Arguments
             }
             $lastExit = $LASTEXITCODE
-            if ($lastExit -eq 0) { return }
+            if ($lastExit -eq 0) {
+                Set-AgentQtPipDefaultSource -PythonBin $PythonBin -IndexUrl $indexUrl -TrustedHost $trustedHost
+                return
+            }
         }
         Write-Host "国内备用 PyPI 镜像失败，回退官方 PyPI..."
     }
     & $PythonBin -m pip install --isolated --index-url __AGENT_QT_OFFICIAL_PIP_INDEX__ --trusted-host pypi.org --trusted-host files.pythonhosted.org @Arguments
     $lastExit = $LASTEXITCODE
-    if ($lastExit -eq 0) { return }
+    if ($lastExit -eq 0) {
+        Set-AgentQtPipDefaultSource -PythonBin $PythonBin -IndexUrl __AGENT_QT_OFFICIAL_PIP_INDEX__ -TrustedHost 'pypi.org files.pythonhosted.org'
+        return
+    }
     if ($Optional) {
         Write-Host "pip 可选升级失败，检查现有 pip 是否可用..."
         & $PythonBin -m pip --version
