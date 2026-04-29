@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -4620,7 +4621,52 @@ class DeepSeekWebBridge:
         try:
             input_box.click(timeout=500)
         except Exception:
-            logger.debug("DeepSeek input click skipped before clipboard paste.", exc_info=True)
+            logger.debug("DeepSeek input click skipped before Playwright native fill.", exc_info=True)
+
+        if not self.headless:
+            try:
+                self.paste_input_from_system_clipboard(page, input_box, prompt)
+                logger.warning("DeepSeek fill_input system clipboard paste done chars=%d", len(prompt))
+                return
+            except Exception as exc:
+                logger.warning(
+                    "DeepSeek system clipboard paste failed; trying execCommand insert: %s",
+                    exc,
+                    exc_info=True,
+                )
+
+        try:
+            self.insert_input_with_exec_command(page, input_box, prompt)
+            logger.warning("DeepSeek fill_input execCommand insert done chars=%d", len(prompt))
+            return
+        except Exception as exc:
+            logger.warning(
+                "DeepSeek execCommand text insert failed; trying native fill: %s",
+                exc,
+                exc_info=True,
+            )
+
+        try:
+            self.fill_input_with_playwright_native(page, input_box, prompt)
+            logger.warning("DeepSeek fill_input native fill done chars=%d", len(prompt))
+            return
+        except Exception as exc:
+            logger.warning(
+                "DeepSeek Playwright native fill failed; trying text insert: %s",
+                exc,
+                exc_info=True,
+            )
+
+        try:
+            self.insert_input_with_playwright(page, input_box, prompt)
+            logger.warning("DeepSeek fill_input playwright insert done chars=%d", len(prompt))
+            return
+        except Exception as exc:
+            logger.warning(
+                "DeepSeek Playwright text insert failed; trying clipboard paste: %s",
+                exc,
+                exc_info=True,
+            )
 
         try:
             self.paste_input_from_clipboard(page, input_box, prompt)
@@ -4681,6 +4727,134 @@ class DeepSeekWebBridge:
             raise RuntimeError(f"DeepSeek input injection failed: {result}")
         logger.warning("DeepSeek fill_input page-level inject done tag=%s", result.get("tag"))
 
+    def paste_input_from_system_clipboard(self, page: Page, input_box: Locator, prompt: str) -> None:
+        started = time.perf_counter()
+        if not self.write_system_clipboard_text(prompt):
+            raise RuntimeError("system clipboard write unavailable")
+        input_box.click(timeout=1000)
+        modifier = "Meta" if sys.platform == "darwin" else "Control"
+        page.keyboard.press(f"{modifier}+A")
+        page.keyboard.press(f"{modifier}+V")
+        length = self.wait_for_input_length(page, len(prompt), timeout_ms=2000)
+        if length < max(1, int(len(prompt) * 0.95)):
+            raise RuntimeError(f"DeepSeek system clipboard paste length mismatch: {length}/{len(prompt)}")
+        logger.warning(
+            "DeepSeek system clipboard paste verified chars=%d elapsed_ms=%d",
+            length,
+            int((time.perf_counter() - started) * 1000),
+        )
+
+    def insert_input_with_exec_command(self, page: Page, input_box: Locator, prompt: str) -> None:
+        started = time.perf_counter()
+        result = input_box.evaluate(
+            """(node, value) => {
+                node.focus();
+                const tag = node.tagName.toLowerCase();
+                if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
+                    node.select();
+                } else {
+                    const range = document.createRange();
+                    range.selectNodeContents(node);
+                    const selection = window.getSelection();
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                }
+                const ok = document.execCommand && document.execCommand('insertText', false, value);
+                const length = node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement
+                    ? (node.value || '').length
+                    : (node.innerText || node.textContent || '').length;
+                return { ok: Boolean(ok), tag, length };
+            }""",
+            prompt,
+            timeout=5000,
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise RuntimeError(f"DeepSeek execCommand insert failed: {result}")
+        length = int(result.get("length") or -1)
+        if length < max(1, int(len(prompt) * 0.95)):
+            length = self.wait_for_input_length(page, len(prompt), timeout_ms=800)
+        if length < max(1, int(len(prompt) * 0.95)):
+            raise RuntimeError(f"DeepSeek execCommand insert length mismatch: {length}/{len(prompt)}")
+        logger.warning(
+            "DeepSeek execCommand insert verified tag=%s chars=%d elapsed_ms=%d",
+            result.get("tag"),
+            length,
+            int((time.perf_counter() - started) * 1000),
+        )
+
+    def fill_input_with_playwright_native(self, page: Page, input_box: Locator, prompt: str) -> None:
+        started = time.perf_counter()
+        tag_name = input_box.evaluate("(node) => node.tagName.toLowerCase()", timeout=1000)
+        if tag_name not in {"input", "textarea"}:
+            raise RuntimeError(f"native fill unsupported for tag={tag_name}")
+        input_box.fill(prompt, timeout=5000)
+        length = self.wait_for_input_length(page, len(prompt), timeout_ms=1200)
+        if length < max(1, int(len(prompt) * 0.95)):
+            raise RuntimeError(f"DeepSeek native fill length mismatch: {length}/{len(prompt)}")
+        logger.warning(
+            "DeepSeek native fill verified tag=%s chars=%d elapsed_ms=%d",
+            tag_name,
+            length,
+            int((time.perf_counter() - started) * 1000),
+        )
+
+    def current_input_length(self, page: Page) -> int:
+        length = page.evaluate(
+            """({ selectors }) => {
+                const isVisible = (node) => {
+                    if (!(node instanceof HTMLElement)) return false;
+                    const style = window.getComputedStyle(node);
+                    if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
+                    const rect = node.getBoundingClientRect();
+                    return !!rect.width && !!rect.height;
+                };
+                const candidates = [];
+                for (const selector of selectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                        if (node instanceof HTMLElement && isVisible(node)) candidates.push(node);
+                    }
+                }
+                if (document.activeElement instanceof HTMLElement && isVisible(document.activeElement)) {
+                    candidates.push(document.activeElement);
+                }
+                const node = candidates[candidates.length - 1];
+                if (!(node instanceof HTMLElement)) return -1;
+                if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
+                    return (node.value || '').length;
+                }
+                return (node.innerText || node.textContent || '').length;
+            }""",
+            {"selectors": list(self.input_selectors)},
+        )
+        return length if isinstance(length, int) else -1
+
+    def wait_for_input_length(self, page: Page, expected_length: int, *, timeout_ms: int = 5000) -> int:
+        min_expected = max(1, int(expected_length * 0.95))
+        length = -1
+        deadline = time.monotonic() + max(0.2, timeout_ms / 1000)
+        while time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+            length = self.current_input_length(page)
+            if length >= min_expected:
+                break
+        return length
+
+    def insert_input_with_playwright(self, page: Page, input_box: Locator, prompt: str) -> None:
+        started = time.perf_counter()
+        input_box.click(timeout=1000)
+        modifier = "Meta" if sys.platform == "darwin" else "Control"
+        page.keyboard.press(f"{modifier}+A")
+        page.keyboard.press("Backspace")
+        page.keyboard.insert_text(prompt)
+        length = self.wait_for_input_length(page, len(prompt), timeout_ms=5000)
+        if length < max(1, int(len(prompt) * 0.95)):
+            raise RuntimeError(f"DeepSeek Playwright insert length mismatch: {length}/{len(prompt)}")
+        logger.warning(
+            "DeepSeek Playwright insert verified chars=%d elapsed_ms=%d",
+            length,
+            int((time.perf_counter() - started) * 1000),
+        )
+
     def write_system_clipboard_text(self, text: str) -> bool:
         try:
             if sys.platform == "darwin" and shutil.which("pbcopy"):
@@ -4707,9 +4881,8 @@ class DeepSeekWebBridge:
 
     def paste_input_from_clipboard(self, page: Page, input_box: Locator, prompt: str) -> None:
         started = time.perf_counter()
-        clipboard_source = "system"
-        if not self.write_system_clipboard_text(prompt):
-            clipboard_source = "browser"
+        clipboard_source = "browser"
+        try:
             page.evaluate(
                 """async (value) => {
                     if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
@@ -4719,44 +4892,15 @@ class DeepSeekWebBridge:
                 }""",
                 prompt,
             )
+        except Exception:
+            if not self.write_system_clipboard_text(prompt):
+                raise
+            clipboard_source = "system"
         input_box.click(timeout=1000)
         modifier = "Meta" if sys.platform == "darwin" else "Control"
         page.keyboard.press(f"{modifier}+A")
         page.keyboard.press(f"{modifier}+V")
-        min_expected = max(1, int(len(prompt) * 0.95))
-        length = -1
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            page.wait_for_timeout(100)
-            length = page.evaluate(
-                """({ selectors }) => {
-                    const isVisible = (node) => {
-                        if (!(node instanceof HTMLElement)) return false;
-                        const style = window.getComputedStyle(node);
-                        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
-                        const rect = node.getBoundingClientRect();
-                        return !!rect.width && !!rect.height;
-                    };
-                    const candidates = [];
-                    for (const selector of selectors) {
-                        for (const node of document.querySelectorAll(selector)) {
-                            if (node instanceof HTMLElement && isVisible(node)) candidates.push(node);
-                        }
-                    }
-                    if (document.activeElement instanceof HTMLElement && isVisible(document.activeElement)) {
-                        candidates.push(document.activeElement);
-                    }
-                    const node = candidates[candidates.length - 1];
-                    if (!(node instanceof HTMLElement)) return -1;
-                    if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
-                        return (node.value || '').length;
-                    }
-                    return (node.innerText || node.textContent || '').length;
-                }""",
-                {"selectors": list(self.input_selectors)},
-            )
-            if isinstance(length, int) and length >= min_expected:
-                break
+        length = self.wait_for_input_length(page, len(prompt), timeout_ms=5000)
         if not isinstance(length, int) or length < max(1, int(len(prompt) * 0.95)):
             raise RuntimeError(f"DeepSeek clipboard paste length mismatch: {length}/{len(prompt)}")
         logger.warning(

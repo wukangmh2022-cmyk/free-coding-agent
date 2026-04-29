@@ -58,7 +58,7 @@ def _looks_like_prompt_replay_text(text: str) -> bool:
 
 
 DEFAULT_URL = os.environ.get("DEEPSEEK_WEB_URL", "https://chat.deepseek.com/")
-DEFAULT_HEADLESS = os.environ.get("DEEPSEEK_WEB_HEADLESS", "1") == "1"
+DEFAULT_HEADLESS = os.environ.get("DEEPSEEK_WEB_HEADLESS", "0") == "1"
 DEFAULT_FORCE_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FORCE_NEW_CHAT", "0") == "1"
 DEFAULT_BROWSER_CHANNEL = os.environ.get("DEEPSEEK_WEB_BROWSER_CHANNEL", "").strip() or None
 DEFAULT_MODEL_ID = os.environ.get("DEEPSEEK_LOCAL_MODEL", "DeepSeekV4")
