@@ -847,9 +847,12 @@ def style_skill_popup_menu(menu: QMenu) -> QMenu:
             padding: 5px 18px 5px 10px;
             min-height: 16px;
         }}
-        QMenu::item:selected,
+        QMenu::item:selected {{
+            background: rgba(190, 222, 255, 225);
+            color: {COLORS['text']};
+        }}
         QMenu::item:checked {{
-            background: rgba(255, 255, 255, 145);
+            background: transparent;
             color: {COLORS['text']};
         }}
         QMenu::item:disabled {{
@@ -5646,6 +5649,20 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
             timeout=1,
         )
 
+    def cancel_generation(self, model: str, thread_id: str) -> bool:
+        if not self.health():
+            return False
+        try:
+            self.request_json(
+                "POST",
+                f"/debug/cancel-generations?model={urllib.parse.quote(model)}&user={urllib.parse.quote(thread_id)}",
+                timeout=3,
+            )
+            return True
+        except Exception:
+            logger.warning("Automation provider cancel request failed.", exc_info=True)
+            return False
+
     def log_tail(self, max_chars: int = 3000) -> str:
         try:
             with open(self.log_file, "r", encoding="utf-8", errors="replace") as f:
@@ -7912,6 +7929,7 @@ class ChatPage(QWidget):
         self.automation_model = AUTOMATION_DEFAULT_MODEL
         self.automation_context_mode = automation_context_mode_setting()
         self.automation_worker: Optional[AutomationChatWorker] = None
+        self.automation_request_serial = 0
         self.automation_preview_worker: Optional[AutomationPreviewWorker] = None
         self.automation_preview_bubble: Optional[QFrame] = None
         self.automation_preview_started_at = 0.0
@@ -8548,8 +8566,6 @@ class ChatPage(QWidget):
         for label, mode in AUTOMATION_CONTEXT_MODES:
             suffix = f" · {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)}" if mode == "simple" else " · 约45k"
             action = QAction(label + suffix, self)
-            action.setCheckable(True)
-            action.setChecked(self.automation_context_mode == mode)
             action.triggered.connect(lambda _checked=False, value=mode: self.set_automation_context_mode(value))
             menu.addAction(action)
         return menu
@@ -8772,10 +8788,10 @@ class ChatPage(QWidget):
 - 必须包含 YAML frontmatter，且只有必要字段：
   ---
   name: kebab-case-skill-name
-  description: Use when ...
+  description: 中文简介，用于显示在技能侧栏卡片上
   ---
 - name 使用英文 kebab-case，简短稳定。
-- description 用英文，清楚说明什么时候触发这个 skill。
+- description 必须使用中文，清楚说明什么时候触发这个 skill；这段会展示在技能侧栏卡片上，要简洁、自然、可读。
 - 正文用 Markdown，保留用户真正需要的流程、约束、模板、判断标准。
 - 内容要精炼，不写 README、安装说明、变更日志等无关材料。
 - 不要编造用户没有提供的事实；信息不足时写成可执行的通用约束。
@@ -9174,9 +9190,33 @@ class ChatPage(QWidget):
         search_btn.clicked.connect(lambda: start_remote_search(search_edit.text()))
         reload_btn.clicked.connect(lambda: start_remote_search(""))
         search_edit.returnPressed.connect(lambda: start_remote_search(search_edit.text()))
+        generation_preview_timer = QTimer(dialog)
+        generation_preview_timer.setInterval(420)
+        generation_preview_tick = {"value": 0}
+
+        def update_generation_placeholder():
+            generation_preview_tick["value"] += 1
+            dots = "." * ((generation_preview_tick["value"] % 3) + 1)
+            steps = [
+                "读取你粘贴的规则和流程",
+                "整理触发条件与使用边界",
+                "生成中文侧栏简介",
+                "组织 SKILL.md 正文结构",
+                "检查 frontmatter 和 Markdown 格式",
+            ]
+            visible = steps[: min(len(steps), 1 + generation_preview_tick["value"] // 2)]
+            preview.setPlainText(
+                "正在生成技能预览" + dots + "\n\n"
+                + "\n".join(f"- {step}" for step in visible)
+                + "\n\n生成完成后这里会替换为可编辑的 SKILL.md。"
+            )
+            preview.moveCursor(QTextCursor.MoveOperation.End)
+
+        generation_preview_timer.timeout.connect(update_generation_placeholder)
 
         def finish_generation(text: str, error: str):
             self.skill_generation_worker = None
+            generation_preview_timer.stop()
             generate_btn.setEnabled(True)
             if error:
                 status.setText("生成失败：" + error[-500:])
@@ -9193,7 +9233,10 @@ class ChatPage(QWidget):
                 return
             generate_btn.setEnabled(False)
             save_btn.setEnabled(False)
-            status.setText("正在调用简单模式 DeepSeek 生成...")
+            generation_preview_tick["value"] = 0
+            update_generation_placeholder()
+            generation_preview_timer.start()
+            status.setText("正在调用简单模式 DeepSeek 生成，完成前先显示生成进度...")
             worker = AutomationChatWorker(
                 self.automation_manager,
                 [{"role": "user", "content": self.build_skill_generation_prompt(raw)}],
@@ -9206,6 +9249,7 @@ class ChatPage(QWidget):
             worker.start()
 
         def cleanup_worker():
+            generation_preview_timer.stop()
             for attr in ("skill_generation_worker", "skill_search_worker", "skill_content_worker"):
                 worker = getattr(self, attr, None)
                 if worker is not None and worker.isRunning():
@@ -9831,12 +9875,13 @@ class ChatPage(QWidget):
         if self.automation_send_btn is None or self.automation_input is None:
             return
         busy = self.is_automation_busy()
-        self.automation_input.setEnabled(not busy and not self.is_execution_running())
+        local_execution_running = self.is_execution_running()
+        self.automation_input.setEnabled(not local_execution_running)
         if self.automation_skill_btn is not None:
-            self.automation_skill_btn.setEnabled(not busy and not self.is_execution_running())
+            self.automation_skill_btn.setEnabled(not local_execution_running)
             self.update_automation_skill_button()
         if busy:
-            self.automation_input.setPlaceholderText("AI 正在处理...")
+            self.automation_input.setPlaceholderText("可以先写下一轮草稿；点击右侧按钮可暂停当前回复。")
             self.automation_send_btn.setIcon(line_icon("pause", "#ffffff", 20))
             self.automation_send_btn.setStyleSheet(f"""
                 QToolButton {{
@@ -9869,15 +9914,25 @@ class ChatPage(QWidget):
         self.submit_automation_prompt_from_composer()
 
     def cancel_automation_request(self):
+        self.automation_request_serial += 1
         worker = self.automation_worker
+        self.automation_manager.cancel_generation(self.effective_automation_model(), self.thread_id)
         if worker is not None:
             worker.requestInterruption()
-            worker.terminate()
-            if worker.wait(1200):
+            if worker.wait(2500):
                 worker.deleteLater()
             else:
-                worker.finished.connect(worker.deleteLater)
-            self.automation_worker = None
+                self.automation_manager.stop_provider_process()
+                if worker.wait(2500):
+                    worker.deleteLater()
+                else:
+                    worker.terminate()
+                    if worker.wait(1200):
+                        worker.deleteLater()
+                    else:
+                        worker.finished.connect(worker.deleteLater)
+            if self.automation_worker is worker:
+                self.automation_worker = None
         self.stop_automation_preview(remove_bubble=True)
         self.stop_automation_loop("", ensure_manual_entry=True)
 
@@ -9921,6 +9976,8 @@ class ChatPage(QWidget):
             None,
             prompt_entry_id,
         )
+        if self.automation_worker is not None and self.selected_skill_ids:
+            self.clear_automation_skills()
 
     def add_automation_user_prompt_bubble(self, full_prompt: str, animate: bool = True) -> str:
         self.hide_empty_state()
@@ -10481,6 +10538,8 @@ class ChatPage(QWidget):
         if status_text:
             self.add_status_bubble(status_text)
         messages = self.build_automation_messages(prompt, skip_entry_id=skip_entry_id)
+        self.automation_request_serial += 1
+        request_serial = self.automation_request_serial
         worker = AutomationChatWorker(
             self.automation_manager,
             messages,
@@ -10492,6 +10551,9 @@ class ChatPage(QWidget):
         self.start_automation_preview()
 
         def on_finished(text: str, error: str):
+            if request_serial != self.automation_request_serial or self.automation_worker is not worker:
+                worker.deleteLater()
+                return
             self.automation_worker = None
             self.stop_automation_preview(remove_bubble=bool(error))
             self.update_automation_composer_state()

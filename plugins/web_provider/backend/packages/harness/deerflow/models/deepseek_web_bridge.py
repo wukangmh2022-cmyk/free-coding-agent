@@ -1850,6 +1850,7 @@ class DeepSeekWebBridge:
         self.copy_candidate_max_distance = max(0, int(copy_candidate_max_distance))
         self.max_continue_clicks = max(0, int(max_continue_clicks))
         self.fast_new_chat = fast_new_chat
+        self._cancel_generation_requested = threading.Event()
 
         self._playwright = None
         self._browser_type = None
@@ -1909,6 +1910,13 @@ class DeepSeekWebBridge:
         self._active_request_prompt = ""
         self._active_request_messages = []
         self._active_request_expected_exact_text = None
+
+    def request_cancel_generation(self) -> None:
+        self._cancel_generation_requested.set()
+
+    def _raise_if_generation_cancelled(self) -> None:
+        if self._cancel_generation_requested.is_set():
+            raise RuntimeError("DeepSeek generation cancelled by caller.")
 
     def reset_response_preview(self) -> None:
         now = time.time()
@@ -3430,6 +3438,7 @@ class DeepSeekWebBridge:
         if trace is not None:
             trace.mark("context_ready")
         with self._lock:
+            self._cancel_generation_requested.clear()
             self.reset_response_preview()
             self._switch_session_if_needed()
             has_prepared_new_chat = (
@@ -5426,6 +5435,7 @@ class DeepSeekWebBridge:
         plain_protocol = output_protocol == "plain"
 
         while time.time() < deadline:
+            self._raise_if_generation_cancelled()
             self.scroll_chat_to_bottom(page)
             current_count = locator.count()
             transport_text = transport_capture.best_payload_text() if transport_capture is not None else ""
@@ -5556,6 +5566,7 @@ class DeepSeekWebBridge:
             return True
 
         while time.time() < deadline:
+            self._raise_if_generation_cancelled()
             self.scroll_chat_to_bottom(page)
             transport_text = transport_capture.best_payload_text() if transport_capture is not None else ""
             if transport_text and transport_capture is not None and not generation_busy_seen:

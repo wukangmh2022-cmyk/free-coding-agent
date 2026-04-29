@@ -760,6 +760,13 @@ class BridgeSlot:
             logger.debug("Failed to close DeepSeek bridge slot %d cleanly.", self.index, exc_info=True)
         self.executor.shutdown(wait=False, cancel_futures=True)
 
+    def request_cancel_generation(self) -> bool:
+        cancel = getattr(self.bridge, "request_cancel_generation", None)
+        if not callable(cancel):
+            return False
+        cancel()
+        return True
+
 
 class BridgePool:
     def __init__(self, *, cache_key: str, base_spec: ModelSpec, size: int) -> None:
@@ -821,6 +828,9 @@ class BridgePool:
             "chars": 0,
             "updated_at": 0.0,
         }
+
+    def request_cancel_generations(self) -> int:
+        return sum(1 for slot in self._all if slot.request_cancel_generation())
 
     def close(self) -> None:
         for slot in self._all:
@@ -2690,6 +2700,18 @@ async def response_preview(model: str = DEFAULT_MODEL_ID, user: str | None = Non
     spec, pool = get_bridge_pool(model, user)
     preview = pool.response_preview()
     return {"model": spec.model_id, **preview}
+
+
+@app.post("/debug/cancel-generations")
+async def cancel_generations(model: str | None = None, user: str | None = None) -> dict[str, Any]:
+    cancelled_slots = 0
+    if model:
+        spec, pool = get_bridge_pool(model, user)
+        cancelled_slots = pool.request_cancel_generations()
+        return {"model": spec.model_id, "cancelled_slots": cancelled_slots}
+    for pool in _bridge_pools.values():
+        cancelled_slots += pool.request_cancel_generations()
+    return {"model": None, "cancelled_slots": cancelled_slots}
 
 
 @app.get("/v1/models")
