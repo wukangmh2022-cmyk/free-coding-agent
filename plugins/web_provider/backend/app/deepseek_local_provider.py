@@ -358,6 +358,19 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
         fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
     ),
+    "DeepSeekV4-simple": ModelSpec(
+        model_id="DeepSeekV4-simple",
+        profile_dir=DEERFLOW_PROFILE_DIR,
+        force_new_chat=DEERFLOW_FORCE_NEW_CHAT,
+        sticky_marker=DEERFLOW_STICKY_MARKER,
+        sticky_reanchor_messages=DEERFLOW_STICKY_REANCHOR_MESSAGES,
+        session_state_path=DEERFLOW_SESSION_STATE_PATH,
+        reuse_persisted_chat=False,
+        forced_thinking_enabled=False,
+        forced_expert_mode_enabled=False,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
+        fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
+    ),
     "DeepSeekV4-thinking": ModelSpec(
         model_id="DeepSeekV4-thinking",
         profile_dir=DEERFLOW_PROFILE_DIR,
@@ -427,6 +440,8 @@ MODEL_SPECS: dict[str, ModelSpec] = {
 MODEL_ALIASES = {
     "deepseek-web": "DeepSeekV4",
     "DeepSeek V4": "DeepSeekV4",
+    "DeepSeek V4 Simple": "DeepSeekV4-simple",
+    "DeepSeekV4-simple": "DeepSeekV4-simple",
     "DeepSeek V4-thinking": "DeepSeekV4-thinking",
     "DeepSeekV3": "DeepSeekV4",
     "DeepSeekV3-thinking": "DeepSeekV4-thinking",

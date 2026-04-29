@@ -144,6 +144,17 @@ def set_automation_enabled_setting(enabled: bool):
     save_app_settings(settings)
 
 
+def automation_context_mode_setting() -> str:
+    value = str(load_app_settings().get("automation_context_mode", "expert") or "expert").strip().lower()
+    return value if value in {"expert", "simple"} else "expert"
+
+
+def set_automation_context_mode_setting(mode: str):
+    settings = load_app_settings()
+    settings["automation_context_mode"] = "simple" if str(mode).strip().lower() == "simple" else "expert"
+    save_app_settings(settings)
+
+
 def developer_error_details_enabled() -> bool:
     return os.environ.get("AGENT_QT_SHOW_AUTOMATION_TRACEBACK", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -3832,6 +3843,13 @@ AUTOMATION_MODELS = [
     ("MiMo V2.5", "xiaomi-mimo-v2.5"),
 ]
 AUTOMATION_DEFAULT_MODEL = "DeepSeekV4"
+AUTOMATION_CONTEXT_MODES = [
+    ("专家模式", "expert"),
+    ("简单模式", "simple"),
+]
+AUTOMATION_SIMPLE_MODEL_BY_MODEL = {
+    "DeepSeekV4": "DeepSeekV4-simple",
+}
 AUTOMATION_REQUIRED_MODULES = (
     "fastapi",
     "uvicorn",
@@ -6648,6 +6666,7 @@ class ChatPage(QWidget):
         self.automation_manager = AutomationProviderManager()
         self.automation_enabled = automation_enabled_setting()
         self.automation_model = AUTOMATION_DEFAULT_MODEL
+        self.automation_context_mode = automation_context_mode_setting()
         self.automation_worker: Optional[AutomationChatWorker] = None
         self.automation_preview_worker: Optional[AutomationPreviewWorker] = None
         self.automation_preview_bubble: Optional[QFrame] = None
@@ -6680,6 +6699,8 @@ class ChatPage(QWidget):
         self.automation_composer: Optional[QFrame] = None
         self.automation_input: Optional[QTextEdit] = None
         self.automation_send_btn: Optional[QToolButton] = None
+        self.automation_context_mode_btn: Optional[QToolButton] = None
+        self.last_automation_provider_compaction = "none"
         self.chat_column_max_width = 1480
         self.chat_column_width_ratio = 0.94
         self.user_bubble_width_ratio = 0.75
@@ -6904,11 +6925,16 @@ class ChatPage(QWidget):
         composer_layout = QHBoxLayout(self.automation_composer)
         composer_layout.setContentsMargins(10, 8, 8, 8)
         composer_layout.setSpacing(8)
+        composer_input_column = QWidget()
+        composer_input_column.setStyleSheet("background: transparent;")
+        composer_input_layout = QVBoxLayout(composer_input_column)
+        composer_input_layout.setContentsMargins(0, 0, 0, 0)
+        composer_input_layout.setSpacing(2)
         self.automation_input = QTextEdit()
         self.automation_input.setPlaceholderText(
             f"上下文 0k / {context_k_label(AUTOMATION_CONTEXT_DISPLAY_TOKENS)} · 输入下一步需求..."
         )
-        self.automation_input.setFixedHeight(54)
+        self.automation_input.setFixedHeight(42)
         self.automation_input.setAcceptRichText(False)
         self.automation_input.textChanged.connect(self.on_automation_input_text_changed)
         self.automation_input.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -6928,7 +6954,20 @@ class ChatPage(QWidget):
                 background: transparent;
             }}
         """)
-        composer_layout.addWidget(self.automation_input, 1)
+        composer_input_layout.addWidget(self.automation_input, 1)
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(0)
+        self.automation_context_mode_btn = QToolButton(cursor=Qt.CursorShape.PointingHandCursor)
+        self.automation_context_mode_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.automation_context_mode_btn.setPopupMode(QToolButton.InstantPopup)
+        self.automation_context_mode_btn.setFixedHeight(22)
+        self.automation_context_mode_btn.setMenu(self.create_automation_context_mode_menu())
+        self.update_automation_context_mode_button()
+        mode_row.addWidget(self.automation_context_mode_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        mode_row.addStretch(1)
+        composer_input_layout.addLayout(mode_row)
+        composer_layout.addWidget(composer_input_column, 1)
         self.automation_send_btn = QToolButton(cursor=Qt.CursorShape.PointingHandCursor)
         self.automation_send_btn.setFixedSize(42, 42)
         self.automation_send_btn.setIcon(line_icon("send", "white", 20))
@@ -7211,6 +7250,59 @@ class ChatPage(QWidget):
     def toggle_prompt_tools(self):
         return
 
+    def automation_context_mode_label(self) -> str:
+        if self.automation_context_mode == "simple":
+            return f"简单模式 · {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)}"
+        return "专家模式 · 约45k"
+
+    def create_automation_context_mode_menu(self) -> QMenu:
+        menu = QMenu(self)
+        for label, mode in AUTOMATION_CONTEXT_MODES:
+            suffix = f" · {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)}" if mode == "simple" else " · 约45k"
+            action = QAction(label + suffix, self)
+            action.setCheckable(True)
+            action.setChecked(self.automation_context_mode == mode)
+            action.triggered.connect(lambda _checked=False, value=mode: self.set_automation_context_mode(value))
+            menu.addAction(action)
+        return menu
+
+    def update_automation_context_mode_button(self):
+        button = self.automation_context_mode_btn
+        if button is None:
+            return
+        button.setText(self.automation_context_mode_label() + " ▾")
+        button.setMenu(self.create_automation_context_mode_menu())
+        button.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {COLORS['text_secondary']};
+                border: none;
+                border-radius: 8px;
+                padding: 2px 7px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QToolButton:hover {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text']};
+            }}
+            QToolButton::menu-indicator {{
+                image: none;
+                width: 0;
+            }}
+        """)
+
+    def set_automation_context_mode(self, mode: str):
+        self.automation_context_mode = "simple" if str(mode).strip().lower() == "simple" else "expert"
+        set_automation_context_mode_setting(self.automation_context_mode)
+        self.update_automation_context_mode_button()
+        self.update_automation_composer_state()
+
+    def effective_automation_model(self) -> str:
+        if self.automation_context_mode == "simple":
+            return AUTOMATION_SIMPLE_MODEL_BY_MODEL.get(self.automation_model, self.automation_model)
+        return self.automation_model
+
     def show_settings_menu(self):
         if agent_runtime_enabled() and not agent_runtime_ready():
             set_agent_runtime_enabled(False)
@@ -7309,6 +7401,8 @@ class ChatPage(QWidget):
 
     def set_automation_model(self, model_id: str):
         self.automation_model = model_id
+        self.update_automation_context_mode_button()
+        self.update_automation_composer_state()
 
     def set_automation_max_rounds(self, rounds: int):
         self.automation_loop_max_rounds = max(1, int(rounds))
@@ -7803,6 +7897,19 @@ class ChatPage(QWidget):
             if self.automation_input is not None:
                 self.automation_input.setFocus()
             return
+        if self.automation_context_mode == "expert":
+            self.build_automation_context_payload(text, log_stats=False, apply_provider_budget=True)
+            if self.last_automation_provider_compaction == "byte_fallback":
+                self.set_automation_context_mode("simple")
+                if self.automation_input is not None:
+                    self.automation_input.setPlainText(text)
+                    self.automation_input.setFocus()
+                styled_warning(
+                    self,
+                    "已切换到简单模式",
+                    "专家模式上下文会触发 DeepSeek Web 超长提交限制。已保留输入内容并切换到简单模式，请确认后重新提交。",
+                )
+                return
         if self.automation_input is not None:
             self.automation_input.clear()
         full_prompt = self.build_system_prompt(text)
@@ -7882,7 +7989,7 @@ class ChatPage(QWidget):
         self.automation_preview_last_chars = 0
         self.automation_preview_dots = 0
         self.automation_preview_bubble = self.create_automation_preview_bubble()
-        worker = AutomationPreviewWorker(self.automation_manager, self.automation_model, self.thread_id)
+        worker = AutomationPreviewWorker(self.automation_manager, self.effective_automation_model(), self.thread_id)
         self.automation_preview_worker = worker
         worker.preview_signal.connect(self.update_automation_preview)
         worker.start()
@@ -8201,7 +8308,13 @@ class ChatPage(QWidget):
         )
         return text_within_token_budget(history_text, token_budget)
 
-    def build_automation_context_payload(self, current_prompt: str, skip_entry_id: str = "", log_stats: bool = True) -> str:
+    def build_automation_context_payload(
+        self,
+        current_prompt: str,
+        skip_entry_id: str = "",
+        log_stats: bool = True,
+        apply_provider_budget: Optional[bool] = None,
+    ) -> str:
         system_context = self.automation_context_system_text()
         current_prompt = str(current_prompt or "").strip()
         token_budget = max(
@@ -8224,7 +8337,9 @@ class ChatPage(QWidget):
 
         payload = build_payload(history_text)
         payload_bytes = utf8_len(payload)
-        provider_byte_budget = AUTOMATION_CONTEXT_PROVIDER_PAYLOAD_BYTES
+        if apply_provider_budget is None:
+            apply_provider_budget = self.automation_context_mode == "expert"
+        provider_byte_budget = AUTOMATION_CONTEXT_PROVIDER_PAYLOAD_BYTES if apply_provider_budget else 0
         provider_compaction = "none"
         if provider_byte_budget > 0 and payload_bytes > provider_byte_budget:
             history_text = self.compact_automation_history_text(
@@ -8248,6 +8363,7 @@ class ChatPage(QWidget):
             history_text = text_within_utf8_budget(history_text, history_byte_budget)
             payload = build_payload(history_text)
             provider_compaction = "byte_fallback"
+        self.last_automation_provider_compaction = provider_compaction
         if log_stats:
             logger.warning(
                 "Automation context payload chars=%d bytes=%d tokens=%d token_budget=%d provider_byte_budget=%d provider_compaction=%s",
@@ -8264,7 +8380,9 @@ class ChatPage(QWidget):
         return estimate_context_tokens(self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id, log_stats=False))
 
     def automation_context_placeholder_text(self) -> str:
-        return f"上下文自动压缩到约 {context_k_label(AUTOMATION_CONTEXT_DISPLAY_TOKENS)} 内 · 输入下一步需求..."
+        if self.automation_context_mode == "simple":
+            return f"简单模式 · 上下文到约 {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)} 自动压缩 · 输入下一步需求..."
+        return "专家模式 · DeepSeek Web 约45k 安全线 · 输入下一步需求..."
 
     def build_automation_messages(self, current_prompt: str, skip_entry_id: str = "") -> List[Dict[str, str]]:
         return [{"role": "user", "content": self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id)}]
@@ -8347,7 +8465,7 @@ class ChatPage(QWidget):
         worker = AutomationChatWorker(
             self.automation_manager,
             messages,
-            self.automation_model,
+            self.effective_automation_model(),
             self.thread_id,
         )
         self.automation_worker = worker
