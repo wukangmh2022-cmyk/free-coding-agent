@@ -3655,7 +3655,7 @@ class DeepSeekWebBridge:
                     else:
                         copy_probe_started = time.perf_counter()
                         copy_probe_budget_ms = self.copy_probe_max_ms
-                        if output_protocol == "plain":
+                        if output_protocol == "plain" and is_likely_truncated_plain_text(response_text):
                             copy_probe_budget_ms = max(copy_probe_budget_ms * 3, 4500)
                         if trace is not None:
                             trace.mark("copy_probe_started")
@@ -5838,30 +5838,6 @@ class DeepSeekWebBridge:
             if has_advanced and current and stable_seen >= self.stable_rounds:
                 if try_continue_generation("stable_text"):
                     continue
-                if plain_protocol and self.can_submit_next_turn(page) and not self.has_continue_generation_button(page):
-                    copied = self.try_copy_last_assistant_text(
-                        page,
-                        max_total_ms=max(self.copy_probe_max_ms, 1500),
-                        plain_protocol=True,
-                    )
-                    if copied and self._matches_current_request_response_candidate(copied):
-                        if copied == stable_copy_text:
-                            stable_copy_seen += 1
-                        else:
-                            stable_copy_text = copied
-                            stable_copy_seen = 1
-                        if stable_copy_seen >= max(2, self.stable_rounds):
-                            if trace is not None:
-                                trace.set("response_chars", len(copied))
-                                trace.set("response_ready_reason", "copy_button_plain_terminal_stable")
-                                trace.mark("response_stable")
-                            logger.warning(
-                                "DeepSeek wait_for_response returning terminal stable plain clipboard copy dom_chars=%d copied_chars=%d stable_copy_seen=%d",
-                                len(current),
-                                len(copied),
-                                stable_copy_seen,
-                            )
-                            return copied
                 if (
                     plain_protocol
                     and has_agent_qt_completion_line(current)
@@ -5875,6 +5851,25 @@ class DeepSeekWebBridge:
                     logger.warning(
                         "DeepSeek wait_for_response returning plain text with completion line chars=%d",
                         len(current),
+                    )
+                    return current
+                if (
+                    plain_protocol
+                    and self.can_submit_next_turn(page)
+                    and not self.has_continue_generation_button(page)
+                    and not is_suspicious_short_fragment(current)
+                    and not is_suspicious_incomplete_command_text(current)
+                    and not is_likely_truncated_plain_text(current)
+                    and self._matches_current_request_response_candidate(current)
+                ):
+                    if trace is not None:
+                        trace.set("response_chars", len(current))
+                        trace.set("response_ready_reason", "plain_terminal_stable_dom")
+                        trace.mark("response_stable")
+                    logger.warning(
+                        "DeepSeek wait_for_response returning terminal stable plain DOM text chars=%d stable_seen=%d",
+                        len(current),
+                        stable_seen,
                     )
                     return current
                 if is_placeholder_assistant_payload_text(current):

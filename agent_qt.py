@@ -8244,7 +8244,7 @@ class ChatPage(QWidget):
 
         def on_finished(text: str, error: str):
             self.automation_worker = None
-            self.stop_automation_preview(remove_bubble=True)
+            self.stop_automation_preview(remove_bubble=bool(error))
             self.update_automation_composer_state()
             if copy_btn is not None and not self.automation_loop_active:
                 copy_btn.setEnabled(True)
@@ -8260,7 +8260,8 @@ class ChatPage(QWidget):
                 if (not quiet_message) or developer_error_details_enabled():
                     styled_warning(self, "AI 自动化失败", self.automation_manager.error_with_log_hint(error))
             else:
-                self.handle_ai_response_text(text)
+                preview_bubble = self.finalize_automation_preview_bubble(text)
+                self.handle_ai_response_text(text, existing_bubble=preview_bubble)
             worker.deleteLater()
 
         worker.finished_signal.connect(on_finished)
@@ -8709,7 +8710,29 @@ class ChatPage(QWidget):
         animate_widget_out(ai_frame, remove_input_frame)
         self.handle_ai_response_text(text, insert_index=idx)
 
-    def handle_ai_response_text(self, text: str, insert_index: Optional[int] = None):
+    def finalize_automation_preview_bubble(self, text: str) -> Optional[ChatBubble]:
+        bubble = self.automation_preview_bubble
+        if not isinstance(bubble, ChatBubble):
+            return None
+        status = getattr(bubble, "preview_status", None)
+        if status is not None:
+            status.hide()
+            status.setParent(None)
+            status.deleteLater()
+            bubble.preview_status = None
+        role_label = bubble.findChild(QLabel)
+        if role_label is not None:
+            role_label.setText("AI")
+        bubble.update_content(text)
+        self.automation_preview_bubble = None
+        return bubble
+
+    def handle_ai_response_text(
+        self,
+        text: str,
+        insert_index: Optional[int] = None,
+        existing_bubble: Optional[ChatBubble] = None,
+    ):
         text = (text or "").strip()
         if not text:
             return
@@ -8727,30 +8750,37 @@ class ChatPage(QWidget):
             self.scroll_to_bottom()
             return
         self.hide_empty_state()
-        ai_bubble = ChatBubble(
-            "ai",
-            display_text,
-            show_copy=True,
-            parent=self.chat_container,
-            copy_text="复制 AI 输出",
-            scrollable=True,
-            max_content_height=QT_WIDGET_MAX_HEIGHT,
-            markdown=self.automation_enabled,
-            expand_to_content=True,
-            flat=self.automation_enabled,
-        )
-        if insert_index is None:
-            self.add_chat_widget(ai_bubble)
+        if existing_bubble is not None:
+            ai_bubble = existing_bubble
+            ai_bubble.content = display_text
+            ai_bubble.update_content(display_text)
         else:
-            self.insert_chat_widget(insert_index, ai_bubble)
-        animate_widget_in(ai_bubble)
+            ai_bubble = ChatBubble(
+                "ai",
+                display_text,
+                show_copy=True,
+                parent=self.chat_container,
+                copy_text="复制 AI 输出",
+                scrollable=True,
+                max_content_height=QT_WIDGET_MAX_HEIGHT,
+                markdown=self.automation_enabled,
+                expand_to_content=True,
+                flat=self.automation_enabled,
+            )
+            if insert_index is None:
+                self.add_chat_widget(ai_bubble)
+            else:
+                self.insert_chat_widget(insert_index, ai_bubble)
+            animate_widget_in(ai_bubble)
         self.append_history({
             "type": "ai",
             "content": display_text,
         })
+        self.scroll_to_bottom()
+        QApplication.processEvents()
 
         if done_response:
-            self.stop_automation_loop("自动化执行完成。", ensure_manual_entry=True)
+            self.stop_automation_loop("", ensure_manual_entry=True)
             self.scroll_to_bottom()
             return
         
@@ -8773,7 +8803,7 @@ class ChatPage(QWidget):
         
         if not commands:
             if self.automation_loop_active:
-                self.stop_automation_loop("自动化执行完成。", ensure_manual_entry=True)
+                self.stop_automation_loop("", ensure_manual_entry=True)
                 self.scroll_to_bottom()
                 return
             warning_bubble = ChatBubble(
@@ -8851,6 +8881,8 @@ class ChatPage(QWidget):
             log_with_changes += format_change_summary(change_records, include_diff=True)
         elif long_running_launches:
             log_with_changes += "\n\nFiles changed:\n未检测到文件改动。若命令正在底部终端继续运行，保存/生成文件后需要等待进程结束或再执行一次检查。"
+        elif not log_with_changes.strip():
+            log_with_changes = "命令执行完成，未产生终端输出或文件变更。"
         context_content = build_execution_context_content(full_log, change_records, long_running_launches)
         self.result_bubble.update_content(log_with_changes)
         if change_records:
