@@ -1618,6 +1618,25 @@ def has_unclosed_shell_quote(text: str) -> bool:
     return single or double
 
 
+def shell_compound_end_token(line: str) -> str:
+    stripped = line.strip()
+    lowered = stripped.lower()
+    if lowered.startswith("if ") or lowered.startswith("if\t") or lowered == "if":
+        return "fi"
+    if lowered.startswith(("for ", "for\t", "while ", "while\t", "until ", "until\t")):
+        return "done"
+    if lowered.startswith("case ") or lowered.startswith("case\t") or lowered == "case":
+        return "esac"
+    return ""
+
+
+def shell_compound_starts_with_end(line: str, end_token: str) -> bool:
+    if not end_token:
+        return False
+    stripped = line.strip().lower()
+    return stripped == end_token or stripped.startswith(end_token + " ")
+
+
 def is_interactive_shell_command(cmd: str) -> bool:
     cmd = strip_shell_command_marker(cmd)
     normalized = " ".join((cmd or "").strip().split()).lower()
@@ -1786,6 +1805,21 @@ def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
             continue
 
         command_lines = [line]
+        compound_end = shell_compound_end_token(line)
+        if compound_end:
+            depth = 1
+            while i < len(lines) and depth > 0:
+                compound_line = lines[i].rstrip()
+                command_lines.append(compound_line)
+                i += 1
+                stripped_compound = compound_line.strip()
+                if not stripped_compound or stripped_compound.startswith("#"):
+                    continue
+                nested_end = shell_compound_end_token(stripped_compound)
+                if nested_end == compound_end:
+                    depth += 1
+                if shell_compound_starts_with_end(stripped_compound, compound_end):
+                    depth -= 1
         for tag in find_heredoc_tags(line):
             while i < len(lines):
                 heredoc_line = lines[i].rstrip()
@@ -2630,7 +2664,11 @@ CHAT_HISTORY_INITIAL_RENDER_ENTRIES = env_int("AGENT_QT_HISTORY_INITIAL_RENDER_E
 
 
 def is_automation_done_response(text: str) -> bool:
-    return AUTOMATION_DONE_MARKER in (text or "")
+    for line in str(text or "").splitlines():
+        if not line.strip():
+            continue
+        return bool(COMPLETION_LINE_RE.match(line))
+    return False
 
 
 def strip_automation_done_marker(text: str) -> str:
@@ -2831,6 +2869,7 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 请基于日志和 diff 判断下一步：
 - 如果任务已经完成，只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。
 - 如果任务还没有完成，继续输出一个完整的 ```{command_block_lang} 代码块，并按既有“占位符 + 后续代码块”协议补齐需要写入的大段文件内容。
+- 如果你输出任何命令块，就不要同时输出 `{AUTOMATION_DONE_MARKER}`；完成标记只能用于“本轮不再执行命令”的最终回复。
 - 如果上一轮把安装、构建、数据拉取或长耗时检查转入后台终端，不要把“已进入后台”当作任务完成。应先按终端摘要里的 log_path/PID/注册表判断它是否仍在运行；如果它仍可能在正常进行，输出一个短暂等待后读取对应日志/注册表的命令块，再由下一轮继续判断。
 - 如果后台终端日志已经显示成功、失败或明确缺失依赖，再基于该日志继续修复、验证或结束任务。
 - 不要重复已经成功完成的步骤；优先修复日志里的错误、补齐缺失文件或做必要验证。
