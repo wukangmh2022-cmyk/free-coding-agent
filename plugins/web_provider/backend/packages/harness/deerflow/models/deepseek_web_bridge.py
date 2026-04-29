@@ -3616,7 +3616,7 @@ class DeepSeekWebBridge:
                         ):
                             raise RuntimeError(
                                 "DeepSeek submit button was clicked, but the web page stayed idle. "
-                                "Please check whether the prompt remained in the input box or the page is rate-limited."
+                                "The DeepSeek Web page may have rejected an overlong message; reduce the prompt/history size and retry."
                             )
                     self.scroll_chat_to_bottom(page)
                     if self.sticky_marker:
