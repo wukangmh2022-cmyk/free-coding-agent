@@ -4630,10 +4630,43 @@ class DeepSeekWebBridge:
                 return
             except Exception as exc:
                 logger.warning(
-                    "DeepSeek system clipboard paste failed; trying execCommand insert: %s",
+                    "DeepSeek system clipboard paste failed; trying React value tracker insert: %s",
                     exc,
                     exc_info=True,
                 )
+
+        try:
+            self.insert_input_with_react_value_tracker(page, input_box, prompt)
+            logger.warning("DeepSeek fill_input React value tracker insert done chars=%d", len(prompt))
+            return
+        except Exception as exc:
+            logger.warning(
+                "DeepSeek React value tracker insert failed; trying synthetic paste event: %s",
+                exc,
+                exc_info=True,
+            )
+
+        try:
+            self.insert_input_with_synthetic_paste(page, input_box, prompt)
+            logger.warning("DeepSeek fill_input synthetic paste done chars=%d", len(prompt))
+            return
+        except Exception as exc:
+            logger.warning(
+                "DeepSeek synthetic paste failed; trying CDP insertText: %s",
+                exc,
+                exc_info=True,
+            )
+
+        try:
+            self.insert_input_with_cdp(page, input_box, prompt)
+            logger.warning("DeepSeek fill_input CDP insertText done chars=%d", len(prompt))
+            return
+        except Exception as exc:
+            logger.warning(
+                "DeepSeek CDP insertText failed; trying execCommand insert: %s",
+                exc,
+                exc_info=True,
+            )
 
         try:
             self.insert_input_with_exec_command(page, input_box, prompt)
@@ -4740,6 +4773,220 @@ class DeepSeekWebBridge:
             raise RuntimeError(f"DeepSeek system clipboard paste length mismatch: {length}/{len(prompt)}")
         logger.warning(
             "DeepSeek system clipboard paste verified chars=%d elapsed_ms=%d",
+            length,
+            int((time.perf_counter() - started) * 1000),
+        )
+
+    def insert_input_with_react_value_tracker(self, page: Page, input_box: Locator, prompt: str) -> None:
+        started = time.perf_counter()
+        result = input_box.evaluate(
+            """(node, value) => {
+                const isTextControl = node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement;
+                const textBefore = isTextControl ? String(node.value || '') : String(node.innerText || node.textContent || '');
+                node.focus();
+                if (isTextControl) {
+                    const proto = node instanceof HTMLTextAreaElement
+                        ? HTMLTextAreaElement.prototype
+                        : HTMLInputElement.prototype;
+                    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (descriptor && typeof descriptor.set === 'function') {
+                        descriptor.set.call(node, '');
+                    } else {
+                        node.value = '';
+                    }
+                    if (node._valueTracker && typeof node._valueTracker.setValue === 'function') {
+                        node._valueTracker.setValue(textBefore);
+                    }
+                    node.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        cancelable: true,
+                        inputType: 'deleteContentBackward',
+                        data: null,
+                    }));
+
+                    const trackerBeforeSet = node._valueTracker && typeof node._valueTracker.getValue === 'function'
+                        ? node._valueTracker.getValue()
+                        : null;
+                    if (descriptor && typeof descriptor.set === 'function') {
+                        descriptor.set.call(node, value);
+                    } else {
+                        node.value = value;
+                    }
+                    node.selectionStart = node.selectionEnd = value.length;
+                    if (node._valueTracker && typeof node._valueTracker.setValue === 'function') {
+                        node._valueTracker.setValue('');
+                    }
+                    const trackerAfterReset = node._valueTracker && typeof node._valueTracker.getValue === 'function'
+                        ? node._valueTracker.getValue()
+                        : null;
+                    try {
+                        node.dispatchEvent(new InputEvent('beforeinput', {
+                            bubbles: true,
+                            cancelable: true,
+                            inputType: 'insertFromPaste',
+                            data: value,
+                        }));
+                    } catch {}
+                    node.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        cancelable: true,
+                        inputType: 'insertFromPaste',
+                        data: value,
+                    }));
+                    node.dispatchEvent(new Event('change', { bubbles: true }));
+                    node.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: value }));
+                    const trackerAfterInput = node._valueTracker && typeof node._valueTracker.getValue === 'function'
+                        ? node._valueTracker.getValue()
+                        : null;
+                    return {
+                        tag: node.tagName.toLowerCase(),
+                        isTextControl,
+                        length: String(node.value || '').length,
+                        hadTracker: Boolean(node._valueTracker),
+                        trackerBeforeSetLength: trackerBeforeSet == null ? null : String(trackerBeforeSet).length,
+                        trackerAfterResetLength: trackerAfterReset == null ? null : String(trackerAfterReset).length,
+                        trackerAfterInputLength: trackerAfterInput == null ? null : String(trackerAfterInput).length,
+                    };
+                }
+
+                const selection = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(node);
+                selection.removeAllRanges();
+                selection.addRange(range);
+                node.textContent = value;
+                node.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'insertFromPaste',
+                    data: value,
+                }));
+                node.dispatchEvent(new Event('change', { bubbles: true }));
+                return {
+                    tag: node.tagName.toLowerCase(),
+                    isTextControl,
+                    length: String(node.innerText || node.textContent || '').length,
+                    hadTracker: false,
+                    trackerBeforeSetLength: null,
+                    trackerAfterResetLength: null,
+                    trackerAfterInputLength: null,
+                };
+            }""",
+            prompt,
+            timeout=5000,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError(f"DeepSeek React value tracker insert returned invalid result: {result}")
+        length = int(result.get("length") or -1)
+        if length < max(1, int(len(prompt) * 0.95)):
+            length = self.wait_for_input_length(page, len(prompt), timeout_ms=800)
+        if length < max(1, int(len(prompt) * 0.95)):
+            raise RuntimeError(f"DeepSeek React value tracker insert length mismatch: {length}/{len(prompt)} result={result}")
+
+        page.wait_for_timeout(120)
+        can_submit = self.can_submit_next_turn(page)
+        if not can_submit:
+            diagnostics = self.input_submit_diagnostics(page)
+            raise RuntimeError(
+                "DeepSeek React value tracker insert did not enable submit: "
+                f"result={result} diagnostics={diagnostics}"
+            )
+        logger.warning(
+            "DeepSeek React value tracker insert verified tag=%s chars=%d had_tracker=%s "
+            "tracker_before=%s tracker_reset=%s tracker_after=%s "
+            "can_submit=%s elapsed_ms=%d",
+            result.get("tag"),
+            length,
+            result.get("hadTracker"),
+            result.get("trackerBeforeSetLength"),
+            result.get("trackerAfterResetLength"),
+            result.get("trackerAfterInputLength"),
+            can_submit,
+            int((time.perf_counter() - started) * 1000),
+        )
+
+    def insert_input_with_synthetic_paste(self, page: Page, input_box: Locator, prompt: str) -> None:
+        started = time.perf_counter()
+        result = input_box.evaluate(
+            """(node, value) => {
+                node.focus();
+                const tag = node.tagName.toLowerCase();
+                const dataTransfer = new DataTransfer();
+                dataTransfer.setData('text/plain', value);
+                const pasteEvent = new ClipboardEvent('paste', {
+                    bubbles: true,
+                    cancelable: true,
+                    clipboardData: dataTransfer,
+                });
+                const notCancelled = node.dispatchEvent(pasteEvent);
+                let changedByPaste = false;
+                if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
+                    changedByPaste = (node.value || '').length >= Math.floor(value.length * 0.95);
+                } else {
+                    changedByPaste = (node.innerText || node.textContent || '').length >= Math.floor(value.length * 0.95);
+                }
+                if (!changedByPaste && notCancelled) {
+                    if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
+                        const start = node.selectionStart || 0;
+                        const end = node.selectionEnd || 0;
+                        const current = node.value || '';
+                        node.value = current.slice(0, start) + value + current.slice(end);
+                        node.selectionStart = node.selectionEnd = start + value.length;
+                    } else {
+                        node.textContent = value;
+                    }
+                    node.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste', data: value }));
+                }
+                const length = node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement
+                    ? (node.value || '').length
+                    : (node.innerText || node.textContent || '').length;
+                return { tag, notCancelled, length };
+            }""",
+            prompt,
+            timeout=5000,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError(f"DeepSeek synthetic paste returned invalid result: {result}")
+        length = int(result.get("length") or -1)
+        if length < max(1, int(len(prompt) * 0.95)):
+            length = self.wait_for_input_length(page, len(prompt), timeout_ms=800)
+        if length < max(1, int(len(prompt) * 0.95)):
+            raise RuntimeError(f"DeepSeek synthetic paste length mismatch: {length}/{len(prompt)} result={result}")
+        page.wait_for_timeout(120)
+        can_submit = self.can_submit_next_turn(page)
+        if not can_submit:
+            diagnostics = self.input_submit_diagnostics(page)
+            raise RuntimeError(
+                f"DeepSeek synthetic paste did not enable submit: result={result} diagnostics={diagnostics}"
+            )
+        logger.warning(
+            "DeepSeek synthetic paste verified tag=%s chars=%d not_cancelled=%s can_submit=%s elapsed_ms=%d",
+            result.get("tag"),
+            length,
+            result.get("notCancelled"),
+            can_submit,
+            int((time.perf_counter() - started) * 1000),
+        )
+
+    def insert_input_with_cdp(self, page: Page, input_box: Locator, prompt: str) -> None:
+        started = time.perf_counter()
+        input_box.click(timeout=1000)
+        modifier = "Meta" if sys.platform == "darwin" else "Control"
+        page.keyboard.press(f"{modifier}+A")
+        page.keyboard.press("Backspace")
+        session = page.context.new_cdp_session(page)
+        try:
+            session.send("Input.insertText", {"text": prompt})
+        finally:
+            try:
+                session.detach()
+            except Exception:
+                pass
+        length = self.wait_for_input_length(page, len(prompt), timeout_ms=2000)
+        if length < max(1, int(len(prompt) * 0.95)):
+            raise RuntimeError(f"DeepSeek CDP insertText length mismatch: {length}/{len(prompt)}")
+        logger.warning(
+            "DeepSeek CDP insertText verified chars=%d elapsed_ms=%d",
             length,
             int((time.perf_counter() - started) * 1000),
         )
@@ -4988,6 +5235,69 @@ class DeepSeekWebBridge:
             except Exception:
                 continue
         return False
+
+    def input_submit_diagnostics(self, page: Page) -> dict[str, Any]:
+        try:
+            result = page.evaluate(
+                """({ inputSelectors, sendSelectors }) => {
+                    const isVisible = (node) => {
+                        if (!(node instanceof HTMLElement)) return false;
+                        const style = window.getComputedStyle(node);
+                        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
+                        const rect = node.getBoundingClientRect();
+                        return !!rect.width && !!rect.height;
+                    };
+                    const inputCandidates = [];
+                    for (const selector of inputSelectors) {
+                        for (const node of document.querySelectorAll(selector)) {
+                            if (node instanceof HTMLElement && isVisible(node)) inputCandidates.push({ selector, node });
+                        }
+                    }
+                    const input = inputCandidates[inputCandidates.length - 1] || null;
+                    const buttons = [];
+                    for (const selector of sendSelectors) {
+                        for (const node of document.querySelectorAll(selector)) {
+                            if (!(node instanceof HTMLElement)) continue;
+                            const disabled = Boolean(node.disabled) || node.getAttribute('aria-disabled') === 'true';
+                            buttons.push({
+                                selector,
+                                tag: node.tagName.toLowerCase(),
+                                visible: isVisible(node),
+                                disabled,
+                                ariaDisabled: node.getAttribute('aria-disabled'),
+                                type: node.getAttribute('type'),
+                                className: String(node.className || '').slice(0, 180),
+                                text: String(node.innerText || node.textContent || '').trim().slice(0, 80),
+                            });
+                        }
+                    }
+                    if (!input) {
+                        return { input: null, buttons };
+                    }
+                    const node = input.node;
+                    const isTextControl = node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement;
+                    const trackerValue = node._valueTracker && typeof node._valueTracker.getValue === 'function'
+                        ? node._valueTracker.getValue()
+                        : null;
+                    return {
+                        input: {
+                            selector: input.selector,
+                            tag: node.tagName.toLowerCase(),
+                            active: document.activeElement === node,
+                            length: isTextControl
+                                ? String(node.value || '').length
+                                : String(node.innerText || node.textContent || '').length,
+                            hadTracker: Boolean(node._valueTracker),
+                            trackerLength: trackerValue == null ? null : String(trackerValue).length,
+                        },
+                        buttons,
+                    };
+                }""",
+                {"inputSelectors": list(self.input_selectors), "sendSelectors": list(self.send_selectors)},
+            )
+            return result if isinstance(result, dict) else {"invalid": result}
+        except Exception as exc:
+            return {"error": str(exc)}
 
     def has_continue_generation_button(self, page: Page) -> bool:
         for selector in self.continue_generation_selectors:
