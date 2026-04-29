@@ -60,6 +60,7 @@ _AGENT_RUNTIME_ENABLED: Optional[bool] = None
 _AUTOMATION_ENABLED: Optional[bool] = None
 QT_WIDGET_MAX_HEIGHT = 16777215
 DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+OFFICIAL_PIP_INDEX_URL = "https://pypi.org/simple"
 logger = logging.getLogger(__name__)
 
 
@@ -470,7 +471,7 @@ function Invoke-AgentQtPipInstall {
         if ($lastExit -eq 0) { return }
         Write-Host "配置的 PyPI 镜像失败，回退官方 PyPI..."
     }
-    & $PythonBin -m pip install @Arguments
+    & $PythonBin -m pip install --isolated --index-url __AGENT_QT_OFFICIAL_PIP_INDEX__ --trusted-host pypi.org --trusted-host files.pythonhosted.org @Arguments
     $lastExit = $LASTEXITCODE
     if ($lastExit -eq 0) { return }
     if ($Optional) {
@@ -483,7 +484,7 @@ function Invoke-AgentQtPipInstall {
     }
     exit $lastExit
 }
-"""
+""".replace("__AGENT_QT_OFFICIAL_PIP_INDEX__", ps_quote(OFFICIAL_PIP_INDEX_URL))
 
 def build_python_runtime_install_command() -> str:
     pip_args_posix = posix_join(pip_index_args())
