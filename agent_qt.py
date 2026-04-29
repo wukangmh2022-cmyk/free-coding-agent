@@ -8382,7 +8382,7 @@ class ChatPage(QWidget):
     def automation_context_placeholder_text(self) -> str:
         if self.automation_context_mode == "simple":
             return f"简单模式 · 上下文到约 {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)} 自动压缩 · 输入下一步需求..."
-        return "专家模式 · DeepSeek Web 约45k 安全线 · 输入下一步需求..."
+        return "专家模式 · DeepSeek Web 约45k 上下文阈值 · 输入下一步需求..."
 
     def build_automation_messages(self, current_prompt: str, skip_entry_id: str = "") -> List[Dict[str, str]]:
         return [{"role": "user", "content": self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id)}]
