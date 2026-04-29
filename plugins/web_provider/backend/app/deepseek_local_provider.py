@@ -111,6 +111,19 @@ DEEPSEEK_WEB_POOL_ACQUIRE_TIMEOUT_S = _int_env(
     minimum=1,
     maximum=3600,
 )
+DEEPSEEK_WEB_PREWARM_POOL = os.environ.get("DEEPSEEK_WEB_PREWARM_POOL", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+DEEPSEEK_WEB_PREWARM_SLOTS = _int_env(
+    "DEEPSEEK_WEB_PREWARM_SLOTS",
+    1,
+    minimum=0,
+    maximum=6,
+)
 DEEPSEEK_WEB_PROTOCOL_RETRIES = _int_env(
     "DEEPSEEK_WEB_PROTOCOL_RETRIES",
     1,
@@ -689,6 +702,40 @@ class BridgeSlot:
             max_workers=1,
             thread_name_prefix=f"deepseek-web-{_safe_pool_name(cache_key)}-{slot_index}",
         )
+        self._prewarm_lock = threading.Lock()
+        self._prewarm_future: concurrent.futures.Future | None = None
+
+    def prewarm(self, spec: ModelSpec) -> None:
+        with self._prewarm_lock:
+            if self._prewarm_future is not None and not self._prewarm_future.done():
+                return
+
+            def operation() -> dict[str, Any]:
+                started = time.perf_counter()
+                try:
+                    result = run_bridge_with_spec(
+                        self.bridge,
+                        spec=spec,
+                        operation=lambda: self.bridge.prepare_for_next_request(
+                            thinking_enabled=spec.forced_thinking_enabled,
+                            expert_mode_enabled=spec.forced_expert_mode_enabled,
+                        ),
+                    )
+                    logger.warning(
+                        "DeepSeek bridge slot prewarmed slot=%d prepared=%s already=%s elapsed_ms=%d total_ms=%d url=%s",
+                        self.index,
+                        result.get("prepared"),
+                        result.get("already_prepared"),
+                        result.get("elapsed_ms"),
+                        int((time.perf_counter() - started) * 1000),
+                        result.get("url"),
+                    )
+                    return result
+                except Exception:
+                    logger.warning("DeepSeek bridge slot prewarm failed slot=%d", self.index, exc_info=True)
+                    raise
+
+            self._prewarm_future = self.executor.submit(lambda: _run_in_playwright_worker(operation))
 
     def close(self) -> None:
         try:
@@ -712,6 +759,16 @@ class BridgePool:
         self._admission = threading.BoundedSemaphore(self.size + self.queue_limit)
         for slot in reversed(self._all):
             self._available.put(slot)
+
+    def prewarm_available(self, spec: ModelSpec, *, limit: int | None = None) -> None:
+        if not DEEPSEEK_WEB_PREWARM_POOL:
+            return
+        limit = self.size if limit is None else max(0, min(limit, self.size))
+        if limit <= 0:
+            return
+        available_slots = list(getattr(self._available, "queue", []))
+        for slot in available_slots[:limit]:
+            slot.prewarm(_spec_for_bridge_slot(spec, slot))
 
     def acquire(self) -> BridgeSlot:
         admitted = self._admission.acquire(blocking=False)
@@ -773,6 +830,7 @@ def get_bridge_pool(model_name: str, request_user: str | None = None) -> tuple[M
             pool.size,
             pool.queue_limit,
         )
+        pool.prewarm_available(spec, limit=DEEPSEEK_WEB_PREWARM_SLOTS)
     return spec, pool
 
 
@@ -1010,6 +1068,7 @@ async def run_on_bridge_slot(
     finally:
         released_at = time.perf_counter()
         pool.release(slot)
+        pool.prewarm_available(spec, limit=DEEPSEEK_WEB_PREWARM_SLOTS)
         logger.warning(
             "provider[%s] %s released bridge slot=%d pool=%s available=%d lifetime_ms=%d",
             request_id,
@@ -1030,6 +1089,23 @@ def close_bridges() -> None:
 atexit.register(close_bridges)
 
 app = FastAPI(title="DeepSeek Localhost Provider", version="0.2.0")
+
+
+@app.on_event("startup")
+async def prewarm_default_bridge_pool() -> None:
+    if not DEEPSEEK_WEB_PREWARM_POOL or DEEPSEEK_WEB_PREWARM_SLOTS <= 0:
+        return
+    try:
+        spec, pool = get_bridge_pool(DEFAULT_MODEL_ID)
+        pool.prewarm_available(spec, limit=DEEPSEEK_WEB_PREWARM_SLOTS)
+        logger.warning(
+            "DeepSeek bridge pool startup prewarm scheduled model=%s slots=%d pool=%s",
+            DEFAULT_MODEL_ID,
+            min(DEEPSEEK_WEB_PREWARM_SLOTS, pool.size),
+            pool.cache_key,
+        )
+    except Exception:
+        logger.warning("DeepSeek bridge pool startup prewarm scheduling failed", exc_info=True)
 
 
 class ChatMessage(BaseModel):

@@ -1868,6 +1868,7 @@ class DeepSeekWebBridge:
         self._active_request_prompt = ""
         self._active_request_messages: list[dict[str, Any]] = []
         self._active_request_expected_exact_text: str | None = None
+        self._prepared_new_chat = False
         self._response_preview_started_at = 0.0
         self._response_preview_lock = threading.Lock()
         self._response_preview: dict[str, Any] = {
@@ -1895,6 +1896,7 @@ class DeepSeekWebBridge:
             self._clear_session_runtime_state()
             self._active_session_state_path = None
             self._active_sticky_marker = None
+            self._prepared_new_chat = False
 
     def _clear_session_runtime_state(self) -> None:
         self._sticky_initialized = False
@@ -2117,6 +2119,7 @@ class DeepSeekWebBridge:
     def reset_page(self) -> None:
         if self._page is None or self._page.is_closed():
             self._page = None
+            self._prepared_new_chat = False
             return
         try:
             self._page.close()
@@ -2124,6 +2127,52 @@ class DeepSeekWebBridge:
             logger.debug("Failed to close DeepSeek page before recreating it.", exc_info=True)
         finally:
             self._page = None
+            self._prepared_new_chat = False
+
+    def prepare_for_next_request(
+        self,
+        *,
+        thinking_enabled: bool | None = None,
+        expert_mode_enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        with self._lock:
+            self._switch_session_if_needed()
+            if self._page is not None and self._page.is_closed():
+                self._page = None
+                self._prepared_new_chat = False
+            if self.force_new_chat and self._prepared_new_chat and self._page is not None:
+                return {
+                    "prepared": True,
+                    "already_prepared": True,
+                    "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                    "url": self._page.url,
+                }
+
+            page = self.ensure_page()
+            if self.force_new_chat:
+                try:
+                    page.goto(self.url, wait_until="domcontentloaded", timeout=self.page_load_timeout_ms)
+                except Exception:
+                    logger.debug("DeepSeek prewarm goto failed; recreating page.", exc_info=True)
+                    self.reset_page()
+                    page = self.ensure_page()
+                    page.goto(self.url, wait_until="domcontentloaded", timeout=self.page_load_timeout_ms)
+                self._clear_session_runtime_state()
+
+            self.ensure_chat_ready(page)
+            self.select_preferred_model(page)
+            self.sync_thinking_mode(page, thinking_enabled)
+            self.sync_expert_mode(page, expert_mode_enabled)
+            self.first_visible(page, self.input_selectors)
+            if self.force_new_chat:
+                self._prepared_new_chat = True
+            return {
+                "prepared": True,
+                "already_prepared": False,
+                "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                "url": page.url,
+            }
 
     def _is_active_request_echo_text(self, text: str) -> bool:
         stripped = (text or "").strip()
@@ -3383,9 +3432,14 @@ class DeepSeekWebBridge:
         with self._lock:
             self.reset_response_preview()
             self._switch_session_if_needed()
+            has_prepared_new_chat = (
+                self._prepared_new_chat
+                and self._page is not None
+                and not self._page.is_closed()
+            )
             reused_page_for_new_chat = (
                 self.force_new_chat
-                and self.fast_new_chat
+                and (self.fast_new_chat or has_prepared_new_chat)
                 and self._page is not None
                 and not self._page.is_closed()
             )
@@ -3397,21 +3451,33 @@ class DeepSeekWebBridge:
                 trace.mark("page_created")
             try:
                 if reused_page_for_new_chat:
-                    try:
-                        page.goto(self.url, wait_until="domcontentloaded", timeout=self.page_load_timeout_ms)
+                    if has_prepared_new_chat:
+                        self._prepared_new_chat = False
                         self._clear_session_runtime_state()
-                        self._refresh_current_chat_url(page, persist=False)
                         if trace is not None:
-                            trace.set("new_chat_selector", "fast_goto")
+                            trace.set("new_chat_selector", "prewarmed_page")
                             trace.mark("new_chat_ready")
-                    except Exception:
-                        logger.debug("Fast page-level new-chat reset failed; recreating page.", exc_info=True)
-                        self.reset_page()
-                        self._clear_session_runtime_state()
-                        page = self.ensure_page()
-                        reused_page_for_new_chat = False
-                        if trace is not None:
-                            trace.mark("page_recreated_after_fast_new_chat_miss")
+                    else:
+                        try:
+                            page.goto(self.url, wait_until="domcontentloaded", timeout=self.page_load_timeout_ms)
+                            self._clear_session_runtime_state()
+                            self._refresh_current_chat_url(page, persist=False)
+                            if trace is not None:
+                                trace.set("new_chat_selector", "fast_goto")
+                                trace.mark("new_chat_ready")
+                        except Exception:
+                            logger.debug("Fast page-level new-chat reset failed; recreating page.", exc_info=True)
+                            self.reset_page()
+                            self._clear_session_runtime_state()
+                            page = self.ensure_page()
+                            reused_page_for_new_chat = False
+                            if trace is not None:
+                                trace.mark("page_recreated_after_fast_new_chat_miss")
+                else:
+                    self._prepared_new_chat = False
+                if not reused_page_for_new_chat:
+                    if trace is not None:
+                        trace.set("new_chat_selector", None)
                 self.ensure_chat_ready(page, trace=trace)
                 model_select_result = self.select_preferred_model(page, trace=trace)
                 if trace is not None:
