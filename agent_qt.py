@@ -8038,7 +8038,63 @@ class ChatPage(QWidget):
             "Agent Qt 会把较早历史 compact 成 plaintext 摘要，近期上下文保留原文后继续。"
         )
 
-    def automation_history_text_for_entry(self, entry: Dict[str, object]) -> str:
+    def summarize_automation_text(self, text: str, limit: int) -> str:
+        content = strip_low_value_context_blocks(str(text or "").strip())
+        if len(content) <= limit:
+            return content
+        lines = [line.rstrip() for line in content.splitlines() if line.strip()]
+        if not lines:
+            return ""
+        high_signal: List[str] = []
+        high_signal_patterns = (
+            "FINAL:",
+            AUTOMATION_DONE_MARKER,
+            "Files changed:",
+            "Git diff file names:",
+            "Git diff hunks:",
+            "Traceback",
+            "Error:",
+            "ERROR:",
+            "失败",
+            "报错",
+        )
+        for line in lines:
+            stripped = line.strip()
+            if (
+                any(stripped.startswith(pattern) for pattern in high_signal_patterns)
+                or re.match(r"^[AMD]\s+\S+", stripped)
+                or stripped.startswith("@@")
+            ):
+                high_signal.append(stripped)
+        selected: List[str] = []
+        for line in high_signal[:18]:
+            if line not in selected:
+                selected.append(line)
+        for line in lines[:10]:
+            if line not in selected:
+                selected.append(line)
+        for line in lines[-8:]:
+            if line not in selected:
+                selected.append(line)
+        summary = "\n".join(selected).strip()
+        if len(summary) > limit:
+            summary = summary[: max(0, limit - 40)].rstrip()
+        omitted = max(0, len(lines) - len(selected))
+        if omitted:
+            suffix = f"\n（已省略 {omitted} 行低优先级历史细节）"
+            summary = (summary[: max(0, limit - len(suffix))].rstrip() + suffix).strip()
+        return summary
+
+    def summarize_result_history_text(self, text: str, limit: int) -> str:
+        content = strip_low_value_context_blocks(str(text or "").strip())
+        if not content:
+            return "命令执行完成，未产生可保留的高信号输出。"
+        marker = "【文件变更摘要（高密度，优先保留）】"
+        if marker in content:
+            content = content[content.index(marker):].strip()
+        return self.summarize_automation_text(content, limit)
+
+    def automation_history_text_for_entry(self, entry: Dict[str, object], detail: str = "full") -> str:
         entry_type = str(entry.get("type") or "")
         content = str(entry.get("context_content") or entry.get("content") or "").strip()
         if not content:
@@ -8049,23 +8105,63 @@ class ChatPage(QWidget):
                 user_text = content.strip()
             if not user_text:
                 return ""
-            return "【用户需求】\n" + self.compact_automation_entry_text(user_text, 2000)
+            prompt_limit = 2000 if detail == "full" else (900 if detail == "lean" else 500)
+            return "【用户需求】\n" + self.compact_automation_entry_text(user_text, prompt_limit)
         if entry_type == "ai":
-            return "【AI 回复】\n" + self.compact_automation_entry_text(content)
+            if detail == "full":
+                return "【AI 回复】\n" + self.compact_automation_entry_text(content)
+            ai_limit = 2600 if detail == "lean" else 1000
+            return "【AI 回复摘要】\n" + self.summarize_automation_text(content, ai_limit)
         if entry_type == "result":
-            high_signal = strip_low_value_context_blocks(content)
-            return "【本地执行结果和文件变更】\n" + self.compact_automation_entry_text(high_signal)
+            if detail == "full":
+                high_signal = strip_low_value_context_blocks(content)
+                return "【本地执行结果和文件变更】\n" + self.compact_automation_entry_text(high_signal)
+            result_limit = 2400 if detail == "lean" else 1100
+            return "【本地执行结果摘要】\n" + self.summarize_result_history_text(content, result_limit)
         return ""
 
-    def automation_history_chunks(self, skip_entry_id: str = "") -> List[str]:
-        chunks: List[str] = []
-        for entry in self.history_entries:
-            if skip_entry_id and str(entry.get("id") or "") == skip_entry_id:
+    def collapse_repeated_history_chunks(self, chunks: List[str]) -> List[str]:
+        collapsed: List[str] = []
+        previous = ""
+        count = 0
+
+        def flush() -> None:
+            nonlocal previous, count
+            if not previous:
+                return
+            if count > 1:
+                collapsed.append(f"{previous}\n（上面这条历史连续重复 {count} 次，已合并）")
+            else:
+                collapsed.append(previous)
+
+        for chunk in chunks:
+            if chunk == previous:
+                count += 1
                 continue
-            text = self.automation_history_text_for_entry(entry)
+            flush()
+            previous = chunk
+            count = 1
+        flush()
+        return collapsed
+
+    def automation_history_chunks(
+        self,
+        skip_entry_id: str = "",
+        detail: str = "full",
+        recent_full_count: int = 0,
+    ) -> List[str]:
+        entries = [
+            entry for entry in self.history_entries
+            if not (skip_entry_id and str(entry.get("id") or "") == skip_entry_id)
+        ]
+        chunks: List[str] = []
+        full_start = max(0, len(entries) - max(0, recent_full_count))
+        for index, entry in enumerate(entries):
+            entry_detail = "full" if recent_full_count and index >= full_start else detail
+            text = self.automation_history_text_for_entry(entry, detail=entry_detail)
             if text:
                 chunks.append(text)
-        return chunks
+        return self.collapse_repeated_history_chunks(chunks)
 
     def compact_automation_history_text(self, chunks: List[str], token_budget: int) -> str:
         if not chunks:
@@ -8129,22 +8225,38 @@ class ChatPage(QWidget):
         payload = build_payload(history_text)
         payload_bytes = utf8_len(payload)
         provider_byte_budget = AUTOMATION_CONTEXT_PROVIDER_PAYLOAD_BYTES
-        compacted_for_provider = False
+        provider_compaction = "none"
+        if provider_byte_budget > 0 and payload_bytes > provider_byte_budget:
+            history_text = self.compact_automation_history_text(
+                self.automation_history_chunks(skip_entry_id=skip_entry_id, detail="lean", recent_full_count=16),
+                token_budget,
+            )
+            payload = build_payload(history_text)
+            payload_bytes = utf8_len(payload)
+            provider_compaction = "semantic_lean"
+        if provider_byte_budget > 0 and payload_bytes > provider_byte_budget:
+            history_text = self.compact_automation_history_text(
+                self.automation_history_chunks(skip_entry_id=skip_entry_id, detail="minimal", recent_full_count=6),
+                token_budget,
+            )
+            payload = build_payload(history_text)
+            payload_bytes = utf8_len(payload)
+            provider_compaction = "semantic_minimal"
         if provider_byte_budget > 0 and payload_bytes > provider_byte_budget:
             empty_history_payload = build_payload("")
             history_byte_budget = max(0, provider_byte_budget - utf8_len(empty_history_payload) - 512)
             history_text = text_within_utf8_budget(history_text, history_byte_budget)
             payload = build_payload(history_text)
-            compacted_for_provider = True
+            provider_compaction = "byte_fallback"
         if log_stats:
             logger.warning(
-                "Automation context payload chars=%d bytes=%d tokens=%d token_budget=%d provider_byte_budget=%d provider_compacted=%s",
+                "Automation context payload chars=%d bytes=%d tokens=%d token_budget=%d provider_byte_budget=%d provider_compaction=%s",
                 len(payload),
                 utf8_len(payload),
                 estimate_context_tokens(payload),
                 token_budget,
                 provider_byte_budget,
-                compacted_for_provider,
+                provider_compaction,
             )
         return payload
 
