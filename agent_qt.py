@@ -156,6 +156,35 @@ def set_automation_context_mode_setting(mode: str):
     save_app_settings(settings)
 
 
+def app_theme_setting() -> str:
+    value = str(load_app_settings().get("theme", "light") or "light").strip().lower()
+    return value if value in {"light", "dark"} else "light"
+
+
+def set_app_theme_setting(theme: str):
+    settings = load_app_settings()
+    settings["theme"] = "dark" if str(theme).strip().lower() == "dark" else "light"
+    save_app_settings(settings)
+
+
+def chat_font_scale_setting() -> float:
+    try:
+        value = float(load_app_settings().get("chat_font_scale", 1.0))
+    except (TypeError, ValueError):
+        value = 1.0
+    return min(1.35, max(0.9, value))
+
+
+def set_chat_font_scale_setting(scale: float):
+    settings = load_app_settings()
+    settings["chat_font_scale"] = min(1.35, max(0.9, float(scale)))
+    save_app_settings(settings)
+
+
+def scaled_font_px(base: int) -> int:
+    return max(9, int(round(base * chat_font_scale_setting())))
+
+
 def developer_error_details_enabled() -> bool:
     return os.environ.get("AGENT_QT_SHOW_AUTOMATION_TRACEBACK", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -693,7 +722,7 @@ FORBIDDEN = [
 ]
 POWERSHELL_COMMAND_PREFIX = "__AGENT_QT_POWERSHELL__\n"
 
-COLORS = {
+LIGHT_COLORS = {
     "bg": "#f6f7fb",
     "bg_top": "#fbfcff",
     "surface": "#ffffff",
@@ -724,6 +753,46 @@ COLORS = {
     "terminal_muted": "#657089",
     "terminal_accent": "#2563eb",
 }
+
+DARK_COLORS = {
+    "bg": "#10141d",
+    "bg_top": "#151a25",
+    "surface": "#171d29",
+    "surface_alt": "#202838",
+    "sidebar_bg": "#121824",
+    "card_user": "#16263a",
+    "card_ai": "#221d34",
+    "card_system": "#182231",
+    "accent": "#7c6dff",
+    "accent_dark": "#a99fff",
+    "accent_light": "#2d2944",
+    "accent_2": "#22d3ee",
+    "text": "#ecf2ff",
+    "text_secondary": "#a9b5cc",
+    "muted": "#748098",
+    "border": "#30394c",
+    "border_strong": "#46536a",
+    "code_bg": "#111827",
+    "success": "#2dd48f",
+    "success_soft": "#123426",
+    "danger": "#ff6b72",
+    "danger_soft": "#3b1f25",
+    "input_bg": "#111827",
+    "terminal_bg": "#10141d",
+    "terminal_panel": "#121824",
+    "terminal_card": "#111827",
+    "terminal_text": "#ecf2ff",
+    "terminal_muted": "#a9b5cc",
+    "terminal_accent": "#60a5fa",
+}
+
+COLORS = dict(DARK_COLORS if app_theme_setting() == "dark" else LIGHT_COLORS)
+
+
+def apply_theme_palette(theme: str):
+    COLORS.clear()
+    COLORS.update(DARK_COLORS if str(theme).strip().lower() == "dark" else LIGHT_COLORS)
+
 
 def message_box_style() -> str:
     return f"""
@@ -5925,8 +5994,8 @@ class ChatBubble(QFrame):
         elif self.compact_user:
             self.setStyleSheet(f"""
                 QFrame#chatBubble {{
-                    background: #edf5ff;
-                    border: 1px solid #cfe0ff;
+                    background: {COLORS['card_user']};
+                    border: 1px solid {COLORS['border']};
                     border-radius: 18px;
                     margin: 4px 0;
                 }}
@@ -5966,7 +6035,7 @@ class ChatBubble(QFrame):
                     color: {COLORS['text']};
                     border: none;
                     padding: 0;
-                    font-size: 13px;
+                    font-size: {scaled_font_px(13)}px;
                     line-height: 1.35;
                 }}
                 QScrollBar:vertical {{
@@ -6094,7 +6163,7 @@ class ChatBubble(QFrame):
                 border-radius: {content_radius}px;
                 padding: {content_padding};
                 {font_family}
-                font-size: 12px;
+                font-size: {scaled_font_px(12)}px;
                 selection-background-color: #d8e6ff;
                 selection-color: {COLORS['text']};
             }}
@@ -6174,7 +6243,7 @@ class ChatBubble(QFrame):
                 border: none;
                 border-radius: 0;
                 padding: 0;
-                font-size: 12px;
+                font-size: {scaled_font_px(12)}px;
             }}
         """
 
@@ -6187,7 +6256,7 @@ class ChatBubble(QFrame):
                 border-radius: 0;
                 padding: 10px 12px;
                 font-family: 'SF Mono', 'Menlo', monospace;
-                font-size: 12px;
+                font-size: {scaled_font_px(12)}px;
                 selection-background-color: #d8e6ff;
                 selection-color: {COLORS['text']};
             }}
@@ -6518,6 +6587,86 @@ class ChatBubble(QFrame):
         self.content = text
         self.update_display_content(text)
 
+    def refresh_visual_settings(self):
+        colors = {
+            "user": (COLORS["card_user"], COLORS["border"], "你"),
+            "ai": (COLORS["card_ai"], "#d7ccff" if app_theme_setting() == "light" else COLORS["border"], "AI 输出"),
+            "system": (COLORS["card_system"], COLORS["border"], "执行结果"),
+        }
+        bg, border, _label_text = colors.get(getattr(self, 'role', 'system'), colors["system"])
+        if self.plain_system_log:
+            self.setStyleSheet("QFrame#chatBubblePlainSystemLog { background: transparent; border: none; margin: 0; }")
+        elif self.flat:
+            self.setStyleSheet("QFrame#chatBubble { background: transparent; border: none; margin: 2px 0; }")
+        else:
+            self.setStyleSheet(f"QFrame#chatBubble {{ background: {bg}; border: 1px solid {border}; border-radius: 18px; margin: 4px 0; }}")
+        for label in self.findChildren(QLabel):
+            if label in self.markdown_widgets:
+                continue
+            label.setStyleSheet(f"color: {COLORS['text']}; font-weight: 700; font-size: 13px; background: transparent;")
+        if self.markdown and self.expand_to_content:
+            self.render_markdown_parts()
+        elif hasattr(self, "content_label") and self.content_label is not None:
+            if self.compact_user:
+                self.content_label.setStyleSheet(f"""
+                    QTextBrowser {{
+                        background: transparent;
+                        color: {COLORS['text']};
+                        border: none;
+                        padding: 0;
+                        font-size: {scaled_font_px(13)}px;
+                        line-height: 1.35;
+                    }}
+                    QScrollBar:vertical {{
+                        background: transparent;
+                        width: 8px;
+                        margin: 2px 0 2px 2px;
+                    }}
+                    QScrollBar::handle:vertical {{
+                        background: {COLORS['border_strong']};
+                        border-radius: 4px;
+                        min-height: 22px;
+                    }}
+                    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                        height: 0;
+                    }}
+                """)
+            else:
+                editor_type = "QTextBrowser" if self.markdown else "QPlainTextEdit"
+                font_family = "" if self.markdown or (self.flat and self.role == "ai") else "font-family: 'SF Mono', 'Menlo', monospace;"
+                flat_system_log = self.flat and self.role == "system"
+                content_bg = COLORS["code_bg"] if flat_system_log else ("transparent" if self.flat else COLORS["code_bg"])
+                content_border = COLORS["border"] if flat_system_log else ("transparent" if self.flat else COLORS["border"])
+                content_radius = 12 if flat_system_log else (0 if self.flat else 12)
+                content_padding = "10px 12px" if flat_system_log else ("2px 0" if self.flat else "10px 12px")
+                self.content_label.setStyleSheet(f"""
+                    {editor_type} {{
+                        background: {content_bg};
+                        color: {COLORS['text']};
+                        border: 1px solid {content_border};
+                        border-radius: {content_radius}px;
+                        padding: {content_padding};
+                        {font_family}
+                        font-size: {scaled_font_px(12)}px;
+                        selection-background-color: #d8e6ff;
+                        selection-color: {COLORS['text']};
+                    }}
+                    QScrollBar:vertical {{
+                        background: transparent;
+                        width: 8px;
+                        margin: 4px 2px 4px 0;
+                    }}
+                    QScrollBar::handle:vertical {{
+                        background: {COLORS['border_strong']};
+                        border-radius: 4px;
+                        min-height: 28px;
+                    }}
+                    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                        height: 0;
+                    }}
+                """)
+        self.adjust_content_height()
+
     def eventFilter(self, watched, event):
         return super().eventFilter(watched, event)
 
@@ -6675,7 +6824,7 @@ class ExecutionLogPanel(QFrame):
                     background: transparent;
                     color: {COLORS['text']};
                     border: none;
-                    font-size: 14px;
+                    font-size: {scaled_font_px(14)}px;
                     font-weight: 900;
                     padding: 0;
                 }}
@@ -6704,7 +6853,7 @@ class ExecutionLogPanel(QFrame):
                 border-radius: 12px;
                 padding: 10px 12px;
                 font-family: 'SF Mono', 'Menlo', monospace;
-                font-size: 12px;
+                font-size: {scaled_font_px(12)}px;
                 selection-background-color: #d8e6ff;
                 selection-color: {COLORS['text']};
             }}
@@ -6745,6 +6894,46 @@ class ExecutionLogPanel(QFrame):
     def update_content(self, text: str):
         self.content = text
         self.editor.setPlainText(text)
+        self.adjust_content_height()
+
+    def refresh_visual_settings(self):
+        if self.title_label is not None:
+            self.title_label.setStyleSheet(f"""
+                QLabel {{
+                    background: transparent;
+                    color: {COLORS['text']};
+                    border: none;
+                    font-size: {scaled_font_px(14)}px;
+                    font-weight: 900;
+                    padding: 0;
+                }}
+            """)
+        self.editor.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background: {COLORS['code_bg']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+                padding: 10px 12px;
+                font-family: 'SF Mono', 'Menlo', monospace;
+                font-size: {scaled_font_px(12)}px;
+                selection-background-color: #d8e6ff;
+                selection-color: {COLORS['text']};
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 8px;
+                margin: 4px 2px 4px 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {COLORS['border_strong']};
+                border-radius: 4px;
+                min-height: 28px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+        """)
         self.adjust_content_height()
 
 
@@ -8208,19 +8397,7 @@ class ChatPage(QWidget):
         self.automation_input.customContextMenuRequested.connect(
             lambda pos, editor=self.automation_input: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
         )
-        self.automation_input.setStyleSheet(f"""
-            QTextEdit {{
-                background: transparent;
-                color: {COLORS['text']};
-                border: none;
-                padding: 3px 4px;
-                font-size: 13px;
-            }}
-            QScrollBar:vertical {{
-                width: 0;
-                background: transparent;
-            }}
-        """)
+        self.automation_input.setStyleSheet(self.automation_input_style())
         composer_input_layout.addWidget(self.automation_input, 1)
         mode_row = QHBoxLayout()
         mode_row.setContentsMargins(0, 0, 0, 0)
@@ -9343,6 +9520,96 @@ class ChatPage(QWidget):
             return AUTOMATION_SIMPLE_MODEL_BY_MODEL.get(self.automation_model, self.automation_model)
         return self.automation_model
 
+    def automation_input_style(self) -> str:
+        return f"""
+            QTextEdit {{
+                background: transparent;
+                color: {COLORS['text']};
+                border: none;
+                padding: 3px 4px;
+                font-size: {scaled_font_px(13)}px;
+            }}
+            QScrollBar:vertical {{
+                width: 0;
+                background: transparent;
+            }}
+        """
+
+    def ai_manual_input_style(self) -> str:
+        return f"""
+            QTextEdit {{
+                background: {COLORS['input_bg']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+                padding: 12px;
+                font-size: {scaled_font_px(13)}px;
+                font-family: 'SF Mono', 'Menlo', monospace;
+            }}
+            QTextEdit:focus {{
+                border: 1px solid {COLORS['accent']};
+            }}
+        """
+
+    def apply_chat_visual_settings(self):
+        self.setStyleSheet(f"background: {COLORS['bg']};")
+        if self.settings_btn is not None:
+            self.settings_btn.setIcon(line_icon("settings", COLORS["text"], 18))
+            self.settings_btn.setStyleSheet(f"""
+                QToolButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 12px;
+                    font-size: 15px;
+                    font-weight: 900;
+                }}
+                QToolButton:hover {{
+                    background: {COLORS['accent_light']};
+                    color: {COLORS['accent_dark']};
+                }}
+            """)
+        if hasattr(self, "chat_container"):
+            self.chat_container.setStyleSheet(f"background: {COLORS['surface']};")
+        if hasattr(self, "chat_column"):
+            self.chat_column.setStyleSheet(f"background: {COLORS['surface']};")
+        if hasattr(self, "scroll_area"):
+            self.scroll_area.viewport().setStyleSheet(f"background: {COLORS['surface']};")
+        if self.automation_composer is not None:
+            self.automation_composer.setStyleSheet(f"""
+                QFrame {{
+                    background: {COLORS['surface']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 18px;
+                }}
+            """)
+        if self.automation_input is not None:
+            self.automation_input.setStyleSheet(self.automation_input_style())
+        for idx in range(self.chat_layout.count()):
+            widget = self.chat_layout.itemAt(idx).widget()
+            if isinstance(widget, (ChatBubble, ExecutionLogPanel)):
+                widget.refresh_visual_settings()
+                continue
+            if widget is not None and widget.objectName() == "aiResponseFrame":
+                ai_input = getattr(widget, "ai_input", None)
+                if ai_input is not None:
+                    ai_input.setStyleSheet(self.ai_manual_input_style())
+        window = self.window()
+        if isinstance(window, QMainWindow):
+            window.setStyleSheet(f"QMainWindow {{ background: {COLORS['bg']}; }}")
+        self.update_automation_composer_state()
+        self.update()
+
+    def set_chat_font_scale(self, scale: float):
+        set_chat_font_scale_setting(scale)
+        self.apply_chat_visual_settings()
+
+    def toggle_app_theme(self):
+        next_theme = "light" if app_theme_setting() == "dark" else "dark"
+        set_app_theme_setting(next_theme)
+        apply_theme_palette(next_theme)
+        self.apply_chat_visual_settings()
+
     def show_settings_menu(self):
         if agent_runtime_enabled() and not agent_runtime_ready():
             set_agent_runtime_enabled(False)
@@ -9430,10 +9697,20 @@ class ChatPage(QWidget):
         home_action.triggered.connect(self.confirm_back_home)
         menu.addAction(home_action)
         menu.addSeparator()
-        for title in ("字号大小（待实现）", "主题颜色（待实现）", "语言设置（待实现）"):
-            action = QAction(title, self)
-            action.setEnabled(False)
-            menu.addAction(action)
+        font_menu = style_compact_popup_menu(menu.addMenu("对话字号"))
+        current_scale = chat_font_scale_setting()
+        for label, scale in (("小 · 90%", 0.9), ("标准 · 100%", 1.0), ("大 · 115%", 1.15), ("特大 · 130%", 1.3)):
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(abs(current_scale - scale) < 0.01)
+            action.triggered.connect(lambda _checked=False, value=scale: self.set_chat_font_scale(value))
+            font_menu.addAction(action)
+        theme_action = QAction("白天模式" if app_theme_setting() == "dark" else "夜间模式", self)
+        theme_action.triggered.connect(self.toggle_app_theme)
+        menu.addAction(theme_action)
+        language_action = QAction("语言设置（待实现）", self)
+        language_action.setEnabled(False)
+        menu.addAction(language_action)
         menu.aboutToHide.connect(lambda menu=menu: setattr(self, "_settings_menu", None))
         menu.popup(self.settings_btn.mapToGlobal(self.settings_btn.rect().bottomRight()))
 
@@ -10964,20 +11241,7 @@ class ChatPage(QWidget):
         ai_input.customContextMenuRequested.connect(
             lambda pos, editor=ai_input: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
         )
-        ai_input.setStyleSheet(f"""
-            QTextEdit {{
-                background: {COLORS['input_bg']};
-                color: {COLORS['text']};
-                border: 1px solid #d7ccff;
-                border-radius: 12px;
-                padding: 12px;
-                font-size: 13px;
-                font-family: 'SF Mono', 'Menlo', monospace;
-            }}
-            QTextEdit:focus {{
-                border: 1px solid {COLORS['accent']};
-            }}
-        """)
+        ai_input.setStyleSheet(self.ai_manual_input_style())
         ai_frame.ai_input = ai_input
         ai_layout.addWidget(ai_input)
         
