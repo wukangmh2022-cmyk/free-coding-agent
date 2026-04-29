@@ -7237,6 +7237,8 @@ class ThreadCard(QFrame):
         self._rename_cancelled = False
         self.setObjectName("threadCard")
         self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(50)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setup_ui()
         self.apply_style()
 
@@ -7387,6 +7389,8 @@ class SkillCard(QFrame):
         self.skill_id = str(skill.get("id") or "")
         self.setObjectName("skillCard")
         self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(112)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setup_ui()
 
     def setup_ui(self):
@@ -7399,6 +7403,7 @@ class SkillCard(QFrame):
         title = QLabel(str(self.skill.get("name") or self.skill_id or "skill"))
         title.setStyleSheet(f"background: transparent; border: none; color: {COLORS['text']}; font-size: 12px; font-weight: 900;")
         title.setWordWrap(True)
+        title.setMaximumHeight(34)
         header.addWidget(title, 1)
         self.delete_btn = QToolButton(self, cursor=Qt.PointingHandCursor)
         self.delete_btn.setText("×")
@@ -7427,6 +7432,7 @@ class SkillCard(QFrame):
         if description:
             desc = QLabel(description)
             desc.setWordWrap(True)
+            desc.setMaximumHeight(48)
             desc.setStyleSheet(f"background: transparent; border: none; color: {COLORS['text_secondary']}; font-size: 11px;")
             layout.addWidget(desc)
         self.setStyleSheet(f"""
@@ -7565,7 +7571,14 @@ class Sidebar(QFrame):
         self.thread_list_layout.setContentsMargins(0, 0, 0, 0)
         self.thread_list_layout.setSpacing(8)
         self.thread_list_layout.addStretch()
-        threads_layout.addWidget(self.thread_list, 1)
+        self.thread_scroll = QScrollArea()
+        self.thread_scroll.setWidgetResizable(True)
+        self.thread_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.thread_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.thread_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.thread_scroll.setWidget(self.thread_list)
+        self.thread_scroll.setStyleSheet(self.sidebar_list_scroll_style())
+        threads_layout.addWidget(self.thread_scroll, 1)
         self.stack.addWidget(self.threads_page)
 
         self.skills_page = QWidget()
@@ -7580,7 +7593,14 @@ class Sidebar(QFrame):
         self.skill_list_layout.setContentsMargins(0, 0, 0, 0)
         self.skill_list_layout.setSpacing(8)
         self.skill_list_layout.addStretch()
-        skills_layout.addWidget(self.skill_list, 1)
+        self.skill_scroll = QScrollArea()
+        self.skill_scroll.setWidgetResizable(True)
+        self.skill_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.skill_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.skill_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.skill_scroll.setWidget(self.skill_list)
+        self.skill_scroll.setStyleSheet(self.sidebar_list_scroll_style())
+        skills_layout.addWidget(self.skill_scroll, 1)
         self.stack.addWidget(self.skills_page)
         layout.addWidget(self.stack, 1)
 
@@ -7606,6 +7626,33 @@ class Sidebar(QFrame):
         layout.addWidget(self.bottom_btn)
         self.set_tab("threads")
         self.setVisible(False)
+
+    def sidebar_list_scroll_style(self) -> str:
+        return f"""
+            QScrollArea {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollArea QWidget#qt_scrollarea_viewport {{
+                background: transparent;
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 8px;
+                margin: 4px 0 4px 2px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {COLORS['border_strong']};
+                border-radius: 4px;
+                min-height: 28px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: transparent;
+            }}
+        """
 
     def create_nav_button(self, text: str) -> QPushButton:
         btn = QPushButton(text, cursor=Qt.PointingHandCursor)
