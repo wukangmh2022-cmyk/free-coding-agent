@@ -2323,6 +2323,7 @@ AUTOMATION_CONTEXT_DISPLAY_TOKENS = env_int(
 AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_RECENT_TOKENS", 70000, minimum=8000)
 AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT_SUMMARY_TOKENS", 90000, minimum=12000)
 AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 16000, minimum=1200)
+AUTOMATION_CONTEXT_PROVIDER_PAYLOAD_BYTES = env_int("AGENT_QT_AUTOMATION_PROVIDER_PAYLOAD_BYTES", 175000, minimum=50000)
 CHAT_HISTORY_INITIAL_RENDER_ENTRIES = env_int("AGENT_QT_HISTORY_INITIAL_RENDER_ENTRIES", 40, minimum=10)
 
 
@@ -2441,6 +2442,45 @@ def text_within_token_budget(text: str, token_limit: int) -> str:
         return value[len(value) - lo:].lstrip()
 
     return prefix_by_tokens(text, head_budget) + marker + suffix_by_tokens(text, tail_budget)
+
+
+def utf8_len(text: str) -> int:
+    return len(str(text or "").encode("utf-8"))
+
+
+def text_within_utf8_budget(text: str, byte_limit: int) -> str:
+    text = str(text or "")
+    if byte_limit <= 0 or not text:
+        return ""
+    if utf8_len(text) <= byte_limit:
+        return text
+    marker = "\n\n... 历史内容已按 DeepSeek 网页输入字节预算压缩，保留开头和最新部分 ...\n\n"
+    marker_bytes = utf8_len(marker)
+    available = max(1, byte_limit - marker_bytes)
+    head_budget = max(4000, available // 3)
+    tail_budget = max(4000, available - head_budget)
+
+    def prefix_by_bytes(value: str, limit: int) -> str:
+        lo, hi = 0, len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if utf8_len(value[:mid]) <= limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        return value[:lo].rstrip()
+
+    def suffix_by_bytes(value: str, limit: int) -> str:
+        lo, hi = 0, len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if utf8_len(value[len(value) - mid:]) <= limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        return value[len(value) - lo:].lstrip()
+
+    return prefix_by_bytes(text, head_budget) + marker + suffix_by_bytes(text, tail_budget)
 
 
 def context_k_label(tokens: int) -> str:
@@ -8079,17 +8119,32 @@ class ChatPage(QWidget):
             self.automation_history_chunks(skip_entry_id=skip_entry_id),
             token_budget,
         )
-        payload = "\n\n".join([
-            plaintext_fence("第一段：系统提示词", system_context),
-            plaintext_fence("第二段：历史对话", history_text),
-            plaintext_fence("第三段：当前指令", current_prompt),
-        ])
+        def build_payload(history: str) -> str:
+            return "\n\n".join([
+                plaintext_fence("第一段：系统提示词", system_context),
+                plaintext_fence("第二段：历史对话", history),
+                plaintext_fence("第三段：当前指令", current_prompt),
+            ])
+
+        payload = build_payload(history_text)
+        payload_bytes = utf8_len(payload)
+        provider_byte_budget = AUTOMATION_CONTEXT_PROVIDER_PAYLOAD_BYTES
+        compacted_for_provider = False
+        if provider_byte_budget > 0 and payload_bytes > provider_byte_budget:
+            empty_history_payload = build_payload("")
+            history_byte_budget = max(0, provider_byte_budget - utf8_len(empty_history_payload) - 512)
+            history_text = text_within_utf8_budget(history_text, history_byte_budget)
+            payload = build_payload(history_text)
+            compacted_for_provider = True
         if log_stats:
             logger.warning(
-                "Automation context payload chars=%d tokens=%d token_budget=%d",
+                "Automation context payload chars=%d bytes=%d tokens=%d token_budget=%d provider_byte_budget=%d provider_compacted=%s",
                 len(payload),
+                utf8_len(payload),
                 estimate_context_tokens(payload),
                 token_budget,
+                provider_byte_budget,
+                compacted_for_provider,
             )
         return payload
 
