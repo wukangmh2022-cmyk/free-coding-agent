@@ -619,56 +619,54 @@ def install_agent_python_runtime(status_callback=None) -> str:
 SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 
 ## 协议说明
-本 Agent 采用"占位符 + 代码块"协议：你在命令代码块中用注释占位符（如 <!-- HTML block -->）替代大段代码，
+本 Agent 采用"占位符 + 代码块"协议：你在命令代码块中用带编号注释占位符（如 <!-- HTML block 1 -->）替代大段代码，
 然后将完整代码放在对应的 Markdown 代码块中。Agent 会先缓存所有代码块，再执行命令代码块并自动替换占位符。
 这样既能保持指令清晰，又能直接写入完整文件。
-
-## 当前运行环境
-- 操作系统: {os_name}
-- 平台标识: {platform_id}
-- 默认 Shell: {shell_name}
-- 本轮命令工具: {command_shell_name}
-- 命令执行方式: {command_execution}
-- 命令代码块语言: {command_block_lang}
-- 路径风格: {path_style}
-- Python 运行时: {python_runtime}
-- **重要：所有命令行指令必须匹配当前操作系统和本轮命令工具，不要输出其他系统或其他 shell 的命令。**
-- **Windows 特别重要：如果命令代码块语言是 powershell，就只能写 PowerShell；不要混用 cmd/bat 或 bash。**
 
 ## 推理要求
 - Reasoning Effort: absolute maximum with no shortcuts permitted. You must thoroughly decompose the task, identify the root cause, and stress-test the solution against likely paths, edge cases, and adversarial scenarios before answering.
 - 输出时不要展开隐藏思考链；只给出关键判断、可验证依据、最终方案和必要的执行指令。
 
-## 输出规则
+## 输出原则
+a. **重要：一个md命令块包含所有指令，不要输出多个命令块。**
+b. **禁止输出备用方案或二选一方案**：
+   - 不要写“如果上面失败/或者改用/备用方案/方案 A 和方案 B”。
+   - 不要在同一轮里同时保留两种互相替代的做法。
+   - 你必须自己选择一个最高把握方案，只输出这一种可执行路径。
+
+## 输出规则【核心、绝对、无可质疑】
+0. **自然对话问答输出无需使用text块、命令块；代码、脚本请放入如下规则的代码块内：
 1. **所有命令放在一个 Markdown fenced `{command_block_lang}` 代码块中**，不要拆分多个命令块。
    - 不要输出 JSON 对象，不要输出 content/tool_calls 包装，不要使用结构化工具调用协议。
    - 不要把 `{command_block_lang}` 作为普通正文单独输出；语言标识只能写在 Markdown 代码围栏里。
    - {command_rules}
-2. 大段文件内容用占位符替代，支持的占位符：
-   - <!-- HTML block --> 对应 html 代码块
-   - <!-- CSS block --> 或 /* CSS block */ 对应 css 代码块
-   - <!-- JS block --> 或 // JS block 对应 js/javascript 代码块
-   - <!-- Python block --> 或 # Python block 对应 python 代码块
-   - <!-- SVG block --> 对应 svg 代码块
-   - <!-- JSON block --> 对应 json 代码块
-   - <!-- YAML block --> 对应 yaml 代码块
-   - <!-- TypeScript block --> 对应 typescript/ts 代码块
-   - <!-- 其他任意类型 block --> 对应该类型名的代码块（如 svg/xml/toml 等）
-3. **占位符与代码块的对应规则**：
-   - 未编号占位符按出现顺序消费同语言代码块：两个 `<!-- Python block -->` 需要两个后续 ```python 代码块。
-   - 编号占位符固定引用对应序号的同语言代码块：`<!-- Python block 1 -->`、`# Python block 1` 都引用第 1 个 ```python 代码块。
-   - 同一个编号可以重复使用；如果同一份代码需要替换到多个位置，重复写 `<!-- Python block 1 -->` 即可，不要重复提供同一份代码块。
-4. 各代码块在命令块之后单独给出。
-5. 指令按顺序排列，先创建目录再写文件，确保可直接执行。
+2. **占位符与代码块的对应规则**：
+   - 编号占位符固定引用对应序号的同语言代码块如：`<!-- Python block 1 -->`
+   - <!-- Python block 1 --> 1代表顺序第一个python代码块会替换该位置。
+   - 禁止在命令块中用 heredoc/cat/tee/python -c 直接内嵌长代码或长文本；凡是超过 10 行的文件内容，必须改用带编号占位符，并把完整内容放到后续对应语言代码块。
+3. 大段输出内容用带编号占位符替代，支持的占位符：
+   - <!-- HTML block 1 --> 对应第 1 个 html 代码块
+   - <!-- CSS block 1 --> 或 /* CSS block 1 */ 对应第 1 个 css 代码块
+   - <!-- JS block 1 --> 或 // JS block 1 对应第 1 个 js/javascript 代码块
+   - <!-- Python block 1 --> 或 # Python block 1 对应第 1 个 python 代码块
+   - <!-- SVG block 1 --> 对应第 1 个 svg 代码块
+   - <!-- JSON block 1 --> 对应第 1 个 json 代码块
+   - <!-- YAML block 1 --> 对应第 1 个 yaml 代码块
+   - <!-- TypeScript block 1 --> 对应第 1 个 typescript/ts 代码块
+   - <!-- 其他任意类型 block 1 --> 对应该类型名的第 1 个代码块（如 svg/xml/toml 等）
+4. 各代码块建议在命令块之后单独给出。
+5. 指令按顺序排列，先创建目录再写文件，确保可顺序执行。
 6. 项目根目录: {project_root}，所有路径使用绝对路径。
-7. **重要：一个命令块包含所有指令，不要输出多个命令块。**
-8. **禁止输出备用方案或二选一方案**：
-   - 不要写“如果上面失败/或者改用/备用方案/方案 A 和方案 B”。
-   - 不要在同一轮里同时保留两种互相替代的做法。
-   - 你必须自己选择一个最高把握方案，只输出这一种可执行路径。
-9. 安装依赖用 pip install，启动后端用 python server.py 或 python3 -m http.server。
-10. 常驻进程命令（python server.py 等）会自动进入后台终端，不要加 & 或 nohup。
-11. 自动化循环中，如果根据执行日志判断任务已经完成，不要再输出命令块，回复 `{done_marker}` 加简短总结即可；如果未完成，继续输出下一轮完整命令块。
+7. 安装依赖用 pip install，启动后端用 python server.py 或 python3 -m http.server。
+8. 常驻进程命令（python server.py 等）会自动进入后台终端，不要加 & 或 nohup。
+9. 自动化循环中，如果根据执行日志判断任务已经完成，不要再输出命令块，回复 `{done_marker}` 加简短总结即可；如果未完成，继续输出下一轮完整命令块。
+
+## 当前运行环境
+- 操作系统: {os_name} ，平台标识: {platform_id}
+- 默认 Shell: {shell_name} ，命令工具: {command_shell_name}
+- 命令执行方式: {command_execution}，命令代码块语言: {command_block_lang}
+- 路径风格: {path_style}，Python 运行时: {python_runtime}
+- **Windows 如果命令代码块语言是 powershell，就只能写 PowerShell；不要混用 cmd/bat 或 bash。**
 
 ---
 
@@ -1431,7 +1429,7 @@ def get_code_block(blocks: Dict[str, List[str]], lang: str, index: int = 0) -> O
     return None
 
 def get_next_code_block(blocks: Dict[str, List[str]], counters: Dict[str, int], lang: str) -> Optional[str]:
-    """按占位符出现顺序消费同语言代码块。"""
+    """按占位符出现顺序消费同语言代码块。保留给旧数据迁移，不再用于占位符解析。"""
     lang = canonical_lang(lang)
     index = counters.get(lang, 0)
     code = get_code_block(blocks, lang, index)
@@ -1443,19 +1441,22 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
     """
     替换所有占位符。
     支持格式:
-    - <!-- XXX block -->
     - <!-- XXX block 1 -->
-    - # XXX block
     - # XXX block 1
     其中 XXX 对应 blocks 中的 key（html/css/js/python/svg/json/yaml/typescript/ts...）
     """
-    counters: Dict[str, int] = {}
     missing: List[str] = []
     placeholder_pattern = re.compile(
-        r'<!--\s*(?P<html>\w+)\s+block(?:\s+(?P<html_index>\d+))?\s*-->'
-        r'|/\*\s*(?P<css>\w+)\s+block(?:\s+(?P<css_index>\d+))?\s*\*/'
-        r'|//\s*(?P<slash>\w+)\s+block(?:\s+(?P<slash_index>\d+))?\b'
-        r'|#\s*(?P<hash>\w+)\s+block(?:\s+(?P<hash_index>\d+))?\b'
+        r'<!--\s*(?P<html>\w+)\s+block\s+(?P<html_index>\d+)\s*-->'
+        r'|/\*\s*(?P<css>\w+)\s+block\s+(?P<css_index>\d+)\s*\*/'
+        r'|//\s*(?P<slash>\w+)\s+block\s+(?P<slash_index>\d+)\b'
+        r'|#\s*(?P<hash>\w+)\s+block\s+(?P<hash_index>\d+)\b'
+    )
+    unnumbered_placeholder_pattern = re.compile(
+        r'<!--\s*(?P<html>\w+)\s+block\s*-->'
+        r'|/\*\s*(?P<css>\w+)\s+block\s*\*/'
+        r'|//\s*(?P<slash>\w+)\s+block\b(?!\s+\d+)'
+        r'|#\s*(?P<hash>\w+)\s+block\b(?!\s+\d+)'
     )
 
     def replace(match: re.Match) -> str:
@@ -1467,16 +1468,24 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
             or match.group('hash_index')
             or ''
         )
-        if index_text:
-            block_index = max(0, int(index_text) - 1)
-            code = get_code_block(blocks, lang, block_index)
-        else:
-            code = get_next_code_block(blocks, counters, lang)
+        block_index = max(0, int(index_text) - 1)
+        code = get_code_block(blocks, lang, block_index)
         if code is None:
-            suffix = f" block {index_text}" if index_text else ""
-            missing.append(canonical_lang(lang) + suffix)
+            missing.append(canonical_lang(lang) + f" block {index_text}")
             return match.group(0)
         return code
+
+    unnumbered = []
+    for match in unnumbered_placeholder_pattern.finditer(bash_text):
+        lang = (match.group('html') or match.group('css') or match.group('slash') or match.group('hash') or '').lower()
+        unnumbered.append(canonical_lang(lang))
+    if unnumbered:
+        unique_unnumbered = ", ".join(sorted(set(unnumbered)))
+        raise ValueError(
+            f"不再支持未编号占位符：{unique_unnumbered}。"
+            "请使用带编号占位符，例如 <!-- Python block 1 --> 或 # Python block 1。"
+            "为避免覆盖文件，本轮已停止执行。"
+        )
 
     resolved = placeholder_pattern.sub(replace, bash_text)
     if missing:
@@ -1488,7 +1497,7 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
         )
         raise ValueError(
             f"缺少占位符对应的代码块：{unique_missing}（缺少 {missing_counts}）。"
-            "未编号占位符会按顺序消费代码块；如需多处复用同一代码块，请使用编号占位符，例如 <!-- Python block 1 -->。"
+            "请确认占位符编号没有超过对应语言代码块数量，例如 <!-- Python block 1 --> 引用第 1 个 python 代码块。"
             "为避免覆盖文件，本轮已停止执行。"
         )
     if placeholder_pattern.search(resolved):
@@ -2542,7 +2551,8 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 - 如果任务还没有完成，继续输出一个完整的 ```{command_block_lang} 代码块，并按既有“占位符 + 后续代码块”协议补齐需要写入的大段文件内容。
 - 不要重复已经成功完成的步骤；优先修复日志里的错误、补齐缺失文件或做必要验证。
 - 禁止输出备用方案或“如果上面失败就改用...”这类二选一命令；必须自己选择一个最高把握方案，只保留一种可执行路径。
-- 未编号占位符按顺序消费代码块；编号占位符可复用同一个代码块，例如多处 `<!-- Python block 1 -->` 都引用第 1 个 python 代码块。
+- 只支持带编号占位符；编号占位符可复用同一个代码块，例如多处 `<!-- Python block 1 -->` 都引用第 1 个 python 代码块。
+- 禁止在命令块中用 heredoc/cat/tee/python -c 直接内嵌长代码或长文本；凡是超过 10 行的文件内容，必须改用带编号占位符，并把完整内容放到后续对应语言代码块。
 - 不要输出 JSON，不要输出 content/tool_calls 包装；这里需要的是普通 Markdown 文本和 fenced {command_block_lang}。
 """
 
@@ -5230,21 +5240,7 @@ class ChatBubble(QFrame):
                 code_box = self.markdown_code_widgets[code_index]
                 text = part.get("text", "")
                 if getattr(code_box, "code_source", None) != text:
-                    vertical = code_box.verticalScrollBar()
-                    horizontal = code_box.horizontalScrollBar()
-                    old_value = vertical.value()
-                    old_h_value = horizontal.value()
-                    was_at_bottom = old_value >= vertical.maximum() - 4
-                    code_box.code_source = text
-                    code_box.setUpdatesEnabled(False)
-                    code_box.setPlainText(text)
-                    code_box.setUpdatesEnabled(True)
-                    if was_at_bottom:
-                        vertical.setValue(vertical.maximum())
-                        QTimer.singleShot(0, lambda editor=code_box: editor.verticalScrollBar().setValue(editor.verticalScrollBar().maximum()))
-                    else:
-                        vertical.setValue(min(old_value, vertical.maximum()))
-                    horizontal.setValue(min(old_h_value, horizontal.maximum()))
+                    self.update_markdown_code_box_text(code_box, text)
                     changed = True
                 code_index += 1
             else:
@@ -5276,6 +5272,41 @@ class ChatBubble(QFrame):
                     total_ms,
                 )
         return True
+
+    def update_markdown_code_box_text(self, code_box: QPlainTextEdit, text: str):
+        old_text = str(getattr(code_box, "code_source", "") or "")
+        vertical = code_box.verticalScrollBar()
+        horizontal = code_box.horizontalScrollBar()
+        old_value = vertical.value()
+        old_maximum = vertical.maximum()
+        old_h_value = horizontal.value()
+        was_at_bottom = old_value >= old_maximum - 4
+        code_box.code_source = text
+
+        # Streaming updates commonly append one chunk to an open fenced block.
+        # Mutating the document in place avoids rebuilding the editor, which is
+        # what caused visible shaking inside command/code blocks.
+        if text.startswith(old_text):
+            suffix = text[len(old_text):]
+            if suffix:
+                code_box.setUpdatesEnabled(False)
+                cursor = QTextCursor(code_box.document())
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText(suffix)
+                code_box.setUpdatesEnabled(True)
+        else:
+            code_box.setUpdatesEnabled(False)
+            code_box.setPlainText(text)
+            code_box.setUpdatesEnabled(True)
+
+        if was_at_bottom:
+            if vertical.maximum() > old_maximum:
+                vertical.setValue(vertical.maximum())
+            else:
+                vertical.setValue(min(old_value, vertical.maximum()))
+        else:
+            vertical.setValue(min(old_value, vertical.maximum()))
+        horizontal.setValue(min(old_h_value, horizontal.maximum()))
 
     def render_precomputed_markdown_parts(self, parts: List[Dict[str, str]], signatures: List[tuple], layout: Optional[QVBoxLayout] = None, stats: Optional[Dict[str, int]] = None):
         if layout is None:
@@ -7184,6 +7215,31 @@ class ChatPage(QWidget):
         bar = self.scroll_area.verticalScrollBar()
         return bar.value() >= bar.maximum() - 8
 
+    def capture_chat_scroll_state(self) -> Dict[str, object]:
+        bar = self.scroll_area.verticalScrollBar()
+        return {
+            "value": bar.value(),
+            "maximum": bar.maximum(),
+            "at_bottom": bar.value() >= bar.maximum() - 8,
+        }
+
+    def restore_chat_scroll_state(self, state: Dict[str, object]):
+        bar = self.scroll_area.verticalScrollBar()
+        previous_maximum = int(state.get("maximum") or 0)
+        previous_value = int(state.get("value") or 0)
+        if bool(state.get("at_bottom")):
+            if bar.maximum() > previous_maximum + 2:
+                bar.setValue(bar.maximum())
+            else:
+                bar.setValue(min(previous_value, bar.maximum()))
+            return
+        bar.setValue(min(previous_value, bar.maximum()))
+
+    def stabilize_chat_scroll_after_update(self, state: Dict[str, object]):
+        self.restore_chat_scroll_state(state)
+        for delay in (0, 30, 90):
+            QTimer.singleShot(delay, lambda state=state: self.restore_chat_scroll_state(state))
+
     def is_execution_running(self) -> bool:
         return bool(self.worker and self.worker.isRunning())
 
@@ -7965,11 +8021,12 @@ class ChatPage(QWidget):
             "",
             parent=self.chat_container,
             markdown=True,
-            expand_to_content=False,
+            expand_to_content=True,
             flat=True,
             max_content_height=560,
         )
         frame.async_markdown_render = False
+        frame.stabilize_markdown_height = True
         role_label = frame.findChild(QLabel)
         if role_label is not None:
             role_label.setText("AI 正在回复")
@@ -8057,11 +8114,10 @@ class ChatPage(QWidget):
         text = self.automation_preview_pending_text
         if not text or text == self.automation_preview_last_rendered_text:
             return
-        should_follow_bottom = self.is_chat_at_bottom()
+        scroll_state = self.capture_chat_scroll_state()
         bubble.update_content(text)
         self.automation_preview_last_rendered_text = text
-        if should_follow_bottom:
-            QTimer.singleShot(0, self.scroll_to_bottom_now)
+        self.stabilize_chat_scroll_after_update(scroll_state)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         if elapsed_ms >= 60:
             logger.warning("Automation preview render UI slow elapsed_ms=%d chars=%d", elapsed_ms, len(text))
@@ -8944,6 +9000,7 @@ class ChatPage(QWidget):
         bubble = self.automation_preview_bubble
         if not isinstance(bubble, ChatBubble):
             return None
+        scroll_state = self.capture_chat_scroll_state()
         status = getattr(bubble, "preview_status", None)
         if status is not None:
             status.hide()
@@ -8954,6 +9011,7 @@ class ChatPage(QWidget):
         if role_label is not None:
             role_label.setText("AI")
         bubble.update_content(text)
+        self.stabilize_chat_scroll_after_update(scroll_state)
         self.automation_preview_bubble = None
         return bubble
 
@@ -8979,6 +9037,7 @@ class ChatPage(QWidget):
             self.stop_automation_loop("自动化执行完成。", ensure_manual_entry=True)
             self.scroll_to_bottom()
             return
+        scroll_state = self.capture_chat_scroll_state()
         self.hide_empty_state()
         if existing_bubble is not None:
             ai_bubble = existing_bubble
@@ -9006,7 +9065,7 @@ class ChatPage(QWidget):
             "type": "ai",
             "content": display_text,
         })
-        self.scroll_to_bottom()
+        self.stabilize_chat_scroll_after_update(scroll_state)
         QApplication.processEvents()
 
         if done_response:
