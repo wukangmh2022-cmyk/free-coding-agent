@@ -12,6 +12,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -4624,8 +4626,12 @@ class DeepSeekWebBridge:
             self.paste_input_from_clipboard(page, input_box, prompt)
             logger.warning("DeepSeek fill_input clipboard paste done chars=%d", len(prompt))
             return
-        except Exception:
-            logger.debug("DeepSeek clipboard paste failed; falling back to direct value injection.", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "DeepSeek clipboard paste failed; falling back to direct value injection: %s",
+                exc,
+                exc_info=True,
+            )
 
         logger.warning("DeepSeek fill_input page-level inject start chars=%d", len(prompt))
         result = page.evaluate(
@@ -4675,54 +4681,88 @@ class DeepSeekWebBridge:
             raise RuntimeError(f"DeepSeek input injection failed: {result}")
         logger.warning("DeepSeek fill_input page-level inject done tag=%s", result.get("tag"))
 
+    def write_system_clipboard_text(self, text: str) -> bool:
+        try:
+            if sys.platform == "darwin" and shutil.which("pbcopy"):
+                subprocess.run(["pbcopy"], input=text, text=True, encoding="utf-8", check=True, timeout=20)
+                return True
+            if sys.platform.startswith("win"):
+                command = "[Console]::InputEncoding=[Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())"
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                    input=text,
+                    text=True,
+                    encoding="utf-8",
+                    check=True,
+                    timeout=30,
+                )
+                return True
+            for command in (("wl-copy",), ("xclip", "-selection", "clipboard"), ("xsel", "--clipboard", "--input")):
+                if shutil.which(command[0]):
+                    subprocess.run(command, input=text, text=True, encoding="utf-8", check=True, timeout=20)
+                    return True
+        except Exception:
+            logger.debug("DeepSeek system clipboard write failed.", exc_info=True)
+        return False
+
     def paste_input_from_clipboard(self, page: Page, input_box: Locator, prompt: str) -> None:
         started = time.perf_counter()
-        page.evaluate(
-            """async (value) => {
-                if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
-                    throw new Error('clipboard-write-unavailable');
-                }
-                await navigator.clipboard.writeText(value);
-            }""",
-            prompt,
-        )
+        clipboard_source = "system"
+        if not self.write_system_clipboard_text(prompt):
+            clipboard_source = "browser"
+            page.evaluate(
+                """async (value) => {
+                    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+                        throw new Error('clipboard-write-unavailable');
+                    }
+                    await navigator.clipboard.writeText(value);
+                }""",
+                prompt,
+            )
         input_box.click(timeout=1000)
         modifier = "Meta" if sys.platform == "darwin" else "Control"
         page.keyboard.press(f"{modifier}+A")
         page.keyboard.press(f"{modifier}+V")
-        page.wait_for_timeout(250)
-        length = page.evaluate(
-            """({ selectors }) => {
-                const isVisible = (node) => {
-                    if (!(node instanceof HTMLElement)) return false;
-                    const style = window.getComputedStyle(node);
-                    if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
-                    const rect = node.getBoundingClientRect();
-                    return !!rect.width && !!rect.height;
-                };
-                const candidates = [];
-                for (const selector of selectors) {
-                    for (const node of document.querySelectorAll(selector)) {
-                        if (node instanceof HTMLElement && isVisible(node)) candidates.push(node);
+        min_expected = max(1, int(len(prompt) * 0.95))
+        length = -1
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+            length = page.evaluate(
+                """({ selectors }) => {
+                    const isVisible = (node) => {
+                        if (!(node instanceof HTMLElement)) return false;
+                        const style = window.getComputedStyle(node);
+                        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
+                        const rect = node.getBoundingClientRect();
+                        return !!rect.width && !!rect.height;
+                    };
+                    const candidates = [];
+                    for (const selector of selectors) {
+                        for (const node of document.querySelectorAll(selector)) {
+                            if (node instanceof HTMLElement && isVisible(node)) candidates.push(node);
+                        }
                     }
-                }
-                if (document.activeElement instanceof HTMLElement && isVisible(document.activeElement)) {
-                    candidates.push(document.activeElement);
-                }
-                const node = candidates[candidates.length - 1];
-                if (!(node instanceof HTMLElement)) return -1;
-                if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
-                    return (node.value || '').length;
-                }
-                return (node.innerText || node.textContent || '').length;
-            }""",
-            {"selectors": list(self.input_selectors)},
-        )
+                    if (document.activeElement instanceof HTMLElement && isVisible(document.activeElement)) {
+                        candidates.push(document.activeElement);
+                    }
+                    const node = candidates[candidates.length - 1];
+                    if (!(node instanceof HTMLElement)) return -1;
+                    if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
+                        return (node.value || '').length;
+                    }
+                    return (node.innerText || node.textContent || '').length;
+                }""",
+                {"selectors": list(self.input_selectors)},
+            )
+            if isinstance(length, int) and length >= min_expected:
+                break
         if not isinstance(length, int) or length < max(1, int(len(prompt) * 0.95)):
             raise RuntimeError(f"DeepSeek clipboard paste length mismatch: {length}/{len(prompt)}")
         logger.warning(
-            "DeepSeek clipboard paste verified chars=%d elapsed_ms=%d",
+            "DeepSeek clipboard paste verified chars=%d source=%s elapsed_ms=%d",
             length,
+            clipboard_source,
             int((time.perf_counter() - started) * 1000),
         )
 
