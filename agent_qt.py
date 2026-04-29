@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QLineEdit, QTreeWidget, QTreeWidgetItem,
     QMenu, QToolButton, QStyle, QPlainTextEdit, QTextBrowser, QStackedWidget,
     QGridLayout, QSizePolicy, QGraphicsOpacityEffect, QAbstractItemView,
-    QSpacerItem, QWidgetAction, QAbstractButton, QDialog
+    QSpacerItem, QWidgetAction, QAbstractButton, QDialog, QCheckBox
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, Property
 from PySide6.QtGui import QFont, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QKeySequence, QTextDocument, QImage
@@ -824,6 +824,48 @@ def compact_popup_menu_style() -> str:
 def style_compact_popup_menu(menu: QMenu) -> QMenu:
     menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     menu.setStyleSheet(compact_popup_menu_style())
+    return menu
+
+
+def style_skill_popup_menu(menu: QMenu) -> QMenu:
+    menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    menu.setStyleSheet(f"""
+        QMenu {{
+            background: rgba(238, 243, 252, 238);
+            color: {COLORS['text']};
+            border: none;
+            border-radius: 14px;
+            padding: 5px;
+            font-size: 11px;
+            font-weight: 700;
+        }}
+        QMenu::item {{
+            background: transparent;
+            color: {COLORS['text']};
+            border: none;
+            border-radius: 9px;
+            padding: 5px 18px 5px 10px;
+            min-height: 16px;
+        }}
+        QMenu::item:selected,
+        QMenu::item:checked {{
+            background: rgba(255, 255, 255, 145);
+            color: {COLORS['text']};
+        }}
+        QMenu::item:disabled {{
+            color: {COLORS['muted']};
+            background: transparent;
+        }}
+        QMenu::separator {{
+            height: 1px;
+            background: rgba(23, 32, 51, 24);
+            margin: 3px 7px;
+        }}
+        QMenu::indicator {{
+            width: 0;
+            height: 0;
+        }}
+    """)
     return menu
 
 def app_global_style() -> str:
@@ -3286,14 +3328,63 @@ def load_workspace_skills(root: str) -> List[Dict[str, str]]:
         except OSError:
             continue
         meta = parse_skill_frontmatter(content)
+        display_meta = load_skill_display_meta(path)
+        display_name = str(display_meta.get("display_name") or meta.get("name") or entry)
+        display_description = str(display_meta.get("display_description") or meta.get("description") or "")
         skills.append({
             "id": safe_skill_id(entry),
-            "name": meta.get("name") or entry,
-            "description": meta.get("description") or "",
+            "name": display_name,
+            "description": display_description,
             "path": skill_file,
             "dir": path,
         })
     return skills
+
+
+def skill_display_meta_path(skill_dir: str) -> str:
+    return os.path.join(skill_dir, ".agent_qt_skill.json")
+
+
+def load_skill_display_meta(skill_dir: str) -> Dict[str, str]:
+    for filename in (".agent_qt_skill.json", "_meta.json"):
+        path = os.path.join(skill_dir, filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        return {
+            "display_name": str(payload.get("display_name") or payload.get("displayName") or payload.get("name") or "").strip(),
+            "display_description": str(
+                payload.get("display_description")
+                or payload.get("description_zh")
+                or payload.get("summary_zh")
+                or payload.get("description")
+                or payload.get("summary")
+                or ""
+            ).strip(),
+        }
+    return {}
+
+
+def write_skill_display_meta(skill_dir: str, display_meta: Optional[Dict[str, str]] = None):
+    meta = dict(display_meta or {})
+    payload = {
+        "display_name": str(meta.get("display_name") or meta.get("name") or "").strip(),
+        "display_description": str(meta.get("display_description") or meta.get("description") or "").strip(),
+        "source": str(meta.get("source") or "").strip(),
+        "slug": str(meta.get("slug") or "").strip(),
+    }
+    if not any(payload.values()):
+        return
+    tmp_path = skill_display_meta_path(skill_dir) + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, skill_display_meta_path(skill_dir))
 
 
 def save_workspace_skill(root: str, markdown_text: str) -> Dict[str, str]:
@@ -3326,6 +3417,280 @@ def save_workspace_skill(root: str, markdown_text: str) -> Dict[str, str]:
         "path": skill_file,
         "dir": path,
     }
+
+
+def safe_skill_relative_path(path: str) -> str:
+    value = str(path or "").replace("\\", "/").strip()
+    if value.startswith("/") or any(part == ".." for part in value.split("/")):
+        return ""
+    value = re.sub(r"/+", "/", value).lstrip("/")
+    parts = []
+    for part in value.split("/"):
+        if not part or part in {".", ".."}:
+            continue
+        parts.append(re.sub(r"[^a-zA-Z0-9._ -]+", "_", part)[:120])
+    return "/".join(parts)
+
+
+def save_workspace_skill_package(root: str, files: Dict[str, bytes], fallback_markdown: str = "", display_meta: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    raw_skill = files.get("SKILL.md") or files.get("skill.md") or fallback_markdown.encode("utf-8")
+    content = normalize_skill_markdown(raw_skill.decode("utf-8", errors="replace"))
+    meta = parse_skill_frontmatter(content)
+    skill_id = safe_skill_id(meta.get("name"))
+    normalized_files = dict(files)
+    normalized_files["SKILL.md"] = content.encode("utf-8")
+    base = skills_root(root)
+    path = os.path.join(base, skill_id)
+    suffix = 2
+    while os.path.exists(path):
+        path = os.path.join(base, f"{skill_id}-{suffix}")
+        suffix += 1
+    os.makedirs(path, exist_ok=True)
+    for rel_path, data in normalized_files.items():
+        safe_rel = safe_skill_relative_path(rel_path)
+        if not safe_rel:
+            continue
+        target = os.path.abspath(os.path.join(path, safe_rel))
+        if not target.startswith(os.path.abspath(path) + os.sep):
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp_path = target + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, target)
+    write_skill_display_meta(path, display_meta)
+    skill_file = os.path.join(path, "SKILL.md")
+    return {
+        "id": os.path.basename(path),
+        "name": str((display_meta or {}).get("display_name") or meta.get("name") or os.path.basename(path)),
+        "description": str((display_meta or {}).get("display_description") or meta.get("description") or ""),
+        "path": skill_file,
+        "dir": path,
+    }
+
+
+def delete_workspace_skill(root: str, skill_id: str) -> bool:
+    skill_id = safe_skill_id(skill_id)
+    if not skill_id:
+        return False
+    base = os.path.abspath(skills_root(root))
+    path = os.path.abspath(os.path.join(base, skill_id))
+    if path == base or not path.startswith(base + os.sep) or not os.path.isdir(path):
+        return False
+    try:
+        shutil.rmtree(path)
+        return True
+    except OSError:
+        return False
+
+
+def normalize_remote_skill(item: object) -> Dict[str, str]:
+    if not isinstance(item, dict):
+        return {}
+    name = str(item.get("name") or item.get("slug") or item.get("id") or item.get("title") or item.get("displayName") or "").strip()
+    title = str(item.get("displayName") or item.get("title") or item.get("name") or name).strip()
+    description = str(
+        item.get("description_zh")
+        or item.get("summary_zh")
+        or item.get("description")
+        or item.get("summary")
+        or item.get("readme")
+        or ""
+    ).strip()
+    content = str(
+        item.get("skill_md")
+        or item.get("skillMd")
+        or item.get("markdown")
+        or item.get("content")
+        or item.get("skill")
+        or ""
+    ).strip()
+    author = str(item.get("author") or item.get("owner") or item.get("publisher") or "").strip()
+    if not author:
+        owner = item.get("owner")
+        if isinstance(owner, dict):
+            author = str(owner.get("displayName") or owner.get("handle") or "").strip()
+        else:
+            author = str(item.get("ownerName") or "").strip()
+    category = str(item.get("category") or item.get("type") or "").strip()
+    source_url = str(item.get("url") or item.get("source_url") or item.get("repository") or item.get("repo") or "").strip()
+    if not source_url:
+        source_url = str(item.get("homepage") or "").strip()
+    install = str(item.get("install") or item.get("install_command") or item.get("installCommand") or "").strip()
+    slug = str(item.get("slug") or name or title).strip()
+    downloads = ""
+    stars = ""
+    stats = item.get("stats")
+    if isinstance(stats, dict):
+        downloads = str(stats.get("downloads") or "").strip()
+        stars = str(stats.get("stars") or "").strip()
+    else:
+        downloads = str(item.get("downloads") or "").strip()
+        stars = str(item.get("stars") or "").strip()
+    if not name and not title:
+        return {}
+    return {
+        "name": safe_skill_id(name or title),
+        "slug": slug,
+        "title": title or name,
+        "description": description,
+        "content": content,
+        "author": author,
+        "category": category,
+        "source_url": source_url,
+        "install": install,
+        "downloads": downloads,
+        "stars": stars,
+        "source": str(item.get("source") or "tencent-skillhub").strip(),
+    }
+
+
+def extract_remote_skill_items(payload: object) -> List[Dict[str, str]]:
+    candidates: object = payload
+    if isinstance(payload, dict):
+        for key in ("skills", "results", "items", "data", "catalog"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                candidates = value
+                break
+            if isinstance(value, dict):
+                nested = extract_remote_skill_items(value)
+                if nested:
+                    return nested
+    if not isinstance(candidates, list):
+        return []
+    skills: List[Dict[str, str]] = []
+    for item in candidates:
+        skill = normalize_remote_skill(item)
+        if skill:
+            skills.append(skill)
+    return skills
+
+
+class RemoteSkillSearchWorker(QThread):
+    finished_signal = Signal(list, str)
+
+    def __init__(self, query: str = "", category: str = "", fallback_category: str = "", parent=None):
+        super().__init__(parent)
+        self.query = str(query or "").strip()
+        self.category = str(category or "").strip()
+        self.fallback_category = str(fallback_category or "").strip()
+
+    @staticmethod
+    def split_search_terms(value: str) -> List[str]:
+        return [item.strip() for item in str(value or "").split("|") if item.strip()]
+
+    def fetch_skills(self, query: str = "", category: str = "") -> List[Dict[str, str]]:
+        params = {
+            "page": "1",
+            "pageSize": "30",
+            "sortBy": "score",
+            "order": "desc",
+        }
+        if query:
+            params["keyword"] = query
+        if category:
+            params["category"] = category
+        base = os.environ.get("AGENT_QT_SKILLHUB_BASE_URL", "https://api.skillhub.cn").rstrip("/")
+        url = f"{base}/api/skills?" + urllib.parse.urlencode(params)
+        request = urllib.request.Request(url, headers={"User-Agent": "AgentQt/1.0"}, method="GET")
+        with urllib.request.urlopen(request, timeout=18) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        return extract_remote_skill_items(payload)
+
+    def run(self):
+        try:
+            skills: List[Dict[str, str]] = []
+            seen = set()
+
+            def append_items(items: List[Dict[str, str]]):
+                for skill in items:
+                    if len(skills) >= 30:
+                        break
+                    key = str(skill.get("slug") or skill.get("name") or "")
+                    if key and key not in seen:
+                        skills.append(skill)
+                        seen.add(key)
+
+            queries = self.split_search_terms(self.query) or [""]
+            categories = self.split_search_terms(self.category)
+            if categories and not any(queries):
+                for category in categories:
+                    append_items(self.fetch_skills("", category))
+                    if len(skills) >= 30:
+                        break
+            else:
+                for query in queries:
+                    append_items(self.fetch_skills(query, ""))
+                    if len(skills) >= 30:
+                        break
+
+            if len(skills) < 12:
+                for category in categories:
+                    append_items(self.fetch_skills("", category))
+                    if len(skills) >= 30:
+                        break
+
+            if len(skills) < 12 and self.fallback_category:
+                seen = {str(skill.get("slug") or skill.get("name") or "") for skill in skills}
+                for category in self.split_search_terms(self.fallback_category):
+                    for skill in self.fetch_skills("", category):
+                        key = str(skill.get("slug") or skill.get("name") or "")
+                        if key and key not in seen:
+                            skills.append(skill)
+                            seen.add(key)
+                        if len(skills) >= 30:
+                            break
+                    if len(skills) >= 30:
+                        break
+            self.finished_signal.emit(skills, "" if skills else "没有返回可展示的技能。")
+        except urllib.error.HTTPError as exc:
+            self.finished_signal.emit([], f"腾讯 SkillHub 请求失败：HTTP {exc.code}")
+        except Exception as exc:
+            self.finished_signal.emit([], "腾讯 SkillHub 请求失败：" + str(exc))
+
+
+class RemoteSkillContentWorker(QThread):
+    finished_signal = Signal(str, str, dict)
+
+    def __init__(self, slug: str, parent=None):
+        super().__init__(parent)
+        self.slug = str(slug or "").strip()
+
+    def run(self):
+        if not self.slug:
+            self.finished_signal.emit("", "缺少远程技能 slug。", {})
+            return
+        try:
+            base = os.environ.get("AGENT_QT_SKILLHUB_BASE_URL", "https://api.skillhub.cn").rstrip("/")
+            headers = {"User-Agent": "AgentQt/1.0"}
+            files_url = f"{base}/api/v1/skills/{urllib.parse.quote(self.slug)}/files"
+            files_request = urllib.request.Request(files_url, headers=headers, method="GET")
+            with urllib.request.urlopen(files_request, timeout=18) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            file_items = payload.get("files") if isinstance(payload, dict) else []
+            if not isinstance(file_items, list):
+                file_items = []
+            package: Dict[str, bytes] = {}
+            for item in file_items:
+                if not isinstance(item, dict):
+                    continue
+                rel_path = safe_skill_relative_path(str(item.get("path") or ""))
+                if not rel_path or int(item.get("size") or 0) > 2_000_000:
+                    continue
+                file_url = (
+                    f"{base}/api/v1/skills/{urllib.parse.quote(self.slug)}/file?"
+                    + urllib.parse.urlencode({"path": rel_path})
+                )
+                request = urllib.request.Request(file_url, headers=headers, method="GET")
+                with urllib.request.urlopen(request, timeout=18) as response:
+                    package[rel_path] = response.read()
+            content = (package.get("SKILL.md") or package.get("skill.md") or b"").decode("utf-8", errors="replace")
+            self.finished_signal.emit(content, "" if content.strip() else "远程技能内容为空。", package)
+        except urllib.error.HTTPError as exc:
+            self.finished_signal.emit("", f"获取远程技能包失败：HTTP {exc.code}", {})
+        except Exception as exc:
+            self.finished_signal.emit("", "获取远程技能包失败：" + str(exc), {})
 
 def bytes_to_store(value: Optional[bytes]) -> Optional[str]:
     if value is None:
@@ -6808,6 +7173,7 @@ class ThreadCard(QFrame):
 
 class SkillCard(QFrame):
     selected = Signal(str)
+    delete_requested = Signal(str)
 
     def __init__(self, skill: Dict[str, str], parent=None):
         super().__init__(parent)
@@ -6819,12 +7185,38 @@ class SkillCard(QFrame):
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(12, 10, 8, 10)
         layout.setSpacing(4)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
         title = QLabel(str(self.skill.get("name") or self.skill_id or "skill"))
         title.setStyleSheet(f"background: transparent; border: none; color: {COLORS['text']}; font-size: 12px; font-weight: 900;")
         title.setWordWrap(True)
-        layout.addWidget(title)
+        header.addWidget(title, 1)
+        self.delete_btn = QToolButton(self, cursor=Qt.PointingHandCursor)
+        self.delete_btn.setText("×")
+        self.delete_btn.setToolTip("")
+        self.delete_btn.setFixedSize(24, 24)
+        self.delete_btn.setVisible(False)
+        self.delete_btn.clicked.connect(lambda: self.delete_requested.emit(self.skill_id))
+        self.delete_btn.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {COLORS['muted']};
+                border: none;
+                border-radius: 8px;
+                font-size: 17px;
+                font-weight: 900;
+                padding-bottom: 1px;
+            }}
+            QToolButton:hover {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text']};
+            }}
+        """)
+        header.addWidget(self.delete_btn)
+        layout.addLayout(header)
         description = str(self.skill.get("description") or "").strip()
         if description:
             desc = QLabel(description)
@@ -6843,7 +7235,18 @@ class SkillCard(QFrame):
             }}
         """)
 
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.delete_btn.setVisible(True)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.delete_btn.setVisible(False)
+
     def mousePressEvent(self, event: QMouseEvent):
+        if self.delete_btn.geometry().contains(event.position().toPoint()):
+            super().mousePressEvent(event)
+            return
         self.selected.emit(self.skill_id)
         super().mousePressEvent(event)
 
@@ -6857,7 +7260,7 @@ class Sidebar(QFrame):
     rename_thread_requested = Signal(str, str)
     new_skill_requested = Signal()
     skill_selected = Signal(str)
-    refresh_skills_requested = Signal()
+    delete_skill_requested = Signal(str)
     delete_path_requested = Signal(str)
     
     def __init__(self, parent=None):
@@ -7028,7 +7431,7 @@ class Sidebar(QFrame):
         self.files_tab_btn.setStyleSheet(self.nav_button_style(tab == "files"))
         self.threads_tab_btn.setStyleSheet(self.nav_button_style(tab == "threads"))
         self.skills_tab_btn.setStyleSheet(self.nav_button_style(tab == "skills"))
-        self.bottom_btn.setText("新建会话" if tab == "threads" else ("刷新技能列表" if tab == "skills" else "刷新文件树"))
+        self.bottom_btn.setText("新建会话" if tab == "threads" else ("添加技能" if tab == "skills" else "刷新文件树"))
         try:
             self.bottom_btn.clicked.disconnect()
         except (TypeError, RuntimeError):
@@ -7036,7 +7439,7 @@ class Sidebar(QFrame):
         if tab == "threads":
             self.bottom_btn.clicked.connect(self.new_thread_requested.emit)
         elif tab == "skills":
-            self.bottom_btn.clicked.connect(self.refresh_skills_requested.emit)
+            self.bottom_btn.clicked.connect(self.new_skill_requested.emit)
         else:
             self.bottom_btn.clicked.connect(lambda: self.refresh_tree(self._root_path))
 
@@ -7177,6 +7580,7 @@ class Sidebar(QFrame):
         for skill in skills:
             card = SkillCard(skill, parent=self.skill_list)
             card.selected.connect(self.skill_selected.emit)
+            card.delete_requested.connect(self.delete_skill_requested.emit)
             self.skill_cards[card.skill_id] = card
             self.skill_list_layout.insertWidget(self.skill_list_layout.count() - 1, card)
     
@@ -7581,7 +7985,7 @@ class ChatPage(QWidget):
         self.sidebar.rename_thread_requested.connect(self.rename_thread)
         self.sidebar.new_skill_requested.connect(self.show_new_skill_dialog)
         self.sidebar.skill_selected.connect(self.open_skill_file)
-        self.sidebar.refresh_skills_requested.connect(self.refresh_skills)
+        self.sidebar.delete_skill_requested.connect(self.delete_skill)
         self.sidebar.delete_path_requested.connect(self.delete_project_path)
         self.sidebar_btn = QToolButton()
         self.sidebar_btn.setText("›")
@@ -7814,7 +8218,7 @@ class ChatPage(QWidget):
         self.automation_skill_btn.setPopupMode(QToolButton.InstantPopup)
         self.automation_skill_btn.setFixedHeight(22)
         self.update_automation_skill_button()
-        mode_row.addSpacing(4)
+        mode_row.addSpacing(2)
         mode_row.addWidget(self.automation_skill_btn, 0, Qt.AlignmentFlag.AlignLeft)
         mode_row.addStretch(1)
         composer_input_layout.addLayout(mode_row)
@@ -8140,7 +8544,7 @@ class ChatPage(QWidget):
         return "专家模式 · 约45k"
 
     def create_automation_context_mode_menu(self) -> QMenu:
-        menu = style_compact_popup_menu(QMenu(self))
+        menu = style_skill_popup_menu(QMenu(self))
         for label, mode in AUTOMATION_CONTEXT_MODES:
             suffix = f" · {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)}" if mode == "simple" else " · 约45k"
             action = QAction(label + suffix, self)
@@ -8154,6 +8558,17 @@ class ChatPage(QWidget):
         def sync_width():
             width = button.width() or button.sizeHint().width()
             menu.setFixedWidth(max(1, width))
+
+        menu.aboutToShow.connect(sync_width)
+        sync_width()
+        button.setMenu(menu)
+
+    def attach_skill_menu(self, button: QToolButton, menu: QMenu):
+        def sync_width():
+            label_widths = [button.fontMetrics().horizontalAdvance(action.text()) for action in menu.actions()]
+            content_width = max(label_widths or [0]) + 44
+            target = max(button.sizeHint().width(), min(260, max(170, content_width)))
+            menu.setFixedWidth(target)
 
         menu.aboutToShow.connect(sync_width)
         sync_width()
@@ -8207,7 +8622,7 @@ class ChatPage(QWidget):
         return "\n\n".join(chunks).strip()
 
     def create_automation_skill_menu(self) -> QMenu:
-        menu = style_compact_popup_menu(QMenu(self))
+        menu = style_skill_popup_menu(QMenu(self))
         if not self.skills:
             action = QAction("暂无技能", self)
             action.setEnabled(False)
@@ -8215,10 +8630,41 @@ class ChatPage(QWidget):
         for skill in self.skills:
             skill_id = str(skill.get("id") or "")
             label = str(skill.get("name") or skill_id)
-            action = QAction(label, self)
-            action.setCheckable(True)
-            action.setChecked(skill_id in self.selected_skill_ids)
-            action.triggered.connect(lambda checked=False, value=skill_id: self.toggle_automation_skill(value, checked))
+            row = QWidget(menu)
+            row.setStyleSheet("QWidget { background: transparent; border: none; }")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(8, 3, 8, 3)
+            row_layout.setSpacing(6)
+            checkbox = QCheckBox(label, row)
+            checkbox.setChecked(skill_id in self.selected_skill_ids)
+            checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+            checkbox.setStyleSheet(f"""
+                QCheckBox {{
+                    background: transparent;
+                    color: {COLORS['text']};
+                    border: none;
+                    font-size: 11px;
+                    font-weight: 800;
+                    spacing: 7px;
+                }}
+                QCheckBox::indicator {{
+                    width: 12px;
+                    height: 12px;
+                    border: 1px solid rgba(23, 32, 51, 70);
+                    border-radius: 4px;
+                    background: rgba(255, 255, 255, 110);
+                }}
+                QCheckBox::indicator:checked {{
+                    background: {COLORS['accent']};
+                    border-color: {COLORS['accent']};
+                    image: none;
+                }}
+            """)
+            row_layout.addWidget(checkbox, 1)
+            action = QWidgetAction(menu)
+            action.setText(label)
+            action.setDefaultWidget(row)
+            checkbox.toggled.connect(lambda checked=False, value=skill_id: self.set_automation_skill_selected(value, checked, rebuild_menu=False))
             menu.addAction(action)
         if self.skills:
             menu.addSeparator()
@@ -8232,9 +8678,8 @@ class ChatPage(QWidget):
         button = self.automation_skill_btn
         if button is None:
             return
-        count = len(self.selected_skills())
-        button.setText((f"技能 {count}" if count else "技能") + " ▾")
-        self.attach_button_sized_menu(button, self.create_automation_skill_menu())
+        self.update_automation_skill_button_text()
+        self.attach_skill_menu(button, self.create_automation_skill_menu())
         button.setStyleSheet(f"""
             QToolButton {{
                 background: transparent;
@@ -8255,13 +8700,26 @@ class ChatPage(QWidget):
             }}
         """)
 
-    def toggle_automation_skill(self, skill_id: str, checked: bool):
+    def update_automation_skill_button_text(self):
+        button = self.automation_skill_btn
+        if button is None:
+            return
+        count = len(self.selected_skills())
+        button.setText((f"技能 {count}" if count else "技能") + " ▾")
+
+    def set_automation_skill_selected(self, skill_id: str, checked: bool, rebuild_menu: bool = True):
         if checked:
             self.selected_skill_ids.add(skill_id)
         else:
             self.selected_skill_ids.discard(skill_id)
-        self.update_automation_skill_button()
+        if rebuild_menu:
+            self.update_automation_skill_button()
+        else:
+            self.update_automation_skill_button_text()
         self.update_automation_composer_state()
+
+    def toggle_automation_skill(self, skill_id: str, checked: bool):
+        self.set_automation_skill_selected(skill_id, checked, rebuild_menu=True)
 
     def clear_automation_skills(self):
         self.selected_skill_ids.clear()
@@ -8283,6 +8741,28 @@ class ChatPage(QWidget):
         path = str((skill or {}).get("path") or "")
         if path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def delete_skill(self, skill_id: str):
+        if not self.project_root:
+            return
+        skill_id = safe_skill_id(skill_id)
+        skill = next((item for item in self.skills if item.get("id") == skill_id), None)
+        name = str((skill or {}).get("name") or skill_id or "这个技能")
+        ok = styled_confirm(
+            self,
+            "删除技能",
+            f"确定删除「{name}」吗？它会从当前工作区技能列表移除，技能文件夹也会被删除。",
+            confirm_text="删除",
+            destructive=True,
+        )
+        if not ok:
+            return
+        if not delete_workspace_skill(self.project_root, skill_id):
+            styled_warning(self, "删除失败", "无法删除这个技能文件夹。")
+            return
+        self.selected_skill_ids.discard(skill_id)
+        self.refresh_skills()
+        self.sidebar.set_tab("skills")
 
     def build_skill_generation_prompt(self, raw_text: str) -> str:
         return f"""请把用户粘贴的内容整理成一个 Codex Skill 的标准 SKILL.md。
@@ -8308,17 +8788,178 @@ class ChatPage(QWidget):
     def show_new_skill_dialog(self):
         if not self.project_root:
             return
+        existing = getattr(self, "skill_dialog", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
         dialog = QDialog(self)
-        dialog.setWindowTitle("新建技能")
-        dialog.setMinimumSize(760, 620)
+        self.skill_dialog = dialog
+        dialog.setWindowTitle("添加技能")
+        dialog.setModal(False)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.setMinimumSize(820, 660)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        hint = QLabel("粘贴任意内容，用简单模式 DeepSeek 整理成标准 SKILL.md；预览确认后保存到当前工作区技能列表。")
+        hint = QLabel("在线列表来自腾讯 SkillHub 免费公开接口；也可切到自主添加，用简单模式 DeepSeek 生成标准 SKILL.md。")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px;")
         layout.addWidget(hint)
+
+        switch_row = QHBoxLayout()
+        switch_row.setSpacing(8)
+        online_btn = QPushButton("在线列表", cursor=Qt.PointingHandCursor)
+        custom_btn = QPushButton("自主添加", cursor=Qt.PointingHandCursor)
+        switch_row.addWidget(online_btn)
+        switch_row.addWidget(custom_btn)
+        switch_row.addStretch()
+        layout.addLayout(switch_row)
+
+        stack = QStackedWidget()
+        stack.setStyleSheet("QStackedWidget { background: transparent; border: none; }")
+        layout.addWidget(stack, 1)
+
+        def segment_style(active: bool) -> str:
+            return f"""
+                QPushButton {{
+                    background: {'#e8edf7' if active else COLORS['surface']};
+                    color: {COLORS['text']};
+                    border: none;
+                    border-radius: 11px;
+                    padding: 7px 14px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS['surface_alt']};
+                }}
+            """
+
+        def set_page(index: int):
+            stack.setCurrentIndex(index)
+            online_btn.setStyleSheet(segment_style(index == 0))
+            custom_btn.setStyleSheet(segment_style(index == 1))
+
+        online_page = QWidget()
+        online_layout = QVBoxLayout(online_page)
+        online_layout.setContentsMargins(0, 0, 0, 0)
+        online_layout.setSpacing(10)
+
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+        search_edit = QLineEdit()
+        search_edit.setPlaceholderText("搜索技能，例如 frontend、后端、产品、PDF、Excel...")
+        search_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: {COLORS['surface']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+                padding: 8px 10px;
+                font-size: 12px;
+            }}
+        """)
+        search_btn = QPushButton("搜索", cursor=Qt.PointingHandCursor)
+        reload_btn = QPushButton("热门列表", cursor=Qt.PointingHandCursor)
+        for btn in (search_btn, reload_btn):
+            btn.setFixedHeight(34)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text']};
+                    border: none;
+                    border-radius: 10px;
+                    padding: 6px 12px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{ background: {COLORS['surface_alt']}; }}
+            """)
+        search_row.addWidget(search_edit, 1)
+        search_row.addWidget(search_btn)
+        search_row.addWidget(reload_btn)
+        online_layout.addLayout(search_row)
+
+        category_row = QHBoxLayout()
+        category_row.setSpacing(6)
+        quick_queries = [
+            ("前端", "frontend|ui|react|tailwind", "developer-tools", ""),
+            ("后端", "backend|api|database|server", "developer-tools", ""),
+            ("产品", "product|prd|requirements|user research", "", "productivity|content-creation"),
+            ("办公", "office document|word docx|excel xlsx|ppt", "", "productivity|data-analysis"),
+            ("数据", "data analysis|excel|chart|database", "data-analysis", ""),
+            ("研究", "research|academic|paper|search", "", "productivity|data-analysis"),
+        ]
+        for label, query, category, fallback_category in quick_queries:
+            chip = QPushButton(label, cursor=Qt.PointingHandCursor)
+            chip.setFixedHeight(28)
+            chip.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text_secondary']};
+                    border: none;
+                    border-radius: 9px;
+                    padding: 4px 10px;
+                    font-size: 12px;
+                    font-weight: 800;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS['accent_light']};
+                    color: {COLORS['accent_dark']};
+                }}
+            """)
+            chip.clicked.connect(
+                lambda _checked=False, q=query, c=category, f=fallback_category: (
+                    search_edit.setText(q or c),
+                    start_remote_search(q, c, f),
+                )
+            )
+            category_row.addWidget(chip)
+        category_row.addStretch()
+        online_layout.addLayout(category_row)
+
+        online_status = QLabel("点击“热门列表”加载腾讯 SkillHub 推荐，或输入关键词搜索；选择后会拉取远程 SKILL.md 供你预览确认。")
+        online_status.setWordWrap(True)
+        online_status.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px;")
+        online_layout.addWidget(online_status)
+
+        result_scroll = QScrollArea()
+        result_scroll.setWidgetResizable(True)
+        result_scroll.setFrameShape(QFrame.NoFrame)
+        result_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        result_container = QWidget()
+        result_layout = QVBoxLayout(result_container)
+        result_layout.setContentsMargins(0, 0, 0, 0)
+        result_layout.setSpacing(8)
+        result_layout.addStretch()
+        result_scroll.setWidget(result_container)
+        online_layout.addWidget(result_scroll, 1)
+
+        import_preview = QTextEdit()
+        import_preview.setAcceptRichText(False)
+        import_preview.setPlaceholderText("选择在线技能后，这里会显示将保存的 SKILL.md，可编辑后添加。")
+        import_preview.setFixedHeight(150)
+        import_preview.setStyleSheet(f"""
+            QTextEdit {{
+                background: {COLORS['surface']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+                padding: 10px;
+                font-size: 12px;
+            }}
+        """)
+        online_layout.addWidget(import_preview)
+
+        stack.addWidget(online_page)
+
+        custom_page = QWidget()
+        custom_layout = QVBoxLayout(custom_page)
+        custom_layout.setContentsMargins(0, 0, 0, 0)
+        custom_layout.setSpacing(10)
 
         source_edit = QTextEdit()
         source_edit.setAcceptRichText(False)
@@ -8334,13 +8975,14 @@ class ChatPage(QWidget):
                 font-size: 12px;
             }}
         """)
-        layout.addWidget(source_edit)
+        custom_layout.addWidget(source_edit)
 
         preview = QTextEdit()
         preview.setAcceptRichText(False)
         preview.setPlaceholderText("生成后的 SKILL.md 会显示在这里，可手动微调后保存。")
         preview.setStyleSheet(source_edit.styleSheet())
-        layout.addWidget(preview, 1)
+        custom_layout.addWidget(preview, 1)
+        stack.addWidget(custom_page)
 
         status = QLabel("")
         status.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px;")
@@ -8348,11 +8990,13 @@ class ChatPage(QWidget):
 
         row = QHBoxLayout()
         row.addStretch()
+        save_import_btn = QPushButton("添加所选技能", cursor=Qt.PointingHandCursor)
         generate_btn = QPushButton("生成预览", cursor=Qt.PointingHandCursor)
         save_btn = QPushButton("保存技能", cursor=Qt.PointingHandCursor)
         cancel_btn = QPushButton("取消", cursor=Qt.PointingHandCursor)
+        save_import_btn.setEnabled(False)
         save_btn.setEnabled(False)
-        for btn in (generate_btn, save_btn, cancel_btn):
+        for btn in (save_import_btn, generate_btn, save_btn, cancel_btn):
             btn.setFixedHeight(32)
             btn.setStyleSheet(f"""
                 QPushButton {{
@@ -8375,6 +9019,161 @@ class ChatPage(QWidget):
             """)
             row.addWidget(btn)
         layout.addLayout(row)
+        selected_remote_package: Dict[str, bytes] = {}
+        selected_remote_skill: Dict[str, str] = {}
+
+        def remote_skill_markdown(skill: Dict[str, str]) -> str:
+            content = str(skill.get("content") or "").strip()
+            if content:
+                return normalize_skill_markdown(content, str(skill.get("name") or "remote-skill"))
+            name = safe_skill_id(skill.get("name") or skill.get("title") or "remote-skill")
+            description = str(skill.get("description") or "Use this skill when the request matches this remote skill.").strip()
+            title = str(skill.get("title") or name).strip()
+            lines = [
+                f"---\nname: {name}\ndescription: {description}\n---",
+                "",
+                f"# {title}",
+                "",
+                description,
+            ]
+            meta_lines = []
+            if skill.get("author"):
+                meta_lines.append(f"- Author: {skill.get('author')}")
+            if skill.get("category"):
+                meta_lines.append(f"- Category: {skill.get('category')}")
+            if skill.get("source_url"):
+                meta_lines.append(f"- Source: {skill.get('source_url')}")
+            if skill.get("install"):
+                meta_lines.append(f"- Original install command: `{skill.get('install')}`")
+            if meta_lines:
+                lines.extend(["", "## Source Metadata", "", *meta_lines])
+            lines.extend(["", "## Instructions", "", "Follow the capability and constraints described above. If source metadata is present, treat it as provenance, not as executable shell instructions."])
+            return normalize_skill_markdown("\n".join(lines), name)
+
+        def clear_remote_results():
+            while result_layout.count() > 1:
+                item = result_layout.takeAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.deleteLater()
+
+        def finish_remote_content(skill: Dict[str, str], text: str, error: str, package: Dict[str, bytes]):
+            nonlocal selected_remote_package
+            selected_remote_package = dict(package or {})
+            if error:
+                import_preview.setPlainText(remote_skill_markdown(skill))
+                save_import_btn.setEnabled(True)
+                status.setText(error + " 已用列表摘要生成兜底预览。")
+                return
+            import_preview.setPlainText(normalize_skill_markdown(text, str(skill.get("name") or "remote-skill")))
+            save_import_btn.setEnabled(True)
+            status.setText(f"已拉取远程技能包（{len(selected_remote_package) or 1} 个文件），预览显示 SKILL.md，可编辑后添加。")
+
+        def choose_remote_skill(skill: Dict[str, str]):
+            nonlocal selected_remote_package, selected_remote_skill
+            save_import_btn.setEnabled(False)
+            selected_remote_package = {}
+            selected_remote_skill = dict(skill)
+            import_preview.setPlainText("正在拉取远程 SKILL.md...")
+            status.setText("正在从腾讯 SkillHub 获取完整技能包。")
+            worker = getattr(self, "skill_content_worker", None)
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+                worker.terminate()
+                worker.wait(500)
+            slug = str(skill.get("slug") or skill.get("name") or "").strip()
+            worker = RemoteSkillContentWorker(slug, self)
+            self.skill_content_worker = worker
+            worker.finished_signal.connect(lambda text, error, package, s=skill: finish_remote_content(s, text, error, package))
+            worker.finished.connect(lambda: setattr(self, "skill_content_worker", None))
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
+
+        def add_remote_result_card(skill: Dict[str, str]):
+            card = QFrame()
+            card.setStyleSheet(f"""
+                QFrame {{
+                    background: {COLORS['surface']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 12px;
+                }}
+            """)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 10, 12, 10)
+            card_layout.setSpacing(6)
+            title_row = QHBoxLayout()
+            title = QLabel(str(skill.get("title") or skill.get("name") or "skill"))
+            title.setWordWrap(True)
+            title.setStyleSheet(f"color: {COLORS['text']}; background: transparent; border: none; font-size: 12px; font-weight: 900;")
+            title_row.addWidget(title, 1)
+            add_btn = QPushButton("预览", cursor=Qt.PointingHandCursor)
+            add_btn.setFixedHeight(28)
+            add_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['accent_light']};
+                    color: {COLORS['accent_dark']};
+                    border: none;
+                    border-radius: 9px;
+                    padding: 4px 10px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+            """)
+            add_btn.clicked.connect(lambda _checked=False, s=skill: choose_remote_skill(s))
+            title_row.addWidget(add_btn)
+            card_layout.addLayout(title_row)
+            desc = QLabel(str(skill.get("description") or "暂无描述"))
+            desc.setWordWrap(True)
+            desc.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none; font-size: 11px;")
+            card_layout.addWidget(desc)
+            metric_parts = []
+            if skill.get("downloads"):
+                metric_parts.append(f"{skill.get('downloads')} downloads")
+            if skill.get("stars"):
+                metric_parts.append(f"{skill.get('stars')} stars")
+            meta = " · ".join([x for x in [skill.get("category"), skill.get("author"), *metric_parts] if x])
+            if meta:
+                meta_label = QLabel(meta)
+                meta_label.setWordWrap(True)
+                meta_label.setStyleSheet(f"color: {COLORS['muted']}; background: transparent; border: none; font-size: 10px;")
+                card_layout.addWidget(meta_label)
+            result_layout.insertWidget(result_layout.count() - 1, card)
+
+        def finish_remote_search(skills: List[Dict[str, str]], error: str):
+            search_btn.setEnabled(True)
+            reload_btn.setEnabled(True)
+            clear_remote_results()
+            if error:
+                online_status.setText(error)
+                return
+            online_status.setText(f"已加载 {len(skills)} 个在线技能。选择一个后可预览并添加到当前工作区。")
+            for skill in skills:
+                add_remote_result_card(skill)
+
+        def start_remote_search(query: str = "", category: str = "", fallback_category: str = ""):
+            nonlocal selected_remote_package, selected_remote_skill
+            worker = getattr(self, "skill_search_worker", None)
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+                worker.terminate()
+                worker.wait(500)
+            search_btn.setEnabled(False)
+            reload_btn.setEnabled(False)
+            save_import_btn.setEnabled(False)
+            selected_remote_package = {}
+            selected_remote_skill = {}
+            import_preview.clear()
+            online_status.setText("正在加载腾讯 SkillHub 技能列表...")
+            worker = RemoteSkillSearchWorker(query.strip(), category.strip(), fallback_category.strip(), self)
+            self.skill_search_worker = worker
+            worker.finished_signal.connect(finish_remote_search)
+            worker.finished.connect(lambda: setattr(self, "skill_search_worker", None))
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
+
+        search_btn.clicked.connect(lambda: start_remote_search(search_edit.text()))
+        reload_btn.clicked.connect(lambda: start_remote_search(""))
+        search_edit.returnPressed.connect(lambda: start_remote_search(search_edit.text()))
 
         def finish_generation(text: str, error: str):
             self.skill_generation_worker = None
@@ -8407,15 +9206,16 @@ class ChatPage(QWidget):
             worker.start()
 
         def cleanup_worker():
-            worker = self.skill_generation_worker
-            if worker is not None and worker.isRunning():
-                worker.requestInterruption()
-                worker.terminate()
-                worker.wait(800)
-                self.skill_generation_worker = None
+            for attr in ("skill_generation_worker", "skill_search_worker", "skill_content_worker"):
+                worker = getattr(self, attr, None)
+                if worker is not None and worker.isRunning():
+                    worker.requestInterruption()
+                    worker.terminate()
+                    worker.wait(800)
+                setattr(self, attr, None)
 
-        def save():
-            content = preview.toPlainText().strip()
+        def save_content_from_edit(edit: QTextEdit):
+            content = edit.toPlainText().strip()
             if not content:
                 status.setText("没有可保存的 SKILL.md。")
                 return
@@ -8428,13 +9228,65 @@ class ChatPage(QWidget):
             self.selected_skill_ids.add(str(skill.get("id") or ""))
             self.update_automation_skill_button()
             self.sidebar.set_tab("skills")
-            dialog.accept()
+            status.setText(f"已添加技能：{skill.get('name') or skill.get('id') or ''}。可以继续添加其他技能。")
+            save_btn.setEnabled(False)
 
+        def save():
+            save_content_from_edit(preview)
+
+        def save_import():
+            content = import_preview.toPlainText().strip()
+            if not content:
+                status.setText("没有可保存的 SKILL.md。")
+                return
+            try:
+                package = dict(selected_remote_package)
+                if package:
+                    package["SKILL.md"] = normalize_skill_markdown(content).encode("utf-8")
+                    skill = save_workspace_skill_package(
+                        self.project_root,
+                        package,
+                        content,
+                        {
+                            "display_name": selected_remote_skill.get("title") or selected_remote_skill.get("name") or "",
+                            "display_description": selected_remote_skill.get("description") or "",
+                            "source": selected_remote_skill.get("source") or "tencent-skillhub",
+                            "slug": selected_remote_skill.get("slug") or "",
+                        },
+                    )
+                else:
+                    skill = save_workspace_skill(self.project_root, content)
+            except OSError as exc:
+                status.setText("保存失败：" + str(exc))
+                return
+            self.refresh_skills()
+            self.selected_skill_ids.add(str(skill.get("id") or ""))
+            self.update_automation_skill_button()
+            self.sidebar.set_tab("skills")
+            status.setText(f"已添加技能：{skill.get('name') or skill.get('id') or ''}。可以继续添加其他技能。")
+            save_import_btn.setEnabled(False)
+
+        def update_footer_buttons():
+            online = stack.currentIndex() == 0
+            save_import_btn.setVisible(online)
+            generate_btn.setVisible(not online)
+            save_btn.setVisible(not online)
+
+        def switch_to(index: int):
+            set_page(index)
+            update_footer_buttons()
+
+        online_btn.clicked.connect(lambda: switch_to(0))
+        custom_btn.clicked.connect(lambda: switch_to(1))
         generate_btn.clicked.connect(generate)
         save_btn.clicked.connect(save)
+        save_import_btn.clicked.connect(save_import)
         cancel_btn.clicked.connect(lambda: (cleanup_worker(), dialog.reject()))
-        dialog.finished.connect(lambda _result: cleanup_worker())
-        dialog.exec()
+        dialog.finished.connect(lambda _result: (cleanup_worker(), setattr(self, "skill_dialog", None)))
+        switch_to(0)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def set_automation_context_mode(self, mode: str):
         self.automation_context_mode = "simple" if str(mode).strip().lower() == "simple" else "expert"
