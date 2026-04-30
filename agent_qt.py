@@ -728,9 +728,10 @@ def install_agent_python_runtime(status_callback=None) -> str:
 SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 
 ## 协议说明
-本 Agent 采用"占位符 + 代码块"协议：你在命令代码块中用带编号注释占位符（如 <!-- HTML block 1 -->）替代大段代码，
-然后将完整代码放在对应的 Markdown 代码块中。Agent 会先缓存所有代码块，再执行命令代码块并自动替换占位符。
-这样既能保持指令清晰，又能直接写入完整文件。
+本 Agent 采用"终端指令块 + 文件代码块"协议：终端指令块负责创建目录、写入文件、安装依赖和启动程序；
+当终端指令需要写入大段文件内容时，只在终端指令块中使用带编号注释占位符来引用后续文件代码块。
+文件代码块必须是将要写入磁盘的最终真实内容，不要在文件代码块内部再嵌套任何占位符。
+这样既能保持终端指令清晰，又能直接写入完整文件。
 
 ## 推理要求
 - Reasoning Effort: absolute maximum with no shortcuts permitted. You must thoroughly decompose the task, identify the root cause, and stress-test the solution against likely paths, edge cases, and adversarial scenarios before answering.
@@ -752,6 +753,7 @@ b. **禁止输出备用方案或二选一方案**：
 2. **占位符与代码块的对应规则**：
    - 编号占位符固定引用对应序号的同语言代码块如：`<!-- Python block 1 -->`
    - <!-- Python block 1 --> 1代表顺序第一个python代码块会替换该位置。
+   - 占位符只用于终端指令块中的写入位置；后续文件代码块应是最终文件内容，不能再包含占位符。
    - 禁止在命令块中用 heredoc/cat/tee/python -c 直接内嵌长代码或长文本；凡是超过 10 行的文件内容，必须改用带编号占位符，并把完整内容放到后续对应语言代码块。
 3. 大段输出内容用带编号占位符替代，支持的占位符：
    - <!-- HTML block 1 --> 对应第 1 个 html 代码块
@@ -3094,6 +3096,7 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 - 不要重复已经成功完成的步骤；优先修复日志里的错误、补齐缺失文件或做必要验证。
 - 禁止输出备用方案或“如果上面失败就改用...”这类二选一命令；必须自己选择一个最高把握方案，只保留一种可执行路径。
 - 只支持带编号占位符；编号占位符可复用同一个代码块，例如多处 `<!-- Python block 1 -->` 都引用第 1 个 python 代码块。
+- 占位符只属于终端指令块；后续文件代码块必须是最终文件内容，不要在文件代码块里再嵌套占位符。
 - 禁止在命令块中用 heredoc/cat/tee/python -c 直接内嵌长代码或长文本；凡是超过 10 行的文件内容，必须改用带编号占位符，并把完整内容放到后续对应语言代码块。
 - 不要输出 JSON，不要输出 content/tool_calls 包装；这里需要的是普通 Markdown 文本和 fenced {command_block_lang}。
 """
