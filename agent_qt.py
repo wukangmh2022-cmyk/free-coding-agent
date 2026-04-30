@@ -29,6 +29,7 @@ import locale
 import signal
 import logging
 import threading
+import copy
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -58,6 +59,7 @@ _AGENT_RUNTIME_ERROR = ""
 _APP_SETTINGS: Optional[Dict[str, object]] = None
 _AGENT_RUNTIME_ENABLED: Optional[bool] = None
 _AUTOMATION_ENABLED: Optional[bool] = None
+_DEVELOPER_MODE_ENABLED: Optional[bool] = None
 QT_WIDGET_MAX_HEIGHT = 16777215
 DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 FALLBACK_PIP_INDEXES = [
@@ -197,8 +199,33 @@ def scaled_font_px(base: int) -> int:
     return max(9, int(round(base * chat_font_scale_setting())))
 
 
+def developer_mode_enabled() -> bool:
+    global _DEVELOPER_MODE_ENABLED
+    if _DEVELOPER_MODE_ENABLED is not None:
+        return _DEVELOPER_MODE_ENABLED
+    env_value = os.environ.get("AGENT_QT_SHOW_AUTOMATION_TRACEBACK", "").strip().lower()
+    if env_value:
+        _DEVELOPER_MODE_ENABLED = env_value in {"1", "true", "yes", "on"}
+        return _DEVELOPER_MODE_ENABLED
+    settings = load_app_settings()
+    _DEVELOPER_MODE_ENABLED = bool(settings.get("developer_mode_enabled", False))
+    return _DEVELOPER_MODE_ENABLED
+
+
+def set_developer_mode_enabled(enabled: bool):
+    global _DEVELOPER_MODE_ENABLED
+    _DEVELOPER_MODE_ENABLED = bool(enabled)
+    settings = load_app_settings()
+    settings["developer_mode_enabled"] = _DEVELOPER_MODE_ENABLED
+    save_app_settings(settings)
+
+
 def developer_error_details_enabled() -> bool:
-    return os.environ.get("AGENT_QT_SHOW_AUTOMATION_TRACEBACK", "").strip().lower() in {"1", "true", "yes", "on"}
+    return developer_mode_enabled()
+
+
+def compact_code_blocks_by_default() -> bool:
+    return not developer_error_details_enabled()
 
 
 def env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -727,52 +754,24 @@ def install_agent_python_runtime(status_callback=None) -> str:
 # ============================================================
 SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 
-## 协议说明
-本 Agent 采用"终端指令块 + 文件代码块"协议：终端指令块负责创建目录、写入文件、安装依赖和启动程序；
-当终端指令需要写入大段文件内容时，只在终端指令块中使用带编号注释占位符来引用后续文件代码块。
-文件代码块必须是将要写入磁盘的最终真实内容，不要在文件代码块内部再嵌套任何占位符。
-这样既能保持终端指令清晰，又能直接写入完整文件。
+## 输出协议
+- 自然问答或展示代码时，正常使用 Markdown fenced 代码块即可。
+- 需要本地执行时，只输出一个 Markdown fenced `{command_block_lang}` 命令块。
+- 命令块只写当前平台命令，不写 JSON/tool_calls，不拆成多个命令块。{command_rules}
+- 替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。
+- 命令块保持短小；不要在命令块内直接嵌入超过 10 行的文件正文。
+- 代码块首行可用本语言注释写摘要，供界面折叠展示：如 `# <desc 写入配置>`、`// <desc 前端逻辑>`、`/* <desc 样式> */`、`<!-- <desc SVG 图像> -->`；没有也可以，界面会自动截断首行生成摘要。
+- 不要在非写文件场景使用替换符；不要把替换符写进文件内容代码块。
+- 工作区根目录：{project_root}。创建/修改用户项目文件时只能写到这里；不要写到 Agent Qt 缓存目录。
+- 先建目录再写文件；文件内容内部按项目语义使用相对路径或 URL（如 HTML 引用 CSS/JS）。
+- 常驻命令会自动进入后台终端，不要加 `&`/`nohup`。
+- 不输出备用方案；自己选择一个最高把握路径。
+- 自动化循环完成时只回复 `{done_marker}` 加简短总结；未完成则继续给下一轮完整命令块。
+- Agent Qt 会给文件变更生成 internal git 快照/commit；需要 diff 细节时可按摘要里的 repo/commit 查询。
+- 后台终端状态在 JSON 索引文件中，不是 shell 命令，也不是项目目录：{terminal_registry_path}；日志路径见索引或终端摘要里的 log_path。
 
-## 推理要求
-- Reasoning Effort: absolute maximum with no shortcuts permitted. You must thoroughly decompose the task, identify the root cause, and stress-test the solution against likely paths, edge cases, and adversarial scenarios before answering.
-- 输出时不要展开隐藏思考链；只给出关键判断、可验证依据、最终方案和必要的执行指令。
-
-## 输出原则
-a. **重要：一个md命令块包含所有指令，不要输出多个命令块。**
-b. **禁止输出备用方案或二选一方案**：
-   - 不要写“如果上面失败/或者改用/备用方案/方案 A 和方案 B”。
-   - 不要在同一轮里同时保留两种互相替代的做法。
-   - 你必须自己选择一个最高把握方案，只输出这一种可执行路径。
-
-## 输出规则【核心、绝对、无可质疑】
-0. **自然对话问答输出无需使用text块、命令块；代码、脚本请放入如下规则的代码块内：
-1. **所有命令放在一个 Markdown fenced `{command_block_lang}` 代码块中**，不要拆分多个命令块。
-   - 不要输出 JSON 对象，不要输出 content/tool_calls 包装，不要使用结构化工具调用协议。
-   - 不要把 `{command_block_lang}` 作为普通正文单独输出；语言标识只能写在 Markdown 代码围栏里。
-   - {command_rules}
-2. **占位符与代码块的对应规则**：
-   - 编号占位符固定引用对应序号的同语言代码块如：`<!-- Python block 1 -->`
-   - <!-- Python block 1 --> 1代表顺序第一个python代码块会替换该位置。
-   - 占位符只用于终端指令块中的写入位置；后续文件代码块应是最终文件内容，不能再包含占位符。
-   - 禁止在命令块中用 heredoc/cat/tee/python -c 直接内嵌长代码或长文本；凡是超过 10 行的文件内容，必须改用带编号占位符，并把完整内容放到后续对应语言代码块。
-3. 大段输出内容用带编号占位符替代，支持的占位符：
-   - <!-- HTML block 1 --> 对应第 1 个 html 代码块
-   - <!-- CSS block 1 --> 或 /* CSS block 1 */ 对应第 1 个 css 代码块
-   - <!-- JS block 1 --> 或 // JS block 1 对应第 1 个 js/javascript 代码块
-   - <!-- Python block 1 --> 或 # Python block 1 对应第 1 个 python 代码块
-   - <!-- SVG block 1 --> 对应第 1 个 svg 代码块
-   - <!-- JSON block 1 --> 对应第 1 个 json 代码块
-   - <!-- YAML block 1 --> 对应第 1 个 yaml 代码块
-   - <!-- TypeScript block 1 --> 对应第 1 个 typescript/ts 代码块
-   - <!-- 其他任意类型 block 1 --> 对应该类型名的第 1 个代码块（如 svg/xml/toml 等）
-4. 各代码块建议在命令块之后单独给出。
-5. 指令按顺序排列，先创建目录再写文件，确保可顺序执行。
-6. 项目根目录: {project_root}，所有路径使用绝对路径。
-7. 安装依赖用 pip install，启动后端用 python server.py 或 python3 -m http.server。
-8. 常驻进程命令（python server.py 等）会自动进入后台终端，不要加 & 或 nohup。
-9. 自动化循环中，如果根据执行日志判断任务已经完成，不要再输出命令块，回复 `{done_marker}` 加简短总结即可；如果未完成，继续输出下一轮完整命令块。
-10. Agent Qt 可能只提供执行日志和文件变更的压缩摘要。需要更多细节时，应自主使用当前命令环境中的 shell、git 和文件读取能力查询；如果摘要提供了内部 git 快照仓库与提交信息，可基于这些信息定向获取完整变更，不要要求用户手动粘贴。
-11. 常驻/后台终端会持续写入项目缓存里的终端注册表与日志文件。终端注册表路径：{terminal_registry_path}。需要了解后台服务状态、报错、PID 或日志时，应自主读取该注册表和对应日志；需要停止某个后台终端时，可按注册表里的 PID 使用当前平台命令关闭。
+## 回答风格
+- 不展开隐藏思考链；只给关键判断、验证依据、最终方案和必要指令。
 
 ## 当前运行环境
 - 操作系统: {os_name} ，平台标识: {platform_id}
@@ -1212,6 +1211,39 @@ def markdown_with_pipe_tables_to_html(markdown_text: str) -> str:
     flush_buffer()
     return "\n".join(part for part in parts if part)
 
+DESC_MARKER_RE = re.compile(
+    r"^\s*(?:#|//|--|;|<!--|/\*+)\s*<desc\s+(?P<desc>.+?)>\s*(?:-->|-?\*/)?\s*$",
+    re.I,
+)
+
+def text_within_chars(text: str, limit: int) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: max(1, limit - 1)].rstrip() + "…"
+
+def code_block_summary(lang: str, code: str, limit: int = 92) -> str:
+    text = str(code or "")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        desc_match = DESC_MARKER_RE.match(line)
+        if desc_match:
+            return text_within_chars(desc_match.group("desc").strip(), limit)
+        break
+    canonical = canonical_lang(lang or "text")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if canonical in {"bash", "sh", "shell", "zsh", "powershell", "ps1", "pwsh", "cmd", "bat", "batch"}:
+            if line.startswith(("#", "//", "REM ", "rem ")):
+                continue
+            return text_within_chars(line, limit)
+        return text_within_chars(line, limit)
+    return "空代码块"
+
 def estimate_markdown_table_extra_height(text: str, metrics, available_width: int) -> int:
     lines = (text or "").splitlines()
     extra_height = 0
@@ -1386,24 +1418,61 @@ def split_markdown_fenced_blocks(text: str) -> List[Dict[str, str]]:
     def opening_fence(line: str) -> Optional[re.Match]:
         return re.match(r"^\s{0,3}([`~]{3,})([^\r\n]*)\s*$", line.rstrip("\n\r"))
 
+    def numbered_placeholder_lang(line: str) -> str:
+        pattern = globals().get("NUMBERED_PLACEHOLDER_LINE_RE")
+        if pattern is None:
+            return ""
+        match = pattern.match(line.rstrip("\n\r"))
+        if not match:
+            return ""
+        lang = (
+            match.group("html")
+            or match.group("css")
+            or match.group("slash")
+            or match.group("hash")
+            or ""
+        )
+        return canonical_lang(lang)
+
+    def next_non_empty_line_index(start: int) -> int:
+        for next_index in range(start, len(lines)):
+            if lines[next_index].strip():
+                return next_index
+        return -1
+
+    def looks_like_unfenced_file_payload(line: str, lang: str) -> bool:
+        stripped = line.lstrip()
+        if not stripped:
+            return False
+        if lang in {"svg", "html", "xml"}:
+            return stripped.startswith(("<", "<!"))
+        if lang in {"json", "yaml", "toml"}:
+            return stripped.startswith(("{", "[", "---"))
+        return False
+
     def is_closing_fence(line: str) -> bool:
         if not fence_char or fence_len <= 0:
             return False
         pattern = rf"^\s{{0,3}}{re.escape(fence_char)}{{{fence_len},}}\s*$"
         return re.match(pattern, line.rstrip("\n\r")) is not None
 
-    for line in lines:
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if in_code:
             if is_closing_fence(line):
                 flush_code()
                 in_code = False
+                index += 1
                 continue
             if COMPLETION_LINE_RE.match(line):
                 flush_code()
                 in_code = False
                 buffer.append(line)
+                index += 1
                 continue
             code_buffer.append(line)
+            index += 1
             continue
 
         match = opening_fence(line)
@@ -1414,14 +1483,53 @@ def split_markdown_fenced_blocks(text: str) -> List[Dict[str, str]]:
             fence_char = fence[0]
             fence_len = len(fence)
             code_lang = (match.group(2) or "").strip().split(maxsplit=1)[0] if (match.group(2) or "").strip() else ""
+            index += 1
             continue
+        placeholder_lang = numbered_placeholder_lang(line)
+        if placeholder_lang:
+            next_index = next_non_empty_line_index(index + 1)
+            if (
+                next_index >= 0
+                and opening_fence(lines[next_index]) is None
+                and looks_like_unfenced_file_payload(lines[next_index], placeholder_lang)
+            ):
+                buffer.append(line)
+                flush_markdown()
+                code_lang = placeholder_lang
+                code_buffer = lines[index + 1:]
+                flush_code()
+                break
         buffer.append(line)
+        index += 1
 
     if in_code:
         flush_code()
-    else:
+    elif index >= len(lines):
         flush_markdown()
     return [part for part in parts if part.get("text", "").strip()]
+
+def markdown_fenced_code_block_count(text: str) -> int:
+    return sum(1 for part in split_markdown_fenced_blocks(text) if part.get("type") == "code")
+
+def summarize_fenced_code_blocks_for_context(text: str) -> str:
+    parts = split_markdown_fenced_blocks(str(text or ""))
+    if not any(part.get("type") == "code" for part in parts):
+        return str(text or "")
+    output: List[str] = []
+    for part in parts:
+        if part.get("type") != "code":
+            value = str(part.get("text") or "").strip()
+            if value:
+                output.append(value)
+            continue
+        code = str(part.get("text") or "")
+        lang = canonical_lang(str(part.get("lang") or "text"))
+        line_count = len([line for line in code.splitlines() if line.strip()])
+        digest = hashlib.sha1(code.encode("utf-8", errors="ignore")).hexdigest()[:10]
+        summary = code_block_summary(lang, code, limit=140)
+        summary_part = f"，摘要：{summary}" if summary and summary != "空代码块" else ""
+        output.append(f"【已省略久远代码块：{lang or 'text'}，约 {line_count} 行{summary_part}，sha1={digest}；如需细节请根据文件变更摘要、日志路径或工作区文件恢复。】")
+    return "\n\n".join(output).strip()
 
 def styled_confirm(parent, title: str, text: str, confirm_text: str = "确定", destructive: bool = False) -> bool:
     dialog = QMessageBox(parent)
@@ -1614,9 +1722,21 @@ LANG_ALIASES = {
     "sh": ("sh", "bash", "shell", "zsh"),
     "shell": ("shell", "bash", "sh", "zsh"),
     "zsh": ("zsh", "bash", "sh", "shell"),
+    "b64": ("b64", "base64"),
+    "base64": ("base64", "b64"),
 }
 
 HEREDOC_RE = re.compile(r"<<-?\s*(?P<quote>['\"]?)(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\1")
+NUMBERED_HTML_PLACEHOLDER_RE = re.compile(r'<!--\s*(?P<lang>\w+)\s+block\s+(?P<index>\d+)\s*-->', re.I)
+NUMBERED_PLACEHOLDER_LINE_RE = re.compile(
+    r'^\s*(?:'
+    r'<!--\s*(?P<html>\w+)\s+block\s+(?P<html_index>\d+)\s*-->'
+    r'|/\*\s*(?P<css>\w+)\s+block\s+(?P<css_index>\d+)\s*\*/'
+    r'|//\s*(?P<slash>\w+)\s+block\s+(?P<slash_index>\d+)'
+    r'|#\s*(?P<hash>\w+)\s+block\s+(?P<hash_index>\d+)'
+    r')\s*$',
+    re.I,
+)
 
 def canonical_lang(lang: str) -> str:
     """统一语言别名，保证 js/javascript 等代码块按同一队列顺序消费。"""
@@ -1634,6 +1754,9 @@ def scan_all_code_blocks(text: str) -> Dict[str, List[str]]:
     fence_char = ""
     fence_len = 0
     lang = ""
+    lang_index = 0
+    pending_placeholder_lang = ""
+    pending_placeholder_index = 0
     code_lines: List[str] = []
 
     def opening_fence(line: str) -> Optional[re.Match]:
@@ -1650,26 +1773,110 @@ def scan_all_code_blocks(text: str) -> Dict[str, List[str]]:
             if is_closing_fence(line):
                 code = "".join(code_lines)
                 key = canonical_lang(lang)
-                blocks.setdefault(key, []).append(code.strip())
+                if lang_index > 0:
+                    values = blocks.setdefault(key, [])
+                    while len(values) < lang_index:
+                        values.append("")
+                    values[lang_index - 1] = code.strip()
+                else:
+                    blocks.setdefault(key, []).append(code.strip())
                 in_code = False
                 fence_char = ""
                 fence_len = 0
                 lang = ""
+                lang_index = 0
                 code_lines = []
             else:
                 code_lines.append(line)
             continue
         match = opening_fence(line)
         if not match:
+            stripped = line.strip()
+            placeholder_match = NUMBERED_HTML_PLACEHOLDER_RE.fullmatch(stripped)
+            if placeholder_match:
+                pending_placeholder_lang = canonical_lang(placeholder_match.group("lang"))
+                pending_placeholder_index = max(1, int(placeholder_match.group("index") or "1"))
+            elif stripped:
+                pending_placeholder_lang = ""
+                pending_placeholder_index = 0
             continue
         fence = match.group(1)
         raw_info = (match.group(2) or "").strip()
         lang = raw_info.split(maxsplit=1)[0] if raw_info else ""
+        if not lang and pending_placeholder_lang:
+            lang = pending_placeholder_lang
+            lang_index = pending_placeholder_index
+        else:
+            lang_index = 0
         fence_char = fence[0]
         fence_len = len(fence)
         in_code = True
         code_lines = []
+        pending_placeholder_lang = ""
+        pending_placeholder_index = 0
     return blocks
+
+def reject_unfenced_file_placeholder_payload(text: str, blocks: Dict[str, List[str]]):
+    lines = str(text or "").splitlines()
+    in_code = False
+    fence_char = ""
+    fence_len = 0
+
+    def opening_fence(line: str) -> Optional[re.Match]:
+        return re.match(r"^\s*(`{3,}|~{3,})", line)
+
+    def is_closing_fence(line: str) -> bool:
+        if not in_code:
+            return False
+        stripped = line.strip()
+        return stripped.startswith(fence_char * fence_len)
+
+    for index, line in enumerate(lines):
+        if in_code:
+            if is_closing_fence(line):
+                in_code = False
+                fence_char = ""
+                fence_len = 0
+            continue
+        fence_match = opening_fence(line)
+        if fence_match:
+            fence = fence_match.group(1)
+            fence_char = fence[0]
+            fence_len = len(fence)
+            in_code = True
+            continue
+        placeholder_match = NUMBERED_PLACEHOLDER_LINE_RE.match(line)
+        if not placeholder_match:
+            continue
+        lang = (
+            placeholder_match.group("html")
+            or placeholder_match.group("css")
+            or placeholder_match.group("slash")
+            or placeholder_match.group("hash")
+            or ""
+        )
+        index_text = (
+            placeholder_match.group("html_index")
+            or placeholder_match.group("css_index")
+            or placeholder_match.group("slash_index")
+            or placeholder_match.group("hash_index")
+            or "1"
+        )
+        block_index = max(0, int(index_text) - 1)
+        if get_code_block(blocks, lang, block_index) is not None:
+            continue
+        next_non_empty = ""
+        for later_line in lines[index + 1:]:
+            if later_line.strip():
+                next_non_empty = later_line.lstrip()
+                break
+        if next_non_empty and not (next_non_empty.startswith("```") or next_non_empty.startswith("~~~")):
+            canonical = canonical_lang(lang)
+            raise ValueError(
+                f"占位符 {canonical} block {index_text} 对应的文件内容没有放入 Markdown fenced 代码块。"
+                f"请在同一回复中提供对应的 ```{canonical} ... ``` 代码块；不要直接输出裸文件正文。"
+                "为避免覆盖文件，本轮已停止执行。"
+            )
 
 def scan_inline_protocol_examples(text: str) -> Dict[str, List[str]]:
     blocks: Dict[str, List[str]] = {}
@@ -1791,6 +1998,25 @@ def strip_heredoc_bodies_for_detection(cmd: str) -> str:
         visible_lines.append(raw_line)
         pending_tags.extend(find_heredoc_tags(raw_line))
     return "\n".join(visible_lines)
+
+def command_writes_agent_project_cache(cmd: str, project_root: str) -> bool:
+    if not project_root:
+        return False
+    cache_root = os.path.normpath(project_cache_dir(project_root))
+    visible = strip_heredoc_bodies_for_detection(cmd or "")
+    normalized = visible.replace("\\", "/")
+    cache_forward = cache_root.replace("\\", "/")
+    if cache_forward not in normalized:
+        return False
+    quoted_cache = re.escape(cache_forward)
+    write_patterns = [
+        rf"(?:^|\s)(?:>|>>)\s*['\"]?{quoted_cache}",
+        rf"(?:^|\s)cat\s*>\s*['\"]?{quoted_cache}",
+        rf"(?:^|\s)tee(?:\s+-a)?\s+['\"]?{quoted_cache}",
+        rf"(?:^|\s)(?:touch|mkdir|cp|mv|rm)\b[^\n]*['\"]?{quoted_cache}",
+        rf"(?:^|\s)(?:Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|Remove-Item)\b[^\n]*['\"]?{quoted_cache}",
+    ]
+    return any(re.search(pattern, normalized, re.I | re.M) for pattern in write_patterns)
 
 def split_cd_chain(line: str) -> List[str]:
     """
@@ -1988,6 +2214,7 @@ def command_block_from_blocks(blocks: Dict[str, List[str]]) -> tuple[str, str]:
 
 def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
     """提取当前平台命令块并替换占位符。"""
+    reject_unfenced_file_placeholder_payload(text, blocks)
     command_text, command_lang = command_block_from_blocks(blocks)
     if not command_text:
         plain_block = get_code_block(blocks, "text") or ""
@@ -2795,11 +3022,11 @@ def format_terminal_launch_summary(launches: List[Dict[str, object]]) -> str:
             f"persistent={bool(item.get('persistent'))}  "
             f"launch_reason={item.get('launch_reason') or 'unknown'}  "
             f"command_kind={item.get('command_kind') or 'unknown'}  "
-            f"registry={item.get('registry_path') or 'unavailable'}  "
+            f"registry_json={item.get('registry_path') or 'unavailable'}  "
             f"log={item.get('log_path') or 'unavailable'}  "
             f"name={item.get('name') or ''}"
         )
-    lines.append("这些只是终端索引摘要；需要持续日志或关闭进程时，请按 log_path/PID 自主查询或处理。")
+    lines.append("这些只是终端索引摘要；registry_json 是 JSON 文件路径，不是命令。需要持续日志或关闭进程时，请按 log_path/PID 自主查询或处理。")
     return "\n".join(lines)
 
 
@@ -2979,8 +3206,8 @@ def text_within_token_budget(text: str, token_limit: int) -> str:
     marker = "\n\n... 历史内容已压缩截断，保留开头和最新部分 ...\n\n"
     marker_tokens = estimate_context_tokens(marker)
     available = max(1, token_limit - marker_tokens)
-    head_budget = max(1200, available // 3)
-    tail_budget = max(1200, available - head_budget)
+    head_budget = max(1, available // 3)
+    tail_budget = max(1, available - head_budget)
 
     def prefix_by_tokens(value: str, limit: int) -> str:
         lo, hi = 0, len(value)
@@ -3044,6 +3271,47 @@ def text_within_utf8_budget(text: str, byte_limit: int) -> str:
     return prefix_by_bytes(text, head_budget) + marker + suffix_by_bytes(text, tail_budget)
 
 
+def split_history_for_compaction(chunks: List[str], token_budget: int) -> tuple[str, str]:
+    recent_reversed: List[str] = []
+    recent_tokens = 0
+    old_count = len(chunks)
+    for index in range(len(chunks) - 1, -1, -1):
+        chunk = chunks[index]
+        chunk_tokens = estimate_context_tokens(chunk)
+        if recent_reversed and recent_tokens + chunk_tokens > AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS:
+            old_count = index + 1
+            break
+        recent_reversed.append(chunk)
+        recent_tokens += chunk_tokens
+        old_count = index
+    recent_chunks = list(reversed(recent_reversed))
+    old_chunks = chunks[:old_count]
+    return "\n\n".join(old_chunks).strip(), "\n\n".join(recent_chunks).strip()
+
+
+def compact_history_text_from_chunks(chunks: List[str], token_budget: int) -> tuple[str, bool]:
+    if not chunks:
+        return "（暂无历史对话）", False
+    full_text = "\n\n".join(chunks).strip()
+    if estimate_context_tokens(full_text) <= min(token_budget, AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS):
+        return text_within_token_budget(full_text, token_budget), False
+
+    old_text, recent_text = split_history_for_compaction(chunks, token_budget)
+    summary_budget = min(
+        AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS,
+        max(4000, token_budget - estimate_context_tokens(recent_text) - 2000),
+    )
+    compact_old = text_within_token_budget(summarize_fenced_code_blocks_for_context(old_text), summary_budget) if old_text else "（无较早历史）"
+    history_text = (
+        "【Compact 历史摘要】\n"
+        "以下是较早对话、执行结果和 diff 的 plaintext 压缩版本；请作为连续上下文参考，不要把它当作新需求重复执行。\n"
+        f"{compact_old}\n\n"
+        "【近期完整历史】\n"
+        f"{recent_text or '（暂无近期历史）'}"
+    )
+    return text_within_token_budget(history_text, token_budget), True
+
+
 def context_k_label(tokens: int) -> str:
     return f"{max(0, (int(tokens) + 999) // 1000)}k"
 
@@ -3087,18 +3355,11 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 {clipped_log}
 ```
 
-请基于日志和 diff 判断下一步：
-- 如果任务已经完成，只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。
-- 如果任务还没有完成，继续输出一个完整的 ```{command_block_lang} 代码块，并按既有“占位符 + 后续代码块”协议补齐需要写入的大段文件内容。
-- 如果你输出任何命令块，就不要同时输出 `{AUTOMATION_DONE_MARKER}`；完成标记只能用于“本轮不再执行命令”的最终回复。
-- 如果上一轮把安装、构建、数据拉取或长耗时检查转入后台终端，不要把“已进入后台”当作任务完成。应先按终端摘要里的 log_path/PID/注册表判断它是否仍在运行；如果它仍可能在正常进行，输出一个短暂等待后读取对应日志/注册表的命令块，再由下一轮继续判断。
-- 如果后台终端日志已经显示成功、失败或明确缺失依赖，再基于该日志继续修复、验证或结束任务。
-- 不要重复已经成功完成的步骤；优先修复日志里的错误、补齐缺失文件或做必要验证。
-- 禁止输出备用方案或“如果上面失败就改用...”这类二选一命令；必须自己选择一个最高把握方案，只保留一种可执行路径。
-- 只支持带编号占位符；编号占位符可复用同一个代码块，例如多处 `<!-- Python block 1 -->` 都引用第 1 个 python 代码块。
-- 占位符只属于终端指令块；后续文件代码块必须是最终文件内容，不要在文件代码块里再嵌套占位符。
-- 禁止在命令块中用 heredoc/cat/tee/python -c 直接内嵌长代码或长文本；凡是超过 10 行的文件内容，必须改用带编号占位符，并把完整内容放到后续对应语言代码块。
-- 不要输出 JSON，不要输出 content/tool_calls 包装；这里需要的是普通 Markdown 文本和 fenced {command_block_lang}。
+请判断下一步：
+- 已完成：只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。
+- 未完成：输出一个完整且短小的 ```{command_block_lang} 命令块；写入超过 10 行的文件内容时，必须用带编号替换符引用同一回复里的同语言 fenced 文件内容。
+- 后台安装/构建/拉取不要当作完成；先读取终端摘要中的 log_path/PID/registry_json 判断状态，必要时 sleep 后查日志。
+- 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
 """
 
 
@@ -5082,6 +5343,14 @@ class ExecuteWorker(QThread):
                 outputs.append(f"[{i}] ⛔ 拒绝: {display_cmd}")
                 self.output_signal.emit(outputs[-1])
                 continue
+            if command_writes_agent_project_cache(cmd, self.cwd):
+                outputs.append(
+                    f"[{i}] ⛔ 拒绝: {display_cmd}\n"
+                    "检测到命令尝试把项目文件写入 Agent Qt 缓存目录 .agent_qt/projects。"
+                    "请改写到当前工作区根目录。"
+                )
+                self.output_signal.emit(outputs[-1])
+                continue
             if is_interactive_shell_command(cmd):
                 outputs.append(f"[{i}] ⚠️ 跳过交互式 Shell: {display_cmd}")
                 self.output_signal.emit(outputs[-1])
@@ -5838,7 +6107,8 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
             raise RuntimeError(f"provider 返回格式异常: {payload}") from exc
 
     def response_preview(self, model: str, thread_id: str) -> dict:
-        self.start_provider()
+        # Preview polling is observational. The chat worker owns provider startup;
+        # polling must not get trapped in the long startup path after cancellation.
         return self.request_json(
             "GET",
             f"/debug/response-preview?model={urllib.parse.quote(model)}&user={urllib.parse.quote(thread_id)}",
@@ -5961,14 +6231,162 @@ class AutomationChatWorker(QThread):
             self.finished_signal.emit("", str(exc))
 
 
-class AutomationPreviewWorker(QThread):
-    preview_signal = Signal(dict)
+class AutomationContextBuildWorker(QThread):
+    status_signal = Signal(str)
+    finished_signal = Signal(int, list, str, str)
 
-    def __init__(self, manager: AutomationProviderManager, model: str, thread_id: str):
+    def __init__(
+        self,
+        manager: AutomationProviderManager,
+        *,
+        request_serial: int,
+        system_context: str,
+        current_prompt: str,
+        full_chunks: List[str],
+        lean_chunks: List[str],
+        minimal_chunks: List[str],
+        token_budget: int,
+        provider_byte_budget: int,
+        summary_model: str,
+        thread_id: str,
+    ):
+        super().__init__()
+        self.manager = manager
+        self.request_serial = request_serial
+        self.system_context = system_context
+        self.current_prompt = current_prompt
+        self.full_chunks = list(full_chunks)
+        self.lean_chunks = list(lean_chunks)
+        self.minimal_chunks = list(minimal_chunks)
+        self.token_budget = token_budget
+        self.provider_byte_budget = provider_byte_budget
+        self.summary_model = summary_model
+        self.thread_id = thread_id
+
+    def build_payload(self, history: str) -> str:
+        return "\n\n".join([
+            plaintext_fence("第一段：系统提示词", self.system_context),
+            plaintext_fence("第二段：历史对话", history),
+            plaintext_fence("第三段：当前指令", self.current_prompt),
+        ])
+
+    def llm_summarize_history(self, old_text: str, recent_text: str, input_budget: int) -> str:
+        old_text = summarize_fenced_code_blocks_for_context(old_text)
+        if input_budget > 0:
+            old_text = text_within_utf8_budget(old_text, max(20000, min(120000, input_budget)))
+        else:
+            old_text = text_within_token_budget(old_text, min(AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS, max(12000, self.token_budget // 2)))
+        target_tokens = max(2000, min(AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS, self.token_budget // 3))
+        prompt = (
+            "请把下面的较早 Agent Qt 会话历史压缩成连续上下文摘要，用中文 plaintext 输出。\n"
+            "只输出摘要，不要寒暄，不要 Markdown 代码块。\n"
+            "必须保留：用户真实目标、关键决策、已完成/未完成事项、文件路径、错误与修复线索、终端 registry_json/log_path/pid、重要 diff/commit/函数名、仍需遵守的约束。\n"
+            "可以删除：重复寒暄、大段低价值日志、完整代码正文、已被后续结论覆盖的中间尝试。\n"
+            f"目标长度：约 {context_k_label(target_tokens)} 以内。\n\n"
+            "【较早历史】\n"
+            f"{old_text or '（无较早历史）'}\n\n"
+            "【近期历史提示】\n"
+            "近期完整历史会原文附在摘要后方；不要重复近期内容，只补足连续性。\n"
+            f"{text_within_token_budget(recent_text, 4000) if recent_text else '（暂无近期历史）'}"
+        )
+        summary = self.manager.chat(
+            [{"role": "user", "content": prompt}],
+            self.summary_model,
+            self.thread_id + "-context-compact",
+        ).strip()
+        if not summary:
+            raise RuntimeError("简单模式上下文压缩返回为空。")
+        return summary
+
+    def run(self):
+        try:
+            history_text, compacted = compact_history_text_from_chunks(self.full_chunks, self.token_budget)
+            provider_compaction = "programmatic" if compacted else "none"
+            if compacted:
+                self.status_signal.emit("compacting")
+            payload = self.build_payload(history_text)
+            payload_bytes = utf8_len(payload)
+
+            if self.provider_byte_budget > 0 and payload_bytes > self.provider_byte_budget:
+                self.status_signal.emit("compacting")
+                history_text, _ = compact_history_text_from_chunks(self.lean_chunks, self.token_budget)
+                payload = self.build_payload(history_text)
+                payload_bytes = utf8_len(payload)
+                provider_compaction = "semantic_lean"
+
+            if self.provider_byte_budget > 0 and payload_bytes > self.provider_byte_budget:
+                self.status_signal.emit("compacting")
+                history_text, _ = compact_history_text_from_chunks(self.minimal_chunks, self.token_budget)
+                payload = self.build_payload(history_text)
+                payload_bytes = utf8_len(payload)
+                provider_compaction = "semantic_minimal"
+
+            payload_tokens = estimate_context_tokens(payload)
+            if self.provider_byte_budget <= 0 and payload_tokens > self.token_budget:
+                self.status_signal.emit("llm_compacting")
+                old_text, recent_text = split_history_for_compaction(self.minimal_chunks, self.token_budget)
+                try:
+                    compact_old = self.llm_summarize_history(old_text, recent_text, 0)
+                    history_text = (
+                        "【LLM Compact 历史摘要】\n"
+                        "以下是较早对话、执行结果和 diff 经简单模式模型压缩后的 plaintext 摘要；请作为连续上下文参考，不要把它当作新需求重复执行。\n"
+                        f"{compact_old}\n\n"
+                        "【近期完整历史】\n"
+                        f"{recent_text or '（暂无近期历史）'}"
+                    )
+                    payload = self.build_payload(text_within_token_budget(history_text, self.token_budget))
+                    payload_bytes = utf8_len(payload)
+                    provider_compaction = "llm_summary"
+                except Exception:
+                    logger.warning("LLM token-budget context compaction failed; falling back to token truncation.", exc_info=True)
+
+            if self.provider_byte_budget <= 0 and estimate_context_tokens(payload) > self.token_budget:
+                empty_payload_tokens = estimate_context_tokens(self.build_payload(""))
+                history_token_budget = max(1, self.token_budget - empty_payload_tokens - 200)
+                history_text = text_within_token_budget(history_text, history_token_budget)
+                payload = self.build_payload(history_text)
+                payload_bytes = utf8_len(payload)
+                provider_compaction = "token_fallback"
+
+            if self.provider_byte_budget > 0 and payload_bytes > self.provider_byte_budget:
+                self.status_signal.emit("llm_compacting")
+                old_text, recent_text = split_history_for_compaction(self.minimal_chunks, self.token_budget)
+                try:
+                    compact_old = self.llm_summarize_history(old_text, recent_text, self.provider_byte_budget)
+                    history_text = (
+                        "【LLM Compact 历史摘要】\n"
+                        "以下是较早对话、执行结果和 diff 经简单模式模型压缩后的 plaintext 摘要；请作为连续上下文参考，不要把它当作新需求重复执行。\n"
+                        f"{compact_old}\n\n"
+                        "【近期完整历史】\n"
+                        f"{recent_text or '（暂无近期历史）'}"
+                    )
+                    payload = self.build_payload(text_within_token_budget(history_text, self.token_budget))
+                    payload_bytes = utf8_len(payload)
+                    provider_compaction = "llm_summary"
+                except Exception:
+                    logger.warning("LLM context compaction failed; falling back to byte truncation.", exc_info=True)
+
+            if self.provider_byte_budget > 0 and payload_bytes > self.provider_byte_budget:
+                empty_history_payload = self.build_payload("")
+                history_byte_budget = max(0, self.provider_byte_budget - utf8_len(empty_history_payload) - 512)
+                history_text = text_within_utf8_budget(history_text, history_byte_budget)
+                payload = self.build_payload(history_text)
+                provider_compaction = "byte_fallback"
+
+            self.finished_signal.emit(self.request_serial, [{"role": "user", "content": payload}], "", provider_compaction)
+        except Exception as exc:
+            self.finished_signal.emit(self.request_serial, [], str(exc), "")
+
+
+class AutomationPreviewWorker(QThread):
+    preview_signal = Signal(int, dict)
+
+    def __init__(self, manager: AutomationProviderManager, model: str, thread_id: str, serial: int):
         super().__init__()
         self.manager = manager
         self.model = model
         self.thread_id = thread_id
+        self.serial = serial
         self._running = True
         self._last_signature: tuple = ()
         self._last_emit_at = 0.0
@@ -5999,10 +6417,40 @@ class AutomationPreviewWorker(QThread):
                 if signature != self._last_signature or now - self._last_emit_at >= 1.2:
                     self._last_signature = signature
                     self._last_emit_at = now
-                    self.preview_signal.emit(preview)
+                    if self._running:
+                        self.preview_signal.emit(self.serial, preview)
             except Exception:
                 pass
             self.msleep(300)
+
+
+class HistorySaveWorker(QThread):
+    finished_signal = Signal(int, bool, str)
+
+    def __init__(self, root: str, thread_id: str, entries: List[Dict[str, object]], generation: int):
+        super().__init__()
+        self.root = root
+        self.thread_id = thread_id
+        self.entries = entries
+        self.generation = generation
+
+    def run(self):
+        tmp_path = ""
+        ok = False
+        try:
+            os.makedirs(history_dir(self.root, self.thread_id), exist_ok=True)
+            tmp_path = history_path(self.root, self.thread_id) + f".{self.generation}.tmp"
+            payload = {
+                "version": HISTORY_VERSION,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "entries": self.entries,
+            }
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            ok = True
+        except OSError:
+            ok = False
+        self.finished_signal.emit(self.generation, ok, tmp_path)
 
 
 class MarkdownRenderWorker(QThread):
@@ -6086,6 +6534,7 @@ class ChatBubble(QFrame):
         self.show_prompt_input = show_prompt_input
         self.compact_user = compact_user
         self.code_max_height = 260
+        self.streaming_code_fixed_height_threshold = 7
         self.markdown_widgets: List[QWidget] = []
         self.markdown_code_widgets: List[QPlainTextEdit] = []
         self.markdown_part_signatures: List[tuple] = []
@@ -6136,7 +6585,7 @@ class ChatBubble(QFrame):
         elif self.flat:
             layout.setContentsMargins(2, 10, 2, 10)
         elif self.compact_user:
-            layout.setContentsMargins(14, 10, 14, 10)
+            layout.setContentsMargins(16, 12, 16, 12)
         else:
             layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(4 if self.plain_system_log else (6 if self.compact_user else (8 if self.flat else 10)))
@@ -6162,7 +6611,7 @@ class ChatBubble(QFrame):
                     color: {COLORS['text']};
                     border: none;
                     padding: 0;
-                    font-size: {scaled_font_px(13)}px;
+                    font-size: {scaled_font_px(14)}px;
                     line-height: 1.35;
                 }}
                 QScrollBar:vertical {{
@@ -6489,7 +6938,12 @@ class ChatBubble(QFrame):
         lang_label.setFixedHeight(24)
         lang_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header_layout.addWidget(lang_label, 0, Qt.AlignmentFlag.AlignVCenter)
-        header_layout.addStretch()
+        summary_label = QLabel(code_block_summary(lang, code))
+        summary_label.setFixedHeight(24)
+        summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        summary_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        summary_label.setToolTip(code_block_summary(lang, code, limit=240))
+        header_layout.addWidget(summary_label, 1, Qt.AlignmentFlag.AlignVCenter)
         collapse_btn = QToolButton(cursor=Qt.CursorShape.PointingHandCursor)
         collapse_btn.setText("-")
         collapse_btn.setFixedSize(22, 22)
@@ -6509,22 +6963,77 @@ class ChatBubble(QFrame):
         )
         code_box.setStyleSheet(self.markdown_code_style())
         code_layout.addWidget(code_box)
+        collapsed_height = 34
+
+        def parent_scroll_bar():
+            parent = self.parentWidget()
+            while parent is not None:
+                scroll_area = getattr(parent, "scroll_area", None)
+                if scroll_area is not None:
+                    try:
+                        return scroll_area.verticalScrollBar()
+                    except RuntimeError:
+                        return None
+                parent = parent.parentWidget()
+            return None
+
+        def set_code_collapsed(collapsed: bool, preserve_anchor: bool = False):
+            bar = parent_scroll_bar() if preserve_anchor else None
+            anchor_y = header.mapToGlobal(QPoint(0, 0)).y() if bar is not None else 0
+            if collapsed:
+                code_box.user_locked_height = 0
+                code_box.setVisible(False)
+                code_box.setFixedHeight(0)
+                code_box.setMaximumHeight(0)
+                code_frame.setFixedHeight(collapsed_height)
+                code_frame.setMaximumHeight(collapsed_height)
+            else:
+                code_frame.setMinimumHeight(0)
+                code_frame.setMaximumHeight(QT_WIDGET_MAX_HEIGHT)
+                code_box.setMinimumHeight(0)
+                code_box.setMaximumHeight(QT_WIDGET_MAX_HEIGHT)
+                if self.stabilize_markdown_height:
+                    code_box.user_locked_height = self.code_max_height
+                    code_box.setFixedHeight(self.code_max_height)
+                else:
+                    code_box.user_locked_height = 0
+                code_box.setVisible(True)
+            collapse_btn.setText("▸" if collapsed else "-")
+            header.setProperty("collapsed", collapsed)
+            code_frame.updateGeometry()
+            parent_layout = code_frame.parentWidget().layout() if code_frame.parentWidget() is not None else None
+            if parent_layout is not None:
+                parent_layout.invalidate()
+            self.adjust_content_height()
+            if bar is not None:
+                def restore_anchor():
+                    try:
+                        next_y = header.mapToGlobal(QPoint(0, 0)).y()
+                        delta = next_y - anchor_y
+                        if delta:
+                            bar.setValue(max(0, min(bar.value() + delta, bar.maximum())))
+                    except RuntimeError:
+                        return
+
+                QTimer.singleShot(0, restore_anchor)
+                QTimer.singleShot(40, restore_anchor)
 
         def toggle_code():
-            visible = code_box.isVisible()
-            code_box.setVisible(not visible)
-            collapse_btn.setText("+" if visible else "-")
-            header.setProperty("collapsed", visible)
-            self.adjust_content_height()
+            set_code_collapsed(code_box.isVisible(), preserve_anchor=True)
 
         collapse_btn.clicked.connect(toggle_code)
+        header.clicked.connect(toggle_code)
         code_box.code_source = code
         code_frame.code_box = code_box
         code_frame.lang_label = lang_label
+        code_frame.summary_label = summary_label
         code_frame.collapse_btn = collapse_btn
+        code_frame.set_code_collapsed = set_code_collapsed
         layout.addWidget(code_frame)
         self.markdown_widgets.append(code_frame)
         self.markdown_code_widgets.append(code_box)
+        if compact_code_blocks_by_default():
+            set_code_collapsed(True)
         return code_box
 
     def update_markdown_parts_in_place(self, parts: List[Dict[str, str]], signatures: List[tuple]) -> bool:
@@ -6542,6 +7051,13 @@ class ChatBubble(QFrame):
                 text = part.get("text", "")
                 if getattr(code_box, "code_source", None) != text:
                     self.update_markdown_code_box_text(code_box, text)
+                    summary_label = getattr(widget, "summary_label", None)
+                    if isinstance(summary_label, QLabel):
+                        lang_label = getattr(widget, "lang_label", None)
+                        lang_text = lang_label.text() if isinstance(lang_label, QLabel) else part.get("lang", "")
+                        summary = code_block_summary(lang_text, text)
+                        summary_label.setText(summary)
+                        summary_label.setToolTip(code_block_summary(lang_text, text, limit=240))
                     changed = True
                 code_index += 1
             else:
@@ -6609,13 +7125,20 @@ class ChatBubble(QFrame):
             vertical.setValue(min(old_value, vertical.maximum()))
         horizontal.setValue(min(old_h_value, horizontal.maximum()))
 
-    def render_precomputed_markdown_parts(self, parts: List[Dict[str, str]], signatures: List[tuple], layout: Optional[QVBoxLayout] = None, stats: Optional[Dict[str, int]] = None):
+    def render_precomputed_markdown_parts(
+        self,
+        parts: List[Dict[str, str]],
+        signatures: List[tuple],
+        layout: Optional[QVBoxLayout] = None,
+        stats: Optional[Dict[str, int]] = None,
+        force_rebuild: bool = False,
+    ):
         if layout is None:
             layout = self.layout()
         if layout is None:
             return
         apply_started = time.perf_counter()
-        if self.update_markdown_parts_in_place(parts, signatures):
+        if not force_rebuild and self.update_markdown_parts_in_place(parts, signatures):
             return
         code_scroll_states = self.capture_markdown_code_scroll_state()
         self.clear_markdown_widgets()
@@ -6732,7 +7255,12 @@ class ChatBubble(QFrame):
                 continue
             label.setStyleSheet(f"color: {COLORS['text']}; font-weight: 700; font-size: 13px; background: transparent;")
         if self.markdown and self.expand_to_content:
-            self.render_markdown_parts()
+            parts = split_markdown_fenced_blocks(self.visible_content())
+            signatures = [
+                (part["type"], (part.get("lang", "") if part["type"] == "code" else ""))
+                for part in parts
+            ]
+            self.render_precomputed_markdown_parts(parts, signatures, force_rebuild=True)
         elif hasattr(self, "content_label") and self.content_label is not None:
             if self.compact_user:
                 self.content_label.setStyleSheet(f"""
@@ -6741,7 +7269,7 @@ class ChatBubble(QFrame):
                         color: {COLORS['text']};
                         border: none;
                         padding: 0;
-                        font-size: {scaled_font_px(13)}px;
+                        font-size: {scaled_font_px(14)}px;
                         line-height: 1.35;
                     }}
                     QScrollBar:vertical {{
@@ -6884,6 +7412,14 @@ class ChatBubble(QFrame):
             for code_box in self.markdown_code_widgets:
                 if not code_box.isVisible():
                     continue
+                locked_height = int(getattr(code_box, "user_locked_height", 0) or 0)
+                if locked_height > 0:
+                    if code_box.height() != locked_height:
+                        code_box.setFixedHeight(locked_height)
+                        code_box.updateGeometry()
+                    key = id(code_box)
+                    next_stable_heights[key] = locked_height
+                    continue
                 code_box.setMinimumHeight(0)
                 code_box.setMaximumHeight(QT_WIDGET_MAX_HEIGHT)
                 metrics = code_box.fontMetrics()
@@ -6891,7 +7427,10 @@ class ChatBubble(QFrame):
                 line_count = max(1, len(text.splitlines()) or 1)
                 vertical_padding = 26
                 scrollbar_room = 12 if code_box.horizontalScrollBarPolicy() != Qt.ScrollBarPolicy.ScrollBarAlwaysOff else 0
-                target_height = min(self.code_max_height, max(46, line_count * metrics.lineSpacing() + vertical_padding + scrollbar_room))
+                if self.stabilize_markdown_height and line_count >= self.streaming_code_fixed_height_threshold:
+                    target_height = self.code_max_height
+                else:
+                    target_height = min(self.code_max_height, max(46, line_count * metrics.lineSpacing() + vertical_padding + scrollbar_room))
                 if self.stabilize_markdown_height:
                     key = id(code_box)
                     target_height = max(int(self._stable_markdown_heights.get(key, 0)), target_height)
@@ -6912,7 +7451,8 @@ class ChatBubble(QFrame):
         if self.compact_user:
             available_width = max(120, self.content_label.width() - 8)
             metrics = self.content_label.fontMetrics()
-            target_height = max(26, estimate_wrapped_text_height(self.visible_content() or " ", metrics, available_width))
+            line_spacing = max(1, metrics.lineSpacing())
+            target_height = max(line_spacing + 4, estimate_wrapped_text_height(self.visible_content() or " ", metrics, available_width) - 30)
             target_height = min(self.max_content_height, target_height)
             self.content_label.setVerticalScrollBarPolicy(
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded if target_height >= self.max_content_height else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
@@ -8291,9 +8831,12 @@ class ChatPage(QWidget):
         self.automation_enabled = automation_enabled_setting()
         self.automation_model = AUTOMATION_DEFAULT_MODEL
         self.automation_context_mode = automation_context_mode_setting()
+        self.automation_context_worker: Optional[AutomationContextBuildWorker] = None
         self.automation_worker: Optional[AutomationChatWorker] = None
         self.automation_request_serial = 0
         self.automation_preview_worker: Optional[AutomationPreviewWorker] = None
+        self.automation_preview_retired_workers: List[AutomationPreviewWorker] = []
+        self.automation_preview_serial = 0
         self.automation_preview_bubble: Optional[QFrame] = None
         self.automation_preview_started_at = 0.0
         self.automation_preview_pending_text = ""
@@ -8306,6 +8849,13 @@ class ChatPage(QWidget):
         self.automation_preview_dots_timer = QTimer(self)
         self.automation_preview_dots_timer.setInterval(520)
         self.automation_preview_dots_timer.timeout.connect(self.tick_automation_preview_status)
+        self.history_save_timer = QTimer(self)
+        self.history_save_timer.setSingleShot(True)
+        self.history_save_timer.timeout.connect(self.flush_history_save)
+        self.history_save_worker: Optional[HistorySaveWorker] = None
+        self.history_save_dirty = False
+        self.history_save_generation = 0
+        self.pending_provider_io: Optional[Dict[str, object]] = None
         self.ui_heartbeat_last = time.perf_counter()
         self.ui_heartbeat_timer = QTimer(self)
         self.ui_heartbeat_timer.setInterval(100)
@@ -8321,6 +8871,9 @@ class ChatPage(QWidget):
         self._ensure_ai_entry_pending = False
         self._last_status_message = ""
         self._last_status_at = 0.0
+        self.chat_scroll_user_controlled = False
+        self.chat_scroll_programmatic = False
+        self.chat_scroll_bottom_tolerance = 12
         self.automation_composer: Optional[QFrame] = None
         self.automation_input: Optional[QTextEdit] = None
         self.automation_send_btn: Optional[QToolButton] = None
@@ -8328,6 +8881,8 @@ class ChatPage(QWidget):
         self.automation_skill_btn: Optional[QToolButton] = None
         self.skill_generation_worker: Optional[AutomationChatWorker] = None
         self.last_automation_provider_compaction = "none"
+        self.last_automation_history_compacted = False
+        self._last_context_compaction_notice_at = 0.0
         self.chat_column_max_width = 1480
         self.chat_column_width_ratio = 0.94
         self.user_bubble_width_ratio = 0.75
@@ -8654,6 +9209,10 @@ class ChatPage(QWidget):
         self.update_prompt_tools_responsive()
     
     def set_project(self, path: str):
+        self.flush_history_save(wait=True)
+        self.stop_automation_preview(remove_bubble=True)
+        self.chat_scroll_user_controlled = False
+        self.chat_scroll_programmatic = False
         self.terminal_panel.close_all_processes()
         self.terminal_panel.collapse()
         self.project_root = path
@@ -8746,6 +9305,26 @@ class ChatPage(QWidget):
         notice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.add_chat_widget(notice)
 
+    def add_context_compaction_notice(self):
+        now = time.time()
+        if now - self._last_context_compaction_notice_at < 2:
+            return
+        self._last_context_compaction_notice_at = now
+        notice = QLabel("——————  自动压缩上下文  ———————")
+        notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        notice.setStyleSheet(f"""
+            QLabel {{
+                background: transparent;
+                color: {COLORS['text_secondary']};
+                border: none;
+                padding: 8px 12px;
+                font-size: {scaled_font_px(12)}px;
+                font-weight: 800;
+            }}
+        """)
+        notice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.add_chat_widget(notice)
+
     def add_chat_widget(self, widget: QWidget, *, animate: bool = False):
         self.prepare_chat_widget(widget)
         if isinstance(widget, ChatBubble) and getattr(widget, "role", "") == "user":
@@ -8804,48 +9383,98 @@ class ChatPage(QWidget):
         self.sidebar_wrapper.setFixedWidth(self.sidebar.current_width() + handle_width)
     
     def scroll_to_bottom(self):
+        if not self.should_auto_follow_chat_scroll():
+            return
         self.scroll_to_bottom_now()
         for delay in (30, 90, 180):
-            QTimer.singleShot(delay, self.scroll_to_bottom_now)
+            QTimer.singleShot(delay, self.scroll_to_bottom_if_auto_follow)
 
     def scroll_to_bottom_now(self):
         bar = self.scroll_area.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        self.chat_scroll_programmatic = True
+        try:
+            bar.setValue(bar.maximum())
+        finally:
+            QTimer.singleShot(0, self.clear_programmatic_chat_scroll)
+
+    def clear_programmatic_chat_scroll(self):
+        self.chat_scroll_programmatic = False
+
+    def scroll_to_bottom_if_auto_follow(self):
+        if self.should_auto_follow_chat_scroll():
+            self.scroll_to_bottom_now()
 
     def is_chat_at_bottom(self) -> bool:
         bar = self.scroll_area.verticalScrollBar()
-        return bar.value() >= bar.maximum() - 8
+        return bar.value() >= bar.maximum() - self.chat_scroll_bottom_tolerance
+
+    def should_auto_follow_chat_scroll(self) -> bool:
+        return not self.chat_scroll_user_controlled or self.is_chat_at_bottom()
 
     def capture_chat_scroll_state(self) -> Dict[str, object]:
         bar = self.scroll_area.verticalScrollBar()
         return {
             "value": bar.value(),
             "maximum": bar.maximum(),
-            "at_bottom": bar.value() >= bar.maximum() - 8,
+            "bottom_gap": max(0, bar.maximum() - bar.value()),
+            "at_bottom": self.is_chat_at_bottom(),
+            "user_controlled": self.chat_scroll_user_controlled,
         }
 
     def restore_chat_scroll_state(self, state: Dict[str, object]):
-        bar = self.scroll_area.verticalScrollBar()
-        previous_maximum = int(state.get("maximum") or 0)
-        previous_value = int(state.get("value") or 0)
-        if bool(state.get("at_bottom")):
-            if bar.maximum() > previous_maximum + 2:
-                bar.setValue(bar.maximum())
-            else:
-                bar.setValue(min(previous_value, bar.maximum()))
+        if bool(state.get("user_controlled")):
             return
-        bar.setValue(min(previous_value, bar.maximum()))
+        if bool(state.get("at_bottom")):
+            if self.should_auto_follow_chat_scroll():
+                self.scroll_to_bottom_now()
+            return
+
+    def freeze_user_chat_scroll_value(self, state: Dict[str, object]):
+        if not bool(state.get("user_controlled")):
+            return
+        try:
+            frozen_value = int(state.get("value", 0))
+        except (TypeError, ValueError):
+            frozen_value = 0
+
+        def restore_frozen_value():
+            if not getattr(self, "chat_scroll_user_controlled", False):
+                return
+            if not hasattr(self, "scroll_area"):
+                return
+            try:
+                bar = self.scroll_area.verticalScrollBar()
+            except RuntimeError:
+                return
+            value = max(0, min(frozen_value, bar.maximum()))
+            if bar.value() == value:
+                return
+            self.chat_scroll_programmatic = True
+            try:
+                bar.setValue(value)
+            finally:
+                QTimer.singleShot(0, self.clear_programmatic_chat_scroll)
+
+        restore_frozen_value()
+        for delay in (0, 30, 90, 180, 300, 600):
+            QTimer.singleShot(delay, restore_frozen_value)
 
     def stabilize_chat_scroll_after_update(self, state: Dict[str, object]):
+        if bool(state.get("user_controlled")):
+            self.freeze_user_chat_scroll_value(state)
+            return
         self.restore_chat_scroll_state(state)
-        for delay in (0, 30, 90):
+        for delay in (0, 30, 90, 180, 300):
             QTimer.singleShot(delay, lambda state=state: self.restore_chat_scroll_state(state))
 
     def is_execution_running(self) -> bool:
         return bool(self.worker and self.worker.isRunning())
 
     def is_automation_request_running(self) -> bool:
-        return bool(self.automation_worker and self.automation_worker.isRunning())
+        return bool(
+            (self.automation_context_worker and self.automation_context_worker.isRunning())
+            or (self.automation_worker and self.automation_worker.isRunning())
+        )
 
     def is_automation_busy(self) -> bool:
         return self.automation_loop_active or self.is_automation_request_running()
@@ -8872,7 +9501,12 @@ class ChatPage(QWidget):
                 self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
     
     def on_chat_scroll_changed(self, _value: int):
-        return
+        if self.chat_scroll_programmatic:
+            return
+        if self.is_chat_at_bottom():
+            self.chat_scroll_user_controlled = False
+        else:
+            self.chat_scroll_user_controlled = True
 
     def schedule_ensure_ai_response_entry(self):
         if self.automation_enabled or self._ensure_ai_entry_pending or self.is_execution_running():
@@ -8902,7 +9536,7 @@ class ChatPage(QWidget):
         if self.automation_enabled or self.find_open_ai_response_frame() is None:
             return
         for delay in (0, 80, 180):
-            QTimer.singleShot(delay, self.scroll_to_bottom_now)
+            QTimer.singleShot(delay, self.scroll_to_bottom_if_auto_follow)
 
     def toggle_prompt_tools(self):
         return
@@ -9764,6 +10398,19 @@ class ChatPage(QWidget):
             if isinstance(widget, (ChatBubble, ExecutionLogPanel)):
                 widget.refresh_visual_settings()
                 continue
+            if isinstance(widget, QLabel):
+                widget.setStyleSheet(f"""
+                    QLabel {{
+                        background: transparent;
+                        color: {COLORS['text_secondary']};
+                        border: none;
+                        padding: 8px 12px;
+                        font-size: {scaled_font_px(12)}px;
+                        font-weight: 800;
+                    }}
+                """)
+                widget.updateGeometry()
+                continue
             if widget is not None and widget.objectName() == "aiResponseFrame":
                 ai_input = getattr(widget, "ai_input", None)
                 if ai_input is not None:
@@ -9772,7 +10419,12 @@ class ChatPage(QWidget):
         if isinstance(window, QMainWindow):
             window.setStyleSheet(f"QMainWindow {{ background: {COLORS['bg']}; }}")
         self.update_automation_composer_state()
+        if hasattr(self, "chat_column"):
+            self.chat_column.adjustSize()
+        if hasattr(self, "chat_container"):
+            self.chat_container.adjustSize()
         self.update()
+        QApplication.processEvents()
 
     def set_chat_font_scale(self, scale: float):
         set_chat_font_scale_setting(scale)
@@ -9810,6 +10462,17 @@ class ChatPage(QWidget):
         automation_toggle_action = QWidgetAction(menu)
         automation_toggle_action.setDefaultWidget(automation_toggle)
         menu.addAction(automation_toggle_action)
+
+        developer_toggle = SettingsToggleRow(
+            "开发者模式",
+            "显示完整代码块和详细错误信息",
+            developer_mode_enabled(),
+            parent=menu,
+        )
+        developer_toggle.toggled.connect(lambda enabled, row=developer_toggle: self.set_developer_mode(enabled, row))
+        developer_toggle_action = QWidgetAction(menu)
+        developer_toggle_action.setDefaultWidget(developer_toggle)
+        menu.addAction(developer_toggle_action)
         menu.addSeparator()
 
         runtime_menu = style_compact_popup_menu(menu.addMenu("Python 运行环境"))
@@ -9895,6 +10558,11 @@ class ChatPage(QWidget):
 
     def set_automation_max_rounds(self, rounds: int):
         self.automation_loop_max_rounds = max(1, int(rounds))
+
+    def set_developer_mode(self, enabled: bool, toggle_row: Optional[SettingsToggleRow] = None):
+        set_developer_mode_enabled(enabled)
+        self.apply_chat_visual_settings()
+        self.add_status_bubble("开发者模式已开启：显示完整代码块和详细错误。" if enabled else "开发者模式已关闭：默认折叠代码块并隐藏长错误细节。")
 
     def set_python_runtime_enabled(self, enabled: bool, toggle_row: Optional[SettingsToggleRow] = None):
         if enabled and not agent_runtime_ready():
@@ -9999,6 +10667,30 @@ class ChatPage(QWidget):
         return path
 
     def conversation_export_text(self, fmt: str = "md") -> str:
+        if fmt == "raw":
+            lines: List[str] = [
+                "Agent Qt Provider 原始记录",
+                f"工作区: {self.project_root}",
+                f"会话: {self.thread_id}",
+                f"导出时间: {datetime.now().isoformat(timespec='seconds')}",
+                "",
+            ]
+            raw_count = 0
+            for index, entry in enumerate(self.history_entries, start=1):
+                provider_io = entry.get("provider_io") if isinstance(entry, dict) else None
+                if not isinstance(provider_io, dict):
+                    continue
+                raw_count += 1
+                lines.append(f"===== Provider Round {raw_count} / History Entry {index} =====")
+                lines.append(json.dumps(provider_io, ensure_ascii=False, indent=2))
+                lines.append("")
+            if raw_count == 0:
+                lines.append("当前会话历史里没有 provider_io 原始字段；可能是旧版本会话或非自动化对话。下面附上当前 history_entries 原始 JSON，便于排查。")
+                lines.append("")
+                lines.append(json.dumps(self.history_entries, ensure_ascii=False, indent=2))
+                lines.append("")
+            return "\n".join(lines).rstrip() + "\n"
+
         lines: List[str] = []
         if fmt == "md":
             lines.append("# Agent Qt 会话导出")
@@ -10042,8 +10734,10 @@ class ChatPage(QWidget):
         return "\n".join(lines).rstrip() + "\n"
 
     def export_conversation_text(self, fmt: str):
+        self.flush_history_save(wait=True)
         ext = "md" if fmt == "md" else "txt"
-        path = os.path.join(self.export_dir(), f"agent-qt-{self.thread_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.{ext}")
+        suffix = "-provider-raw" if fmt == "raw" else ""
+        path = os.path.join(self.export_dir(), f"agent-qt-{self.thread_id}{suffix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.{ext}")
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self.conversation_export_text(fmt))
@@ -10093,6 +10787,9 @@ class ChatPage(QWidget):
         txt_action = QAction("分享为 TXT (.txt)", self)
         txt_action.triggered.connect(lambda: self.export_conversation_text("txt"))
         menu.addAction(txt_action)
+        raw_txt_action = QAction("分享原始 Provider TXT (.txt)", self)
+        raw_txt_action.triggered.connect(lambda: self.export_conversation_text("raw"))
+        menu.addAction(raw_txt_action)
         screenshot_action = QAction("分享为长截图 (.png)", self)
         screenshot_action.triggered.connect(self.export_conversation_screenshot)
         menu.addAction(screenshot_action)
@@ -10366,6 +11063,27 @@ class ChatPage(QWidget):
 
     def cancel_automation_request(self):
         self.automation_request_serial += 1
+        context_worker = self.automation_context_worker
+        if context_worker is not None:
+            self.automation_manager.cancel_generation(
+                AUTOMATION_SIMPLE_MODEL_BY_MODEL.get(self.automation_model, self.automation_model),
+                self.thread_id + "-context-compact",
+            )
+            context_worker.requestInterruption()
+            if context_worker.wait(2500):
+                context_worker.deleteLater()
+            else:
+                self.automation_manager.stop_provider_process()
+                if context_worker.wait(2500):
+                    context_worker.deleteLater()
+                else:
+                    context_worker.terminate()
+                    if context_worker.wait(1200):
+                        context_worker.deleteLater()
+                    else:
+                        context_worker.finished.connect(context_worker.deleteLater)
+            if self.automation_context_worker is context_worker:
+                self.automation_context_worker = None
         worker = self.automation_worker
         self.automation_manager.cancel_generation(self.effective_automation_model(), self.thread_id)
         if worker is not None:
@@ -10402,19 +11120,6 @@ class ChatPage(QWidget):
             if self.automation_input is not None:
                 self.automation_input.setFocus()
             return
-        if self.automation_context_mode == "expert":
-            self.build_automation_context_payload(text, log_stats=False, apply_provider_budget=True)
-            if self.last_automation_provider_compaction == "byte_fallback":
-                self.set_automation_context_mode("simple")
-                if self.automation_input is not None:
-                    self.automation_input.setPlainText(text)
-                    self.automation_input.setFocus()
-                styled_warning(
-                    self,
-                    "已切换到简单模式",
-                    "专家模式上下文会触发 DeepSeek Web 超长提交限制。已保留输入内容并切换到简单模式，请确认后重新提交。",
-                )
-                return
         if self.automation_input is not None:
             self.automation_input.clear()
         full_prompt = self.build_system_prompt(text)
@@ -10427,7 +11132,7 @@ class ChatPage(QWidget):
             None,
             prompt_entry_id,
         )
-        if self.automation_worker is not None and self.selected_skill_ids:
+        if self.is_automation_request_running() and self.selected_skill_ids:
             self.clear_automation_skills()
 
     def add_automation_user_prompt_bubble(self, full_prompt: str, animate: bool = True) -> str:
@@ -10491,24 +11196,33 @@ class ChatPage(QWidget):
 
     def start_automation_preview(self):
         self.stop_automation_preview(remove_bubble=True)
+        self.automation_preview_serial += 1
+        serial = self.automation_preview_serial
         self.automation_preview_started_at = time.time()
         self.automation_preview_pending_text = ""
         self.automation_preview_last_rendered_text = ""
         self.automation_preview_last_chars = 0
         self.automation_preview_dots = 0
         self.automation_preview_bubble = self.create_automation_preview_bubble()
-        worker = AutomationPreviewWorker(self.automation_manager, self.effective_automation_model(), self.thread_id)
+        worker = AutomationPreviewWorker(self.automation_manager, self.effective_automation_model(), self.thread_id, serial)
         self.automation_preview_worker = worker
         worker.preview_signal.connect(self.update_automation_preview)
         worker.start()
 
     def stop_automation_preview(self, remove_bubble: bool = False):
+        self.automation_preview_serial += 1
         worker = self.automation_preview_worker
         if worker is not None:
             worker.stop()
+            try:
+                worker.preview_signal.disconnect(self.update_automation_preview)
+            except (RuntimeError, TypeError):
+                pass
             if worker.wait(1500):
                 worker.deleteLater()
             else:
+                self.automation_preview_retired_workers.append(worker)
+                worker.finished.connect(lambda worker=worker: self.cleanup_retired_preview_worker(worker))
                 worker.finished.connect(worker.deleteLater)
             self.automation_preview_worker = None
         self.automation_preview_render_timer.stop()
@@ -10524,6 +11238,12 @@ class ChatPage(QWidget):
             bubble.setParent(None)
             bubble.deleteLater()
             self.chat_container.adjustSize()
+
+    def cleanup_retired_preview_worker(self, worker: AutomationPreviewWorker):
+        try:
+            self.automation_preview_retired_workers.remove(worker)
+        except ValueError:
+            pass
 
     def update_automation_preview_status(self, chars: Optional[int] = None):
         started = time.perf_counter()
@@ -10565,6 +11285,11 @@ class ChatPage(QWidget):
         text = self.automation_preview_pending_text
         if not text or text == self.automation_preview_last_rendered_text:
             return
+        if self.automation_preview_last_rendered_text:
+            previous_code_blocks = markdown_fenced_code_block_count(self.automation_preview_last_rendered_text)
+            next_code_blocks = markdown_fenced_code_block_count(text)
+            if previous_code_blocks > next_code_blocks:
+                return
         scroll_state = self.capture_chat_scroll_state()
         bubble.update_content(text)
         self.automation_preview_last_rendered_text = text
@@ -10573,8 +11298,10 @@ class ChatPage(QWidget):
         if elapsed_ms >= 60:
             logger.warning("Automation preview render UI slow elapsed_ms=%d chars=%d", elapsed_ms, len(text))
 
-    def update_automation_preview(self, preview: dict):
+    def update_automation_preview(self, serial: int, preview: dict):
         started = time.perf_counter()
+        if serial != self.automation_preview_serial:
+            return
         bubble = self.automation_preview_bubble
         if bubble is None:
             return
@@ -10661,7 +11388,7 @@ class ChatPage(QWidget):
         )
 
     def summarize_automation_text(self, text: str, limit: int) -> str:
-        content = strip_low_value_context_blocks(str(text or "").strip())
+        content = summarize_fenced_code_blocks_for_context(strip_low_value_context_blocks(str(text or "").strip()))
         if len(content) <= limit:
             return content
         lines = [line.rstrip() for line in content.splitlines() if line.strip()]
@@ -10797,42 +11524,10 @@ class ChatPage(QWidget):
         return self.collapse_repeated_history_chunks(chunks)
 
     def compact_automation_history_text(self, chunks: List[str], token_budget: int) -> str:
-        if not chunks:
-            return "（暂无历史对话）"
-        full_text = "\n\n".join(chunks).strip()
-        if estimate_context_tokens(full_text) <= min(token_budget, AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS):
-            return text_within_token_budget(full_text, token_budget)
-
-        recent_reversed: List[str] = []
-        recent_tokens = 0
-        old_count = len(chunks)
-        for index in range(len(chunks) - 1, -1, -1):
-            chunk = chunks[index]
-            chunk_tokens = estimate_context_tokens(chunk)
-            if recent_reversed and recent_tokens + chunk_tokens > AUTOMATION_CONTEXT_COMPACT_RECENT_TOKENS:
-                old_count = index + 1
-                break
-            recent_reversed.append(chunk)
-            recent_tokens += chunk_tokens
-            old_count = index
-        recent_chunks = list(reversed(recent_reversed))
-        old_chunks = chunks[:old_count]
-
-        old_text = "\n\n".join(old_chunks).strip()
-        recent_text = "\n\n".join(recent_chunks).strip()
-        summary_budget = min(
-            AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS,
-            max(4000, token_budget - estimate_context_tokens(recent_text) - 2000),
-        )
-        compact_old = text_within_token_budget(old_text, summary_budget) if old_text else "（无较早历史）"
-        history_text = (
-            "【Compact 历史摘要】\n"
-            "以下是较早对话、执行结果和 diff 的 plaintext 压缩版本；请作为连续上下文参考，不要把它当作新需求重复执行。\n"
-            f"{compact_old}\n\n"
-            "【近期完整历史】\n"
-            f"{recent_text or '（暂无近期历史）'}"
-        )
-        return text_within_token_budget(history_text, token_budget)
+        history_text, compacted = compact_history_text_from_chunks(chunks, token_budget)
+        if compacted:
+            self.last_automation_history_compacted = True
+        return history_text
 
     def build_automation_context_payload(
         self,
@@ -10841,6 +11536,7 @@ class ChatPage(QWidget):
         log_stats: bool = True,
         apply_provider_budget: Optional[bool] = None,
     ) -> str:
+        self.last_automation_history_compacted = False
         system_context = self.automation_context_system_text()
         current_prompt = str(current_prompt or "").strip()
         token_budget = max(
@@ -10890,6 +11586,8 @@ class ChatPage(QWidget):
             payload = build_payload(history_text)
             provider_compaction = "byte_fallback"
         self.last_automation_provider_compaction = provider_compaction
+        if provider_compaction != "none":
+            self.last_automation_history_compacted = True
         if log_stats:
             logger.warning(
                 "Automation context payload chars=%d bytes=%d tokens=%d token_budget=%d provider_byte_budget=%d provider_compaction=%s",
@@ -10912,7 +11610,10 @@ class ChatPage(QWidget):
         return f"专家模式 · DeepSeek Web 约45k 上下文阈值{skill_suffix} · 输入下一步需求..."
 
     def build_automation_messages(self, current_prompt: str, skip_entry_id: str = "") -> List[Dict[str, str]]:
-        return [{"role": "user", "content": self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id)}]
+        payload = self.build_automation_context_payload(current_prompt, skip_entry_id=skip_entry_id)
+        if self.last_automation_history_compacted:
+            self.add_context_compaction_notice()
+        return [{"role": "user", "content": payload}]
 
     def append_prompt_bubble_from_toolbar(self):
         if self.automation_enabled:
@@ -10988,46 +11689,128 @@ class ChatPage(QWidget):
             copy_btn.setText("等待 AI...")
         if status_text:
             self.add_status_bubble(status_text)
-        messages = self.build_automation_messages(prompt, skip_entry_id=skip_entry_id)
         self.automation_request_serial += 1
         request_serial = self.automation_request_serial
-        worker = AutomationChatWorker(
-            self.automation_manager,
-            messages,
-            self.effective_automation_model(),
-            self.thread_id,
+        self.last_automation_history_compacted = False
+        self.last_automation_provider_compaction = "none"
+        system_context = self.automation_context_system_text()
+        current_prompt = str(prompt or "").strip()
+        token_budget = max(
+            4000,
+            AUTOMATION_CONTEXT_WINDOW_TOKENS
+            - AUTOMATION_CONTEXT_RESPONSE_RESERVE_TOKENS
+            - estimate_context_tokens(system_context)
+            - estimate_context_tokens(current_prompt),
         )
-        self.automation_worker = worker
+        provider_byte_budget = (
+            AUTOMATION_CONTEXT_PROVIDER_PAYLOAD_BYTES
+            if self.automation_context_mode == "expert"
+            else 0
+        )
+        context_worker = AutomationContextBuildWorker(
+            self.automation_manager,
+            request_serial=request_serial,
+            system_context=system_context,
+            current_prompt=current_prompt,
+            full_chunks=self.automation_history_chunks(skip_entry_id=skip_entry_id),
+            lean_chunks=self.automation_history_chunks(skip_entry_id=skip_entry_id, detail="lean", recent_full_count=16),
+            minimal_chunks=self.automation_history_chunks(skip_entry_id=skip_entry_id, detail="minimal", recent_full_count=6),
+            token_budget=token_budget,
+            provider_byte_budget=provider_byte_budget,
+            summary_model=AUTOMATION_SIMPLE_MODEL_BY_MODEL.get(self.automation_model, self.automation_model),
+            thread_id=self.thread_id,
+        )
+        self.automation_context_worker = context_worker
         self.update_automation_composer_state()
-        self.start_automation_preview()
 
-        def on_finished(text: str, error: str):
-            if request_serial != self.automation_request_serial or self.automation_worker is not worker:
-                worker.deleteLater()
-                return
-            self.automation_worker = None
-            self.stop_automation_preview(remove_bubble=bool(error))
+        def start_chat_worker(messages: List[Dict[str, str]]):
+            provider_model = self.effective_automation_model()
+            worker = AutomationChatWorker(
+                self.automation_manager,
+                messages,
+                provider_model,
+                self.thread_id,
+            )
+            self.automation_worker = worker
             self.update_automation_composer_state()
-            if copy_btn is not None and not self.automation_loop_active:
-                copy_btn.setEnabled(True)
-                copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
-            if error:
-                quiet_message = quiet_automation_error_message(error)
-                self.stop_automation_loop(
-                    quiet_message or "自动化循环已暂停。",
-                    ensure_manual_entry=True,
-                )
-                if "网页登录还没有准备好" in error:
-                    self.add_status_bubble("需要先完成网页登录。请使用设置里的“打开网页登录”，登录后重新发送。")
-                if (not quiet_message) or developer_error_details_enabled():
-                    styled_warning(self, "AI 自动化失败", self.automation_manager.error_with_log_hint(error))
-            else:
-                preview_bubble = self.finalize_automation_preview_bubble(text)
-                self.handle_ai_response_text(text, existing_bubble=preview_bubble)
-            worker.deleteLater()
+            self.start_automation_preview()
 
-        worker.finished_signal.connect(on_finished)
-        worker.start()
+            def on_finished(text: str, error: str):
+                if request_serial != self.automation_request_serial or self.automation_worker is not worker:
+                    worker.deleteLater()
+                    return
+                self.automation_worker = None
+                self.stop_automation_preview(remove_bubble=bool(error))
+                self.update_automation_composer_state()
+                if copy_btn is not None and not self.automation_loop_active:
+                    copy_btn.setEnabled(True)
+                    copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
+                if error:
+                    self.pending_provider_io = {
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "model": provider_model,
+                        "thread_id": self.thread_id,
+                        "messages": copy.deepcopy(messages),
+                        "response": "",
+                        "error": str(error or ""),
+                    }
+                    self.append_history({
+                        "type": "provider_io",
+                        "content": "",
+                        "provider_io": copy.deepcopy(self.pending_provider_io),
+                    })
+                    self.pending_provider_io = None
+                    quiet_message = quiet_automation_error_message(error)
+                    self.stop_automation_loop(
+                        quiet_message or "自动化循环已暂停。",
+                        ensure_manual_entry=True,
+                    )
+                    if "网页登录还没有准备好" in error:
+                        self.add_status_bubble("需要先完成网页登录。请使用设置里的“打开网页登录”，登录后重新发送。")
+                    if (not quiet_message) or developer_error_details_enabled():
+                        styled_warning(self, "AI 自动化失败", self.automation_manager.error_with_log_hint(error))
+                else:
+                    provider_io = {
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "model": provider_model,
+                        "thread_id": self.thread_id,
+                        "messages": copy.deepcopy(messages),
+                        "response": text,
+                        "error": "",
+                    }
+                    preview_bubble = self.finalize_automation_preview_bubble(text)
+                    self.handle_ai_response_text(text, existing_bubble=preview_bubble, provider_io=provider_io)
+                worker.deleteLater()
+
+            worker.finished_signal.connect(on_finished)
+            worker.start()
+
+        def on_context_status(_status: str):
+            self.add_context_compaction_notice()
+
+        def on_context_finished(serial: int, messages: List[Dict[str, str]], error: str, provider_compaction: str):
+            if serial != self.automation_request_serial or self.automation_context_worker is not context_worker:
+                context_worker.deleteLater()
+                return
+            self.automation_context_worker = None
+            self.last_automation_provider_compaction = provider_compaction or "none"
+            self.last_automation_history_compacted = provider_compaction not in {"", "none"}
+            self.update_automation_composer_state()
+            if error:
+                self.stop_automation_loop("上下文压缩失败，自动化循环已暂停。", ensure_manual_entry=True)
+                if copy_btn is not None:
+                    copy_btn.setEnabled(True)
+                    copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
+                if developer_error_details_enabled():
+                    styled_warning(self, "上下文压缩失败", self.automation_manager.error_with_log_hint(error))
+                context_worker.deleteLater()
+                return
+            start_chat_worker(messages)
+            context_worker.deleteLater()
+
+        context_worker.status_signal.connect(on_context_status)
+        context_worker.finished_signal.connect(on_context_finished)
+        context_worker.start()
 
     def update_prompt_history_entry(self, entry_id: str, full_prompt: str):
         if not entry_id:
@@ -11146,11 +11929,65 @@ class ChatPage(QWidget):
         if self.automation_enabled and not self.is_automation_busy() and not self.is_execution_running():
             QTimer.singleShot(0, self.update_automation_composer_state)
 
-    def save_history(self):
-        if self.project_root:
-            save_workspace_history(self.project_root, self.history_entries, self.thread_id)
+    def save_history(self, immediate: bool = False):
+        if not self.project_root:
+            return
+        self.history_save_dirty = True
+        if immediate:
+            self.flush_history_save(wait=True)
+            return
+        self.history_save_timer.start(650)
+
+    def flush_history_save(self, wait: bool = False):
+        if self.history_save_timer.isActive():
+            self.history_save_timer.stop()
+        if self.history_save_worker is not None and self.history_save_worker.isRunning():
+            if wait:
+                self.history_save_worker.wait(3000)
+            if self.history_save_worker is not None and self.history_save_worker.isRunning():
+                self.history_save_dirty = True
+                return
+        if not self.history_save_dirty or not self.project_root:
+            return
+        self.history_save_dirty = False
+        self.history_save_generation += 1
+        generation = self.history_save_generation
+        entries = copy.deepcopy(self.history_entries)
+        worker = HistorySaveWorker(self.project_root, self.thread_id, entries, generation)
+        self.history_save_worker = worker
+        worker.finished_signal.connect(self.on_history_save_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        if wait:
+            worker.wait(3000)
+            QApplication.processEvents()
+            if self.history_save_worker is worker and not worker.isRunning():
+                self.history_save_worker = None
+
+    def on_history_save_finished(self, generation: int, ok: bool, tmp_path: str):
+        worker = self.history_save_worker
+        if worker is not None and not worker.isRunning():
+            self.history_save_worker = None
+        current_generation = generation == self.history_save_generation
+        if ok and current_generation and self.project_root:
+            try:
+                os.makedirs(history_dir(self.project_root, self.thread_id), exist_ok=True)
+                os.replace(tmp_path, history_path(self.project_root, self.thread_id))
+            except OSError:
+                ok = False
+        elif tmp_path:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+        if not ok and current_generation:
+            logger.warning("History save failed generation=%d thread_id=%s", generation, self.thread_id)
+        if self.history_save_dirty:
+            self.history_save_timer.start(300)
 
     def load_history(self):
+        self.flush_history_save(wait=True)
         started = time.perf_counter()
         self.history_entries = load_workspace_history(self.project_root, self.thread_id)
         self.setUpdatesEnabled(False)
@@ -11336,6 +12173,11 @@ class ChatPage(QWidget):
         )
         if not ok:
             return
+        self.flush_history_save(wait=True)
+        self.history_save_generation += 1
+        self.history_save_dirty = False
+        if self.history_save_timer.isActive():
+            self.history_save_timer.stop()
         if clear_workspace_history(self.project_root, self.thread_id):
             self.history_entries = []
             self.clear_chat_widgets()
@@ -11348,6 +12190,10 @@ class ChatPage(QWidget):
             self.scroll_to_bottom()
         else:
             styled_warning(self, "清空失败", "无法删除当前工作区的 .agent_qt 缓存目录。")
+
+    def shutdown(self):
+        self.flush_history_save(wait=True)
+        self.stop_automation_preview(remove_bubble=False)
 
     def add_ai_response_frame(self, focus: bool = True, animate: bool = True, keep_visible: bool = True):
         if self.automation_enabled:
@@ -11491,6 +12337,7 @@ class ChatPage(QWidget):
         text: str,
         insert_index: Optional[int] = None,
         existing_bubble: Optional[ChatBubble] = None,
+        provider_io: Optional[Dict[str, object]] = None,
     ):
         text = (text or "").strip()
         if not text:
@@ -11532,10 +12379,13 @@ class ChatPage(QWidget):
             else:
                 self.insert_chat_widget(insert_index, ai_bubble)
             animate_widget_in(ai_bubble)
-        self.append_history({
+        history_entry = {
             "type": "ai",
             "content": display_text,
-        })
+        }
+        if isinstance(provider_io, dict):
+            history_entry["provider_io"] = copy.deepcopy(provider_io)
+        self.append_history(history_entry)
         self.stabilize_chat_scroll_after_update(scroll_state)
         QApplication.processEvents()
 
@@ -11722,7 +12572,7 @@ class ChatPage(QWidget):
         self.pending_terminal_launches = []
         log_with_changes = full_log
         if change_records:
-            log_with_changes += format_change_summary(change_records, include_diff=True)
+            log_with_changes += format_change_summary(change_records, include_diff=False)
         elif long_running_launches:
             log_with_changes += "\n\nFiles changed:\n未检测到文件改动。若命令正在底部终端继续运行，保存/生成文件后需要等待进程结束或再执行一次检查。"
         elif not log_with_changes.strip():
@@ -11862,6 +12712,10 @@ class MainWindow(QMainWindow):
     def open_chat(self, path: str):
         self.stack.setCurrentWidget(self.chat_page)
         self.chat_page.set_project(path)
+
+    def closeEvent(self, event):
+        self.chat_page.shutdown()
+        super().closeEvent(event)
 
 def main():
     app = QApplication(sys.argv)
