@@ -30,6 +30,7 @@ import signal
 import logging
 import threading
 import copy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -41,7 +42,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QSizePolicy, QGraphicsOpacityEffect, QAbstractItemView,
     QSpacerItem, QWidgetAction, QAbstractButton, QDialog, QCheckBox
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, Property
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, Property, QObject
 from PySide6.QtGui import QFont, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QKeySequence, QTextDocument, QImage
 from PySide6.QtCore import QUrl
 
@@ -60,6 +61,7 @@ _APP_SETTINGS: Optional[Dict[str, object]] = None
 _AGENT_RUNTIME_ENABLED: Optional[bool] = None
 _AUTOMATION_ENABLED: Optional[bool] = None
 _DEVELOPER_MODE_ENABLED: Optional[bool] = None
+_WECHAT_BRIDGE_ENABLED: Optional[bool] = None
 QT_WIDGET_MAX_HEIGHT = 16777215
 DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 FALLBACK_PIP_INDEXES = [
@@ -226,6 +228,207 @@ def developer_error_details_enabled() -> bool:
 
 def compact_code_blocks_by_default() -> bool:
     return not developer_error_details_enabled()
+
+
+def wechat_bridge_enabled_setting() -> bool:
+    global _WECHAT_BRIDGE_ENABLED
+    if _WECHAT_BRIDGE_ENABLED is not None:
+        return _WECHAT_BRIDGE_ENABLED
+    env_value = os.environ.get("AGENT_QT_WECHAT_BRIDGE_ENABLED", "").strip().lower()
+    if env_value:
+        _WECHAT_BRIDGE_ENABLED = env_value not in {"0", "false", "no", "off"}
+        return _WECHAT_BRIDGE_ENABLED
+    _WECHAT_BRIDGE_ENABLED = bool(load_app_settings().get("wechat_bridge_enabled", False))
+    return _WECHAT_BRIDGE_ENABLED
+
+
+def set_wechat_bridge_enabled_setting(enabled: bool):
+    global _WECHAT_BRIDGE_ENABLED
+    _WECHAT_BRIDGE_ENABLED = bool(enabled)
+    settings = load_app_settings()
+    settings["wechat_bridge_enabled"] = _WECHAT_BRIDGE_ENABLED
+    save_app_settings(settings)
+
+
+def wechat_bridge_settings() -> Dict[str, object]:
+    settings = load_app_settings()
+    raw = settings.get("wechat_bridge")
+    payload = dict(raw) if isinstance(raw, dict) else {}
+    host = str(payload.get("host") or os.environ.get("AGENT_QT_WECHAT_BRIDGE_HOST", "127.0.0.1")).strip() or "127.0.0.1"
+    try:
+        port = int(payload.get("port") or os.environ.get("AGENT_QT_WECHAT_BRIDGE_PORT", "8798"))
+    except (TypeError, ValueError):
+        port = 8798
+    port = max(1, min(65535, port))
+    api_key = str(payload.get("api_key") or os.environ.get("AGENT_QT_WECHAT_BRIDGE_API_KEY", "")).strip()
+    silent = bool(payload.get("silent", True))
+    timeout = payload.get("timeout_seconds", 900)
+    try:
+        timeout = int(timeout)
+    except (TypeError, ValueError):
+        timeout = 900
+    timeout = max(5, min(3600, timeout))
+    return {
+        "host": host,
+        "port": port,
+        "api_key": api_key,
+        "silent": silent,
+        "timeout_seconds": timeout,
+    }
+
+
+def wechat_connector_root() -> str:
+    return os.path.join(AGENT_HOME_DIR, "wechat_connector")
+
+
+def wechat_connector_script_path() -> str:
+    return os.path.join(wechat_connector_root(), "agent-qt-wechat.mjs")
+
+
+def write_wechat_connector_files() -> str:
+    root = wechat_connector_root()
+    os.makedirs(root, exist_ok=True)
+    package_json = {
+        "type": "module",
+        "private": True,
+        "dependencies": {
+            "weixin-agent-sdk": "^0.1.0",
+        },
+    }
+    with open(os.path.join(root, "package.json"), "w", encoding="utf-8") as f:
+        json.dump(package_json, f, ensure_ascii=False, indent=2)
+    script = r'''import { login, start } from "weixin-agent-sdk";
+
+const bridgeUrl = (process.env.AGENT_QT_WECHAT_BRIDGE_URL || "http://127.0.0.1:8798").replace(/\/$/, "");
+const apiKey = process.env.AGENT_QT_WECHAT_API_KEY || "";
+const model = process.env.AGENT_QT_WECHAT_MODEL || "agent-qt-wechat";
+
+async function askAgentQt(req) {
+  const text = String(req.text || "").trim();
+  if (!text && !req.media) {
+    return { text: "收到空消息。" };
+  }
+  const messages = [
+    {
+      role: "user",
+      content: text || `[微信${req.media?.type || "媒体"}消息] ${req.media?.fileName || req.media?.filePath || ""}`,
+    },
+  ];
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  const resp = await fetch(`${bridgeUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      user: req.conversationId || "wechat",
+      thread_id: req.conversationId || "wechat",
+      silent: true,
+      messages,
+    }),
+  });
+  const payload = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    return { text: `Agent Qt 调用失败：${payload.error || payload.detail || resp.statusText}` };
+  }
+  const reply = payload?.choices?.[0]?.message?.content || payload.reply || payload.text || "已处理。";
+  return { text: String(reply) };
+}
+
+const agent = { chat: askAgentQt };
+const command = process.argv[2] || "start";
+
+if (command === "login") {
+  console.log("请用微信扫描下面的二维码完成登录。");
+  await login();
+  console.log("微信登录完成。");
+} else if (command === "start") {
+  console.log(`Agent Qt 微信机器人已启动，连接到 ${bridgeUrl}`);
+  const bot = start(agent);
+  await bot.wait();
+} else {
+  console.log("用法: node agent-qt-wechat.mjs login|start");
+  process.exit(1);
+}
+'''
+    with open(wechat_connector_script_path(), "w", encoding="utf-8") as f:
+        f.write(script)
+    return root
+
+
+def wechat_connector_command(action: str, bridge_url: str, api_key: str = "") -> str:
+    root = write_wechat_connector_files()
+    script = wechat_connector_script_path()
+    action = "login" if action == "login" else "start"
+    if platform.system() == "Windows":
+        return POWERSHELL_COMMAND_PREFIX + f"""$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$Root = {ps_quote(root)}
+Set-Location -LiteralPath $Root
+Write-Host "[Agent Qt] 微信连接器"
+Write-Host "目录: $Root"
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) {{
+    throw "未找到 Node.js。微信连接器需要 Node.js 22+。请先安装 Node.js 后重试。"
+}}
+$nodeMajor = [int]((& node -p "process.versions.node.split('.')[0]").Trim())
+if ($nodeMajor -lt 22) {{
+    throw "当前 Node.js 版本低于 22。微信连接器需要 Node.js 22+。"
+}}
+if (-not (Test-Path -LiteralPath (Join-Path $Root 'node_modules'))) {{
+    Write-Host "首次使用，安装微信连接器依赖..."
+    npm install
+    if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+}}
+$env:AGENT_QT_WECHAT_BRIDGE_URL = {ps_quote(bridge_url)}
+$env:AGENT_QT_WECHAT_API_KEY = {ps_quote(api_key)}
+$env:AGENT_QT_WECHAT_MODEL = 'agent-qt-wechat'
+node {ps_quote(script)} {action}
+"""
+    return f"""set -e
+cd {shlex.quote(root)}
+echo "[Agent Qt] 微信连接器"
+echo "目录: {root}"
+if ! command -v node >/dev/null 2>&1; then
+  echo "未找到 Node.js。微信连接器需要 Node.js 22+。请先安装 Node.js 后重试。"
+  exit 1
+fi
+NODE_MAJOR="$(node -p "process.versions.node.split('.')[0]")"
+if [ "$NODE_MAJOR" -lt 22 ]; then
+  echo "当前 Node.js 版本低于 22。微信连接器需要 Node.js 22+。"
+  exit 1
+fi
+if [ ! -d node_modules ]; then
+  echo "首次使用，安装微信连接器依赖..."
+  npm install
+fi
+export AGENT_QT_WECHAT_BRIDGE_URL={shlex.quote(bridge_url)}
+export AGENT_QT_WECHAT_API_KEY={shlex.quote(api_key)}
+export AGENT_QT_WECHAT_MODEL=agent-qt-wechat
+node {shlex.quote(script)} {action}
+"""
+
+
+def set_wechat_bridge_settings(payload: Dict[str, object]):
+    settings = load_app_settings()
+    current = dict(settings.get("wechat_bridge") or {})
+    for key in ("host", "port", "api_key", "silent", "timeout_seconds"):
+        if key in payload:
+            current[key] = payload[key]
+    settings["wechat_bridge"] = current
+    save_app_settings(settings)
+
+
+def parse_boolish(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
 
 
 def env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -756,19 +959,19 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 
 ## 输出协议
 - 自然问答或展示代码时，正常使用 Markdown fenced 代码块即可。
-- 需要本地执行时，只输出一个 Markdown fenced `{command_block_lang}` 命令块。
+- 需要本地执行时，只输出一个 Markdown fenced `{command_block_lang}` 命令块；命令块前后不要写解释、计划或总结。
 - 命令块只写当前平台命令，不写 JSON/tool_calls，不拆成多个命令块。{command_rules}
 - 替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。
 - 命令块保持短小；不要在命令块内直接嵌入超过 10 行的文件正文。
 - 代码块首行可用本语言注释写摘要，供界面折叠展示：如 `# <desc 写入配置>`、`// <desc 前端逻辑>`、`/* <desc 样式> */`、`<!-- <desc SVG 图像> -->`；没有也可以，界面会自动截断首行生成摘要。
 - 不要在非写文件场景使用替换符；不要把替换符写进文件内容代码块。
 - 工作区根目录：{project_root}。创建/修改用户项目文件时只能写到这里；不要写到 Agent Qt 缓存目录。
-- 先建目录再写文件；文件内容内部按项目语义使用相对路径或 URL（如 HTML 引用 CSS/JS）。
-- 常驻命令会自动进入后台终端，不要加 `&`/`nohup`。
+- 先建目录再写文件；项目中脚本文件调用以及终端中文件生成与访问使用绝对路径，代码内可以使用相对路径引用同级文件或子级文件。
+- 常驻命令会自动进入后台终端，不要加 `&`/`nohup`，不要自己写 pid 文件。启动常驻命令后本轮结束，下一轮从执行结果里的 `Terminal processes:` 摘要获取 pid 再查询控制台输出。
 - 不输出备用方案；自己选择一个最高把握路径。
 - 自动化循环完成时只回复 `{done_marker}` 加简短总结；未完成则继续给下一轮完整命令块。
 - Agent Qt 会给文件变更生成 internal git 快照/commit；需要 diff 细节时可按摘要里的 repo/commit 查询。
-- 后台终端状态在 JSON 索引文件中，不是 shell 命令，也不是项目目录：{terminal_registry_path}；日志路径见索引或终端摘要里的 log_path。
+- 查看后台终端输出只用这一种方式：`curl -s '{terminal_logs_url}?pid=xxx'`。把 `xxx` 换成终端摘要里的 pid。
 
 ## 回答风格
 - 不展开隐藏思考链；只给关键判断、验证依据、最终方案和必要指令。
@@ -795,6 +998,7 @@ WORKSPACE_STATE_FILE_NAME = "workspace.json"
 DEFAULT_THREAD_ID = "default"
 HISTORY_VERSION = 1
 TERMINAL_COMPLETED_HISTORY_LIMIT = 50
+COMMAND_BACKGROUND_TIMEOUT_SECONDS = env_int("AGENT_QT_COMMAND_BACKGROUND_TIMEOUT_SECONDS", 10, minimum=3)
 
 FORBIDDEN = [
     "rm -rf /", "sudo rm", "sudo reboot", "shutdown",
@@ -2033,9 +2237,37 @@ def split_cd_chain(line: str) -> List[str]:
 def normalize_cd_target(raw_target: str, cwd: str) -> str:
     target = raw_target.strip().strip('"').strip("'")
     target = os.path.expandvars(os.path.expanduser(target))
-    if not os.path.isabs(target):
+    windows_abs = bool(re.match(r"^[a-zA-Z]:[\\/]", target) or target.startswith("\\\\"))
+    if not os.path.isabs(target) and not windows_abs:
         target = os.path.join(cwd, target)
     return os.path.normpath(target)
+
+
+def plain_cd_target(cmd: str, cwd: str) -> Optional[str]:
+    text = strip_shell_command_marker(cmd).strip()
+    if not text or "\n" in text:
+        return None
+    if any(separator in text for separator in ("&&", "||", ";", "|", " &")) or text.endswith("&"):
+        return None
+    try:
+        tokens = shlex.split(text, posix=False)
+    except ValueError:
+        return None
+    if len(tokens) < 2:
+        return None
+    command = tokens[0].strip().lower()
+    target_tokens = tokens[1:]
+    if command in {"cd", "chdir"}:
+        if platform.system() == "Windows" and target_tokens and target_tokens[0].lower() == "/d":
+            target_tokens = target_tokens[1:]
+    elif command in {"set-location", "sl", "push-location"}:
+        if target_tokens and target_tokens[0].lower() in {"-literalpath", "-path"}:
+            target_tokens = target_tokens[1:]
+    else:
+        return None
+    if len(target_tokens) != 1:
+        return None
+    return normalize_cd_target(target_tokens[0], cwd)
 
 def has_unclosed_shell_quote(text: str) -> bool:
     """判断 shell 命令是否还有未闭合的单/双引号。"""
@@ -2104,6 +2336,9 @@ def first_shell_segment(cmd: str) -> str:
 
 
 def is_observation_command(cmd: str) -> bool:
+    text = strip_shell_command_marker(cmd).lower()
+    if "127.0.0.1:8798/terminallogs" in text or "localhost:8798/terminallogs" in text:
+        return True
     first = first_shell_segment(cmd).lower()
     if not first:
         return False
@@ -2125,6 +2360,7 @@ def is_observation_command(cmd: str) -> bool:
         "stat ",
         "wc ",
         "jq ",
+        "curl ",
         "python - <<",
         "python3 - <<",
         "start-sleep ",
@@ -2133,7 +2369,7 @@ def is_observation_command(cmd: str) -> bool:
         "get-process ",
         "where-object ",
     )
-    return first in {"sleep", "ps", "cat", "tail", "grep", "rg"} or first.startswith(observation_prefixes)
+    return first in {"sleep", "ps", "cat", "tail", "grep", "rg", "curl"} or first.startswith(observation_prefixes)
 
 
 def command_kind(cmd: str) -> str:
@@ -2229,55 +2465,8 @@ def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
     command_text = resolve_all_placeholders(command_text, blocks)
     if command_lang == "powershell":
         return [POWERSHELL_COMMAND_PREFIX + command_text.strip()] if command_text.strip() else []
-    lines = command_text.strip().splitlines()
-    cmds = []
-    i = 0
-    while i < len(lines):
-        raw_line = lines[i].rstrip()
-        line = raw_line.strip()
-        i += 1
-        if not line or line.startswith('#') or line.startswith('//'):
-            continue
-        if line.startswith('$ '):
-            line = line[2:]
-        if is_interactive_shell_command(line):
-            continue
-
-        command_lines = [line]
-        compound_end = shell_compound_end_token(line)
-        if compound_end:
-            depth = 1
-            while i < len(lines) and depth > 0:
-                compound_line = lines[i].rstrip()
-                command_lines.append(compound_line)
-                i += 1
-                stripped_compound = compound_line.strip()
-                if not stripped_compound or stripped_compound.startswith("#"):
-                    continue
-                nested_end = shell_compound_end_token(stripped_compound)
-                if nested_end == compound_end:
-                    depth += 1
-                if shell_compound_starts_with_end(stripped_compound, compound_end):
-                    depth -= 1
-        for tag in find_heredoc_tags(line):
-            while i < len(lines):
-                heredoc_line = lines[i].rstrip()
-                command_lines.append(heredoc_line)
-                i += 1
-                if heredoc_line.strip() == tag:
-                    break
-
-        while not find_heredoc_tags(command_lines[0]) and has_unclosed_shell_quote('\n'.join(command_lines)) and i < len(lines):
-            continuation_line = lines[i].rstrip()
-            command_lines.append(continuation_line)
-            i += 1
-
-        command = '\n'.join(command_lines)
-        if len(command_lines) == 1:
-            cmds.extend(split_cd_chain(command))
-        else:
-            cmds.append(command)
-    return cmds
+    command_text = command_text.strip()
+    return [command_text] if command_text else []
 
 def is_long_running(cmd: str) -> bool:
     cmd = strip_shell_command_marker(cmd)
@@ -2459,10 +2648,17 @@ def run_shell_command_capture(cmd: str, cwd: str, timeout: int, project_root: st
     elif should_use_temp_shell_script(cmd):
         script_path = write_temp_shell_script(cmd)
     shell, args = shell_launch_for_command(cmd, script_path=script_path)
+    terminal_id = ""
+    log_path = ""
+    if project_root:
+        terminal_id, log_path = command_log_path(project_root, display_name or "timeout-command")
+    env = agent_runtime_env(create=False)
+    if terminal_id:
+        env["AGENT_QT_TERMINAL_ID"] = terminal_id
     process = subprocess.Popen(
         [shell, *args],
         cwd=cwd,
-        env=agent_runtime_env(create=False),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -2482,10 +2678,14 @@ def run_shell_command_capture(cmd: str, cwd: str, timeout: int, project_root: st
         captured = exc.output or ""
         if isinstance(captured, bytes):
             captured = decode_process_output(captured)
-        terminal_id, log_path = command_log_path(project_root, display_name or "timeout-command")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(f"$ {strip_shell_command_marker(cmd)}\n# cwd: {cwd}\n# pid: {process.pid}\n")
+            f.write(
+                f"$ {strip_shell_command_marker(cmd)}\n"
+                f"# cwd: {cwd}\n"
+                f"# pid: {process.pid}\n"
+                f"# terminal_id: {terminal_id}\n"
+            )
             if captured:
                 f.write(str(captured))
         thread = threading.Thread(
@@ -3014,6 +3214,7 @@ def format_terminal_launch_summary(launches: List[Dict[str, object]]) -> str:
         f"{len(launches)} terminal process(es) launched or tracked.",
     ]
     for item in launches:
+        launch_text = re.sub(r"\s+", " ", strip_shell_command_marker(str(item.get("cmd") or ""))).strip()
         lines.append(
             " - "
             f"id={item.get('id') or 'unknown'}  "
@@ -3022,11 +3223,9 @@ def format_terminal_launch_summary(launches: List[Dict[str, object]]) -> str:
             f"persistent={bool(item.get('persistent'))}  "
             f"launch_reason={item.get('launch_reason') or 'unknown'}  "
             f"command_kind={item.get('command_kind') or 'unknown'}  "
-            f"registry_json={item.get('registry_path') or 'unavailable'}  "
-            f"log={item.get('log_path') or 'unavailable'}  "
-            f"name={item.get('name') or ''}"
+            f"启动命令={truncate_middle(launch_text, 180) or 'unavailable'}"
         )
-    lines.append("这些只是终端索引摘要；registry_json 是 JSON 文件路径，不是命令。需要持续日志或关闭进程时，请按 log_path/PID 自主查询或处理。")
+    lines.append("查看该后台终端输出：curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'，把 xxx 换成上面的 pid。")
     return "\n".join(lines)
 
 
@@ -3358,7 +3557,7 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 请判断下一步：
 - 已完成：只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。
 - 未完成：输出一个完整且短小的 ```{command_block_lang} 命令块；写入超过 10 行的文件内容时，必须用带编号替换符引用同一回复里的同语言 fenced 文件内容。
-- 后台安装/构建/拉取不要当作完成；先读取终端摘要中的 log_path/PID/registry_json 判断状态，必要时 sleep 后查日志。
+- 后台安装/构建/拉取不要当作完成；启动常驻命令时不要加 `&`/`nohup`，等执行结果给出 `Terminal processes:` 摘要后，再使用 `curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'` 查询控制台输出。
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
 """
 
@@ -4643,7 +4842,9 @@ class ManagedProcess(QWidget):
         self.process = QProcess()
         self.process.setWorkingDirectory(self.cwd)
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self.process.setProcessEnvironment(agent_qprocess_environment(create=False))
+        env = agent_qprocess_environment(create=False)
+        env.insert("AGENT_QT_TERMINAL_ID", self.terminal_id)
+        self.process.setProcessEnvironment(env)
         self.process.readyReadStandardOutput.connect(self.read_output)
         self.process.started.connect(self.on_started)
         self.process.errorOccurred.connect(self.on_error)
@@ -4716,13 +4917,23 @@ class ManagedProcess(QWidget):
         except (RuntimeError, TypeError, ValueError):
             self.pid = 0
         if self.interactive:
-            text = f"# shell: {self.name}\n# cwd: {self.cwd}\n# pid: {self.process_id()}\n"
+            text = (
+                f"# shell: {self.name}\n"
+                f"# cwd: {self.cwd}\n"
+                f"# pid: {self.process_id()}\n"
+                f"# terminal_id: {self.terminal_id}\n"
+            )
             self.output.append_process_text(text)
             self.append_log_file(text)
             self.output.set_input_enabled(True)
         else:
             self.output.set_input_enabled(False)
-            text = f"$ {strip_shell_command_marker(self.cmd)}\n# cwd: {self.cwd}\n# pid: {self.process_id()}\n"
+            text = (
+                f"$ {strip_shell_command_marker(self.cmd)}\n"
+                f"# cwd: {self.cwd}\n"
+                f"# pid: {self.process_id()}\n"
+                f"# terminal_id: {self.terminal_id}\n"
+            )
             self.output.append_process_text(text)
             self.append_log_file(text)
 
@@ -5116,6 +5327,52 @@ class TerminalPanel(QWidget):
         except OSError:
             pass
 
+    def clipped_terminal_output(self, text: str, max_lines: int = 1000) -> str:
+        lines = str(text or "").splitlines()
+        if len(lines) <= max_lines:
+            return str(text or "")
+        omitted = len(lines) - max_lines
+        return "\n".join(lines[:500] + [f"... omitted {omitted} lines ..."] + lines[-500:])
+
+    def terminal_console_entries(self, grep_text: str = "", pid: int = 0) -> List[Dict[str, object]]:
+        needle = str(grep_text or "").strip().lower()
+        try:
+            pid = int(pid or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        entries: List[Dict[str, object]] = []
+        for proc in list(self.processes):
+            try:
+                meta = self.process_registry_entry(proc)
+                if pid and int(meta.get("pid") or 0) != pid:
+                    continue
+                text = proc.output.toPlainText()
+                haystack = "\n".join([
+                    str(meta.get("cmd") or ""),
+                    str(meta.get("cwd") or ""),
+                    text,
+                ]).lower()
+                if needle and needle not in haystack:
+                    continue
+            except RuntimeError:
+                continue
+            meta["output"] = self.clipped_terminal_output(text)
+            entries.append(meta)
+        return entries
+
+    def terminal_console_text(self, grep_text: str = "", pid: int = 0) -> str:
+        entries = self.terminal_console_entries(grep_text, pid=pid)
+        if not entries:
+            if pid:
+                return f"No terminal processes matched pid: {pid}"
+            return f"No terminal processes matched grep: {grep_text or '*'}"
+        parts: List[str] = []
+        for item in entries:
+            parts.append("===== terminal console =====")
+            output = str(item.get("output") or "").rstrip()
+            parts.append(output or "(no console output)")
+        return "\n".join(parts).rstrip() + "\n"
+
     def terminal_title(self, cwd: str, index: Optional[int] = None) -> str:
         root = self.project_root or cwd
         name = os.path.basename(os.path.normpath(root)) or "terminal"
@@ -5329,9 +5586,13 @@ class ExecuteWorker(QThread):
         cwd = self.cwd
         outputs = []
         for i, cmd in enumerate(self.commands, 1):
+            if self.isInterruptionRequested():
+                outputs.append(f"[{i}] ⏹️ 已停止后续命令")
+                self.output_signal.emit(outputs[-1])
+                break
             display_cmd = command_for_log(cmd)
-            if cmd.startswith('cd '):
-                target = normalize_cd_target(cmd[3:], cwd)
+            target = plain_cd_target(cmd, cwd)
+            if target is not None:
                 if os.path.isdir(target):
                     cwd = target
                     outputs.append(f"[{i}] 📂 {display_cmd}\n✅ → {cwd}")
@@ -5361,7 +5622,13 @@ class ExecuteWorker(QThread):
                 self.output_signal.emit(outputs[-1])
                 continue
             try:
-                r = run_shell_command_capture(cmd, cwd, timeout=30, project_root=self.cwd, display_name=display_cmd.splitlines()[0][:40])
+                r = run_shell_command_capture(
+                    cmd,
+                    cwd,
+                    timeout=COMMAND_BACKGROUND_TIMEOUT_SECONDS,
+                    project_root=self.cwd,
+                    display_name=display_cmd.splitlines()[0][:40],
+                )
                 out = r.stdout.strip()
                 if r.stderr.strip():
                     out += "\n" + r.stderr.strip()
@@ -6451,6 +6718,266 @@ class HistorySaveWorker(QThread):
         except OSError:
             ok = False
         self.finished_signal.emit(self.generation, ok, tmp_path)
+
+
+def wechat_strip_markdown_code(text: str, keep_summary: bool = False) -> str:
+    text = str(text or "")
+
+    def replace(match: re.Match) -> str:
+        lang = (match.group(1) or "code").strip() or "code"
+        code = match.group(2) or ""
+        summary = code_block_summary(lang, code)
+        return f"[{lang} 代码块：{summary}]" if keep_summary else ""
+
+    text = re.sub(r"```([^\n`]*)\n(.*?)```", replace, text, flags=re.S)
+    text = re.sub(r"<!--\s*[A-Za-z0-9_ -]+ block \d+\s*-->", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def wechat_history_reply(entries: List[Dict[str, object]], silent: bool = True) -> str:
+    relevant = [entry for entry in entries if isinstance(entry, dict) and entry.get("type") in {"ai", "result", "terminal_result"}]
+    if not relevant:
+        return "已处理。"
+    result_parts: List[str] = []
+    conclusion_parts: List[str] = []
+    for entry in relevant[-8:]:
+        entry_type = str(entry.get("type") or "")
+        content = str(entry.get("context_content") or entry.get("content") or "").strip()
+        if not content:
+            continue
+        if entry_type in {"result", "terminal_result"}:
+            result_parts.append(text_within_utf8_budget(content, 2500))
+        elif entry_type == "ai":
+            conclusion_parts.append(wechat_strip_markdown_code(content, keep_summary=not silent))
+    parts: List[str] = []
+    if result_parts:
+        parts.append("执行结果：\n" + result_parts[-1])
+    if conclusion_parts:
+        parts.append("结论：\n" + conclusion_parts[-1])
+    return "\n\n".join(part for part in parts if part.strip()).strip() or "已处理。"
+
+
+class WeChatBridge(QObject):
+    request_signal = Signal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.server: Optional[ThreadingHTTPServer] = None
+        self.thread: Optional[threading.Thread] = None
+        self.host = ""
+        self.port = 0
+        self.api_key = ""
+        self.timeout_seconds = 900
+        self.pending: Dict[str, Dict[str, object]] = {}
+        self.lock = threading.Lock()
+
+    def url(self) -> str:
+        if not self.server:
+            cfg = wechat_bridge_settings()
+            return f"http://{cfg['host']}:{cfg['port']}"
+        return f"http://{self.host}:{self.port}"
+
+    def is_running(self) -> bool:
+        return self.server is not None
+
+    def start(self) -> str:
+        self.stop()
+        cfg = wechat_bridge_settings()
+        self.host = str(cfg["host"])
+        self.port = int(cfg["port"])
+        self.api_key = str(cfg.get("api_key") or "")
+        self.timeout_seconds = int(cfg.get("timeout_seconds") or 900)
+        bridge = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, _format, *args):
+                return
+
+            def _json_body(self) -> dict:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if length <= 0:
+                    return {}
+                raw = self.rfile.read(length)
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                    return payload if isinstance(payload, dict) else {"text": str(payload)}
+                except Exception:
+                    return {"text": raw.decode("utf-8", errors="replace")}
+
+            def _authorized(self) -> bool:
+                if not bridge.api_key:
+                    return True
+                header = self.headers.get("Authorization", "")
+                token = self.headers.get("X-Agent-Qt-Key", "")
+                return header == f"Bearer {bridge.api_key}" or token == bridge.api_key
+
+            def _send(self, status: int, payload: dict):
+                raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def _send_text(self, status: int, text: str):
+                raw = str(text or "").encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                if not self._authorized():
+                    self._send(401, {"ok": False, "error": "unauthorized"})
+                    return
+                parsed = urllib.parse.urlparse(self.path)
+                path = parsed.path
+                query = urllib.parse.parse_qs(parsed.query)
+                if path in {"/", "/health"}:
+                    self._send(200, {"ok": True, "status": "ok", "service": "agent-qt-wechat", "url": bridge.url()})
+                    return
+                if path in {"/terminals", "/api/terminals"}:
+                    self._send(200, bridge.dispatch({
+                        "action": "terminals",
+                        "pid": (query.get("pid") or ["0"])[0],
+                        "grep": (query.get("grep") or query.get("q") or [""])[0],
+                    }, wait=True))
+                    return
+                if path in {"/terminallogs", "/terminals/text", "/api/terminals/text"}:
+                    result = bridge.dispatch({
+                        "action": "terminals_text",
+                        "pid": (query.get("pid") or ["0"])[0],
+                        "grep": (query.get("grep") or query.get("q") or [""])[0],
+                    }, wait=True)
+                    self._send_text(200 if result.get("ok") else 500, str(result.get("text") or result.get("error") or ""))
+                    return
+                if path in {"/threads", "/conversations"}:
+                    self._send(200, bridge.dispatch({"action": "threads"}, wait=True))
+                    return
+                if path == "/state":
+                    self._send(200, bridge.dispatch({"action": "state"}, wait=True))
+                    return
+                if path == "/provider":
+                    self._send(200, bridge.dispatch({"action": "provider"}, wait=True))
+                    return
+                if path == "/v1/models":
+                    self._send(200, {"object": "list", "data": [{"id": "agent-qt-wechat", "object": "model"}]})
+                    return
+                self._send(404, {"ok": False, "error": "not_found"})
+
+            def do_POST(self):
+                if not self._authorized():
+                    self._send(401, {"ok": False, "error": "unauthorized"})
+                    return
+                path = urllib.parse.urlparse(self.path).path
+                payload = self._json_body()
+                if path == "/v1/chat/completions":
+                    messages = payload.get("messages") if isinstance(payload, dict) else []
+                    text = ""
+                    if isinstance(messages, list):
+                        for message in reversed(messages):
+                            if isinstance(message, dict) and str(message.get("role") or "") == "user":
+                                content = message.get("content")
+                                text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+                                break
+                    if not text:
+                        text = str(payload.get("prompt") or payload.get("text") or "")
+                    result = bridge.dispatch({
+                        "action": "message",
+                        "text": text,
+                        "silent": payload.get("silent", True),
+                        "thread_id": payload.get("user") or payload.get("thread_id") or "",
+                    }, wait=True)
+                    reply = str(result.get("reply") or result.get("text") or result.get("error") or "")
+                    status = 200 if result.get("ok") else 500
+                    self._send(status, {
+                        "id": "chatcmpl-" + uuid.uuid4().hex,
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": str(payload.get("model") or "agent-qt-wechat"),
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": reply},
+                            "finish_reason": "stop" if result.get("ok") else "error",
+                        }],
+                    })
+                    return
+                if path in {"/message", "/wechat/message", "/api/message", "/send"}:
+                    payload["action"] = "message"
+                    self._send(200, bridge.dispatch(payload, wait=True))
+                    return
+                if path in {"/stop", "/wechat/stop", "/api/stop"}:
+                    self._send(200, bridge.dispatch({"action": "stop"}, wait=True))
+                    return
+                if path in {"/threads/select", "/conversation/select"}:
+                    payload["action"] = "select_thread"
+                    self._send(200, bridge.dispatch(payload, wait=True))
+                    return
+                if path in {"/threads/new", "/conversation/new"}:
+                    payload["action"] = "new_thread"
+                    self._send(200, bridge.dispatch(payload, wait=True))
+                    return
+                self._send(404, {"ok": False, "error": "not_found"})
+
+        try:
+            self.server = ThreadingHTTPServer((self.host, self.port), Handler)
+        except OSError as exc:
+            self.server = None
+            raise RuntimeError(f"微信 Bridge 启动失败：{exc}") from exc
+        self.thread = threading.Thread(target=self.server.serve_forever, name="AgentQtWeChatBridge", daemon=True)
+        self.thread.start()
+        return self.url()
+
+    def stop(self):
+        server = self.server
+        self.server = None
+        if server is not None:
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
+        with self.lock:
+            pending = list(self.pending.values())
+            self.pending.clear()
+        for item in pending:
+            item["response"] = {"ok": False, "error": "wechat_bridge_stopped"}
+            event = item.get("event")
+            if isinstance(event, threading.Event):
+                event.set()
+
+    def dispatch(self, payload: dict, wait: bool = True) -> dict:
+        request_id = uuid.uuid4().hex
+        event = threading.Event()
+        payload = dict(payload or {})
+        payload["request_id"] = request_id
+        with self.lock:
+            self.pending[request_id] = {"event": event, "response": None}
+        self.request_signal.emit(payload)
+        if not wait:
+            return {"ok": True, "request_id": request_id}
+        if not event.wait(self.timeout_seconds):
+            with self.lock:
+                self.pending.pop(request_id, None)
+            return {"ok": False, "request_id": request_id, "error": "timeout"}
+        with self.lock:
+            item = self.pending.pop(request_id, None)
+        response = (item or {}).get("response") if isinstance(item, dict) else None
+        return response if isinstance(response, dict) else {"ok": False, "request_id": request_id, "error": "empty_response"}
+
+    def finish_request(self, request_id: str, response: dict):
+        if not request_id:
+            return
+        with self.lock:
+            item = self.pending.get(request_id)
+            if not item:
+                return
+            item["response"] = dict(response or {})
+            event = item.get("event")
+        if isinstance(event, threading.Event):
+            event.set()
 
 
 class MarkdownRenderWorker(QThread):
@@ -8828,6 +9355,11 @@ class ChatPage(QWidget):
         self.result_bubble: Optional[ExecutionLogPanel] = None
         self.worker: Optional[ExecuteWorker] = None
         self.automation_manager = AutomationProviderManager()
+        self.wechat_bridge = WeChatBridge(self)
+        self.wechat_bridge.request_signal.connect(self.handle_wechat_bridge_request)
+        self.wechat_active_request_id = ""
+        self.wechat_active_start_index = 0
+        self.wechat_active_silent = True
         self.automation_enabled = automation_enabled_setting()
         self.automation_model = AUTOMATION_DEFAULT_MODEL
         self.automation_context_mode = automation_context_mode_setting()
@@ -8887,6 +9419,10 @@ class ChatPage(QWidget):
         self.chat_column_width_ratio = 0.94
         self.user_bubble_width_ratio = 0.75
         self.setup_ui()
+        if wechat_bridge_enabled_setting():
+            QTimer.singleShot(0, self.start_wechat_bridge_quietly)
+        else:
+            QTimer.singleShot(0, self.start_console_bridge_quietly)
 
     def check_ui_heartbeat(self):
         now = time.perf_counter()
@@ -9470,6 +10006,180 @@ class ChatPage(QWidget):
     def is_execution_running(self) -> bool:
         return bool(self.worker and self.worker.isRunning())
 
+    def handle_wechat_bridge_request(self, payload: dict):
+        request_id = str((payload or {}).get("request_id") or "")
+        action = str((payload or {}).get("action") or "").strip().lower()
+        try:
+            if action in {"state", "status"}:
+                self.wechat_bridge.finish_request(request_id, {
+                    "ok": True,
+                    "project_root": self.project_root,
+                    "thread_id": self.thread_id,
+                    "busy": self.is_automation_busy() or self.is_execution_running(),
+                    "automation_enabled": self.automation_enabled,
+                    "wechat_bridge": self.wechat_bridge.url(),
+                })
+                return
+            if action in {"provider"}:
+                self.wechat_bridge.finish_request(request_id, {"ok": True, **self.provider_info_payload()})
+                return
+            if action in {"terminals", "terminal_list"}:
+                grep_text = str((payload or {}).get("grep") or (payload or {}).get("q") or "").strip()
+                try:
+                    pid = int((payload or {}).get("pid") or 0)
+                except (TypeError, ValueError):
+                    pid = 0
+                self.wechat_bridge.finish_request(request_id, {
+                    "ok": True,
+                    "pid": pid,
+                    "grep": grep_text,
+                    "terminals": self.terminal_panel.terminal_console_entries(grep_text, pid=pid),
+                })
+                return
+            if action in {"terminals_text", "terminal_text"}:
+                grep_text = str((payload or {}).get("grep") or (payload or {}).get("q") or "").strip()
+                try:
+                    pid = int((payload or {}).get("pid") or 0)
+                except (TypeError, ValueError):
+                    pid = 0
+                self.wechat_bridge.finish_request(request_id, {
+                    "ok": True,
+                    "pid": pid,
+                    "grep": grep_text,
+                    "text": self.terminal_panel.terminal_console_text(grep_text, pid=pid),
+                })
+                return
+            if action in {"threads", "conversations"}:
+                self.wechat_bridge.finish_request(request_id, {
+                    "ok": True,
+                    "active_thread_id": self.thread_id,
+                    "threads": normalize_threads(self.threads),
+                })
+                return
+            if action == "select_thread":
+                if not self.project_root:
+                    raise RuntimeError("尚未打开工作区。")
+                thread_id = safe_thread_id(str((payload or {}).get("thread_id") or (payload or {}).get("id") or ""))
+                if not thread_id:
+                    raise RuntimeError("缺少 thread_id。")
+                if self.is_automation_busy() or self.is_execution_running():
+                    raise RuntimeError("当前还有任务在运行，无法切换会话。")
+                if not any(str(thread.get("id")) == thread_id for thread in normalize_threads(self.threads)):
+                    raise RuntimeError(f"会话不存在：{thread_id}")
+                self.switch_thread(thread_id)
+                self.wechat_bridge.finish_request(request_id, {"ok": True, "active_thread_id": self.thread_id})
+                return
+            if action == "new_thread":
+                if not self.project_root:
+                    raise RuntimeError("尚未打开工作区。")
+                if self.is_automation_busy() or self.is_execution_running():
+                    raise RuntimeError("当前还有任务在运行，无法新建会话。")
+                title = str((payload or {}).get("title") or (payload or {}).get("name") or "微信会话").strip() or "微信会话"
+                self.threads = load_workspace_threads(self.project_root)
+                thread = create_workspace_thread(self.project_root, self.threads)
+                thread["title"] = title
+                rename_workspace_thread(self.project_root, str(thread.get("id") or ""), title, load_workspace_threads(self.project_root))
+                self.threads = load_workspace_threads(self.project_root)
+                self.thread_id = str(thread.get("id", DEFAULT_THREAD_ID))
+                save_last_thread_id(self.project_root, self.thread_id)
+                self.sidebar.set_threads(self.threads, self.thread_id)
+                self.load_history()
+                self.wechat_bridge.finish_request(request_id, {"ok": True, "thread": thread, "active_thread_id": self.thread_id})
+                return
+            if action == "stop":
+                if self.is_automation_busy() or self.is_execution_running():
+                    self.cancel_automation_request()
+                    if self.is_execution_running() and self.worker is not None:
+                        self.worker.requestInterruption()
+                    self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": "已发送停止指令。"})
+                else:
+                    self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": "当前没有正在运行的任务。"})
+                return
+            if action == "message":
+                self.start_wechat_message_request(request_id, payload or {})
+                return
+            raise RuntimeError(f"未知 action：{action or '(empty)'}")
+        except Exception as exc:
+            self.wechat_bridge.finish_request(request_id, {"ok": False, "error": str(exc)})
+
+    def start_wechat_message_request(self, request_id: str, payload: dict):
+        text = str(
+            payload.get("text")
+            or payload.get("content")
+            or payload.get("message")
+            or payload.get("query")
+            or ""
+        ).strip()
+        if not text:
+            raise RuntimeError("缺少消息内容。")
+        if not self.project_root:
+            raise RuntimeError("尚未打开工作区。")
+        command = text.strip()
+        if command == "/stop":
+            self.handle_wechat_bridge_request({"request_id": request_id, "action": "stop"})
+            return
+        if command in {"/threads", "/conversations", "/ls"}:
+            self.handle_wechat_bridge_request({"request_id": request_id, "action": "threads"})
+            return
+        if command.startswith("/select "):
+            self.handle_wechat_bridge_request({"request_id": request_id, "action": "select_thread", "thread_id": command.split(None, 1)[1]})
+            return
+        if command.startswith("/new"):
+            title = command[4:].strip() or "微信会话"
+            self.handle_wechat_bridge_request({"request_id": request_id, "action": "new_thread", "title": title})
+            return
+        requested_thread_id = str(payload.get("thread_id") or payload.get("conversation_id") or "").strip()
+        if requested_thread_id and safe_thread_id(requested_thread_id) != self.thread_id:
+            target_thread_id = safe_thread_id(requested_thread_id)
+            if not any(str(thread.get("id")) == target_thread_id for thread in normalize_threads(self.threads)):
+                raise RuntimeError(f"会话不存在：{target_thread_id}")
+            if self.is_automation_busy() or self.is_execution_running():
+                raise RuntimeError("当前还有任务在运行，无法切换会话。")
+            self.switch_thread(target_thread_id)
+        if self.is_automation_busy() or self.is_execution_running():
+            raise RuntimeError("当前还有任务在运行，可发送 /stop 停止当前 AI 输出或执行。")
+        if not self.automation_enabled:
+            dep = self.automation_manager.dependency_status()
+            if not dep.get("ready"):
+                raise RuntimeError("自动化插件依赖未就绪，请先在设置里安装/修复插件依赖。")
+            self.automation_enabled = True
+            set_automation_enabled_setting(True)
+            self.load_history()
+            self.update_prompt_tools_responsive()
+            self.show_automation_composer(focus=False)
+        settings = wechat_bridge_settings()
+        silent = parse_boolish(payload.get("silent"), bool(settings.get("silent", True)))
+        self.wechat_active_request_id = request_id
+        self.wechat_active_start_index = len(self.history_entries)
+        self.wechat_active_silent = silent
+        full_prompt = self.build_system_prompt(text)
+        prompt_entry_id = self.add_automation_user_prompt_bubble(full_prompt, animate=True)
+        self.begin_automation_loop(text)
+        self.start_automation_worker(text, "", None, None, prompt_entry_id)
+        if self.is_automation_request_running() and self.selected_skill_ids:
+            self.clear_automation_skills()
+
+    def finish_wechat_active_request(self, fallback_message: str = ""):
+        request_id = self.wechat_active_request_id
+        if not request_id:
+            return
+        start = max(0, int(self.wechat_active_start_index or 0))
+        entries = self.history_entries[start:]
+        reply = wechat_history_reply(entries, silent=self.wechat_active_silent)
+        if fallback_message and (not entries or reply == "已处理。"):
+            reply = fallback_message
+        silent = self.wechat_active_silent
+        self.wechat_active_request_id = ""
+        self.wechat_active_start_index = 0
+        self.wechat_active_silent = True
+        self.wechat_bridge.finish_request(request_id, {
+            "ok": True,
+            "reply": reply,
+            "text": reply,
+            "thread_id": self.thread_id,
+            "silent": silent,
+        })
+
     def is_automation_request_running(self) -> bool:
         return bool(
             (self.automation_context_worker and self.automation_context_worker.isRunning())
@@ -9499,6 +10209,8 @@ class ChatPage(QWidget):
                 self.show_automation_composer(focus=False)
             else:
                 self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
+        if self.wechat_active_request_id and not self.is_automation_request_running() and not self.is_execution_running():
+            self.finish_wechat_active_request(message or "")
     
     def on_chat_scroll_changed(self, _value: int):
         if self.chat_scroll_programmatic:
@@ -10529,6 +11241,24 @@ class ChatPage(QWidget):
         copy_plugin_dir_action.triggered.connect(self.copy_automation_plugin_dir)
         automation_menu.addAction(copy_plugin_dir_action)
 
+        wechat_menu = style_compact_popup_menu(menu.addMenu("微信接入"))
+        wechat_config_action = QAction("微信配置页", self)
+        wechat_config_action.triggered.connect(self.show_wechat_config_dialog)
+        wechat_menu.addAction(wechat_config_action)
+        wechat_start_action = QAction("启动微信 Bridge", self)
+        wechat_start_action.triggered.connect(self.start_wechat_bridge_from_menu)
+        wechat_menu.addAction(wechat_start_action)
+        wechat_stop_action = QAction("停止微信 Bridge", self)
+        wechat_stop_action.triggered.connect(self.stop_wechat_bridge_from_menu)
+        wechat_menu.addAction(wechat_stop_action)
+        wechat_copy_action = QAction("复制微信 Bridge 地址", self)
+        wechat_copy_action.triggered.connect(self.copy_wechat_bridge_url)
+        wechat_menu.addAction(wechat_copy_action)
+
+        provider_action = QAction("Provider 查看", self)
+        provider_action.triggered.connect(self.show_provider_info_dialog)
+        automation_menu.addAction(provider_action)
+
         menu.addSeparator()
         home_action = QAction("返回首页", self)
         home_action.triggered.connect(self.confirm_back_home)
@@ -10616,6 +11346,252 @@ class ChatPage(QWidget):
 
     def show_automation_status(self):
         styled_warning(self, "自动化插件状态", self.automation_manager.status_text())
+
+    def provider_info_payload(self) -> Dict[str, object]:
+        return {
+            "api_url": self.automation_manager.base_url,
+            "chat_completions_url": f"{self.automation_manager.base_url}/v1/chat/completions",
+            "responses_url": f"{self.automation_manager.base_url}/v1/responses",
+            "models_url": f"{self.automation_manager.base_url}/v1/models",
+            "api_key": "not-required",
+            "model": self.effective_automation_model(),
+            "status": "running" if self.automation_manager.health() else "stopped",
+        }
+
+    def show_provider_info_dialog(self):
+        payload = self.provider_info_payload()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Provider 查看")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        title = QLabel("OpenAI-compatible Provider")
+        title.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 15px; font-weight: 900;")
+        layout.addWidget(title)
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
+        text.setFixedHeight(210)
+        text.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+                padding: 10px;
+                font-size: 12px;
+            }}
+        """)
+        layout.addWidget(text)
+        row = QHBoxLayout()
+        row.addStretch()
+        copy_btn = QPushButton("复制", cursor=Qt.CursorShape.PointingHandCursor)
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(text.toPlainText()))
+        close_btn = QPushButton("关闭", cursor=Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(dialog.close)
+        for btn in (copy_btn, close_btn):
+            btn.setFixedHeight(34)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 10px;
+                    padding: 6px 16px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{ background: {COLORS['surface_alt']}; }}
+            """)
+            row.addWidget(btn)
+        layout.addLayout(row)
+        dialog.exec()
+
+    def start_wechat_bridge_quietly(self):
+        try:
+            self.wechat_bridge.start()
+            set_wechat_bridge_enabled_setting(True)
+        except Exception:
+            logger.warning("WeChat bridge startup failed.", exc_info=True)
+            set_wechat_bridge_enabled_setting(False)
+
+    def start_console_bridge_quietly(self):
+        try:
+            self.wechat_bridge.start()
+        except Exception:
+            logger.warning("Console bridge startup failed.", exc_info=True)
+
+    def start_wechat_bridge_from_menu(self):
+        try:
+            url = self.wechat_bridge.start()
+            set_wechat_bridge_enabled_setting(True)
+            self.add_status_bubble(f"微信 Bridge 已启动：{url}")
+        except Exception as exc:
+            set_wechat_bridge_enabled_setting(False)
+            styled_warning(self, "微信 Bridge", str(exc))
+
+    def stop_wechat_bridge_from_menu(self):
+        self.wechat_bridge.stop()
+        set_wechat_bridge_enabled_setting(False)
+        self.add_status_bubble("微信 Bridge 已停止。")
+
+    def copy_wechat_bridge_url(self):
+        QApplication.clipboard().setText(self.wechat_bridge.url())
+        self.add_status_bubble(f"已复制微信 Bridge 地址：{self.wechat_bridge.url()}")
+
+    def show_wechat_config_dialog(self):
+        cfg = wechat_bridge_settings()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("微信机器人配置")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        hint = QLabel(
+            "先说明白：只开这个页面，还不能直接读你的微信消息。微信个人号没有给桌面程序直接收发消息的接口，"
+            "中间必须有一个“微信连接器”负责登录微信、收消息、发回复。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px;")
+        layout.addWidget(hint)
+
+        explain = QPlainTextEdit()
+        explain.setReadOnly(True)
+        explain.setPlainText(
+            "你手头会有 3 个东西：\n"
+            "1. 微信：真实收发消息的地方。\n"
+            "2. 微信连接器：会弹出微信扫码二维码，把微信消息转发给 Agent Qt。\n"
+            "3. Agent Qt：真正做代码、执行命令、整理回复的机器人。\n\n"
+            "本页“一键开启”做的是第 3 步：打开 Agent Qt 的本地机器人接口。\n"
+            "扫码不在 Agent Qt 这里发生，而是在“微信连接器”启动时发生。"
+        )
+        explain.setFixedHeight(170)
+        explain.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+                padding: 10px;
+                font-size: 12px;
+            }}
+        """)
+        layout.addWidget(explain)
+
+        enabled_box = QCheckBox("启用微信 Bridge")
+        enabled_box.setChecked(wechat_bridge_enabled_setting())
+        silent_box = QCheckBox("静默模式：不把代码块/命令块正文回给微信")
+        silent_box.setChecked(bool(cfg.get("silent", True)))
+        for box in (enabled_box, silent_box):
+            box.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 12px; font-weight: 800;")
+            layout.addWidget(box)
+
+        host_edit = QLineEdit(str(cfg["host"]))
+        port_edit = QLineEdit(str(cfg["port"]))
+        key_edit = QLineEdit(str(cfg.get("api_key") or ""))
+        timeout_edit = QLineEdit(str(cfg.get("timeout_seconds") or 900))
+        fields = [
+            ("Host", host_edit),
+            ("Port", port_edit),
+            ("API Key（可空）", key_edit),
+            ("等待超时秒数", timeout_edit),
+        ]
+        for label, editor in fields:
+            row = QHBoxLayout()
+            lab = QLabel(label)
+            lab.setFixedWidth(110)
+            lab.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px; font-weight: 800;")
+            editor.setStyleSheet(f"""
+                QLineEdit {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 9px;
+                    padding: 8px 10px;
+                    font-size: 12px;
+                }}
+            """)
+            row.addWidget(lab)
+            row.addWidget(editor, 1)
+            layout.addLayout(row)
+
+        endpoint = QPlainTextEdit()
+        endpoint.setReadOnly(True)
+        endpoint.setPlainText(
+            "如果你已经有微信连接器，就把它配置成调用 Agent Qt：\n"
+            f"接口地址 / Base URL: http://{cfg['host']}:{cfg['port']}/v1\n"
+            "模型名 / Model: agent-qt-wechat\n"
+            "API Key: 本页留空则随便填；本页填写了就填同一个。\n\n"
+            "如果你只有 Agent Qt 和微信，没有微信连接器：\n"
+            "这版还不能做到“点一下就让微信扫码接入”。下一步应该把连接器内置进 Agent Qt，"
+            "到时候按钮会变成“启动微信连接器”，二维码会直接在 Agent Qt 里显示。\n\n"
+            "给懂一点配置的人用的测试接口：\n"
+            f"POST http://{cfg['host']}:{cfg['port']}/message\n"
+            '{"text":"帮我继续完成项目","thread_id":"default","silent":true}\n'
+            f"POST http://{cfg['host']}:{cfg['port']}/stop\n"
+            f"GET  http://{cfg['host']}:{cfg['port']}/threads\n\n"
+            "微信命令：/stop 停止，/threads 查看会话，/select 会话ID 切换，/new 名称 新建。"
+        )
+        endpoint.setFixedHeight(240)
+        endpoint.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+                padding: 10px;
+                font-size: 12px;
+            }}
+        """)
+        layout.addWidget(endpoint)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        save_btn = QPushButton("保存", cursor=Qt.CursorShape.PointingHandCursor)
+        copy_btn = QPushButton("复制示例", cursor=Qt.CursorShape.PointingHandCursor)
+        close_btn = QPushButton("关闭", cursor=Qt.CursorShape.PointingHandCursor)
+        for btn in (save_btn, copy_btn, close_btn):
+            btn.setFixedHeight(34)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 10px;
+                    padding: 6px 16px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{ background: {COLORS['surface_alt']}; }}
+            """)
+            row.addWidget(btn)
+
+        def save():
+            try:
+                payload = {
+                    "host": host_edit.text().strip() or "127.0.0.1",
+                    "port": int(port_edit.text().strip() or "8798"),
+                    "api_key": key_edit.text().strip(),
+                    "silent": silent_box.isChecked(),
+                    "timeout_seconds": int(timeout_edit.text().strip() or "900"),
+                }
+            except ValueError:
+                styled_warning(dialog, "微信配置", "端口和超时必须是数字。")
+                return
+            set_wechat_bridge_settings(payload)
+            set_wechat_bridge_enabled_setting(enabled_box.isChecked())
+            if enabled_box.isChecked():
+                self.start_wechat_bridge_from_menu()
+            else:
+                self.wechat_bridge.stop()
+            dialog.close()
+
+        save_btn.clicked.connect(save)
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(endpoint.toPlainText()))
+        close_btn.clicked.connect(dialog.close)
+        layout.addLayout(row)
+        dialog.exec()
 
     def open_automation_log_file(self):
         path = self.automation_manager.log_file
@@ -10734,14 +11710,14 @@ class ChatPage(QWidget):
         return "\n".join(lines).rstrip() + "\n"
 
     def export_conversation_text(self, fmt: str):
-        self.flush_history_save(wait=True)
         ext = "md" if fmt == "md" else "txt"
         suffix = "-provider-raw" if fmt == "raw" else ""
         path = os.path.join(self.export_dir(), f"agent-qt-{self.thread_id}{suffix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.{ext}")
         try:
+            text = self.conversation_export_text(fmt)
             with open(path, "w", encoding="utf-8") as f:
-                f.write(self.conversation_export_text(fmt))
-        except OSError as exc:
+                f.write(text)
+        except Exception as exc:
             styled_warning(self, "导出失败", str(exc))
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
@@ -11104,6 +12080,8 @@ class ChatPage(QWidget):
                 self.automation_worker = None
         self.stop_automation_preview(remove_bubble=True)
         self.stop_automation_loop("", ensure_manual_entry=True)
+        if self.wechat_active_request_id:
+            self.finish_wechat_active_request("已停止当前 AI 输出或执行。")
 
     def submit_automation_prompt_from_composer(self):
         if not self.automation_enabled:
@@ -11336,6 +12314,7 @@ class ChatPage(QWidget):
             user_prompt=prompt,
             done_marker=AUTOMATION_DONE_MARKER,
             terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
+            terminal_logs_url=(self.wechat_bridge.url().rstrip("/") + "/terminallogs") if hasattr(self, "wechat_bridge") else "http://127.0.0.1:8798/terminallogs",
             **runtime_environment(),
         ) + f"\n{PROMPT_BUBBLE_MARKER}{base64.b64encode(raw_prompt.encode('utf-8')).decode('ascii')} -->"
 
@@ -11345,6 +12324,7 @@ class ChatPage(QWidget):
             user_prompt="当前指令见第三段 plaintext，不要把本段当作用户需求重复执行。",
             done_marker=AUTOMATION_DONE_MARKER,
             terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
+            terminal_logs_url=(self.wechat_bridge.url().rstrip("/") + "/terminallogs") if hasattr(self, "wechat_bridge") else "http://127.0.0.1:8798/terminallogs",
             **runtime_environment(),
         )
 
@@ -11470,6 +12450,8 @@ class ChatPage(QWidget):
             return "【AI 回复摘要】\n" + self.summarize_automation_text(content, ai_limit)
         if entry_type == "result":
             if detail == "full":
+                if "【文件变更摘要（高密度，优先保留）】" in content:
+                    return "【本地执行结果和文件变更】\n" + self.summarize_result_history_text(content, AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT)
                 return "【本地执行结果和文件变更】\n" + self.compact_automation_entry_text(content)
             result_limit = 2400 if detail == "lean" else 1100
             return "【本地执行结果摘要】\n" + self.summarize_result_history_text(content, result_limit)
@@ -12194,6 +13176,8 @@ class ChatPage(QWidget):
     def shutdown(self):
         self.flush_history_save(wait=True)
         self.stop_automation_preview(remove_bubble=False)
+        if hasattr(self, "wechat_bridge"):
+            self.wechat_bridge.stop()
 
     def add_ai_response_frame(self, focus: bool = True, animate: bool = True, keep_visible: bool = True):
         if self.automation_enabled:

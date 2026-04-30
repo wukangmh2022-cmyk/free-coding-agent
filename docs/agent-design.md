@@ -125,10 +125,16 @@ print("hello")
 
 ```text
 Terminal processes:
- - id=... pid=... status=running persistent=True registry=... log=... name=...
+ - id=... pid=... status=running persistent=True 启动命令=npm run dev
 ```
 
-模型下一轮可以基于这个摘要自主读取 registry/log，或者用 PID 停止进程。
+模型下一轮只用这一行读取 app 内存里的终端缓冲区：
+
+```bash
+curl -s 'http://127.0.0.1:8798/terminallogs?pid=12345'
+```
+
+把 `pid=` 后面的值替换成终端摘要里的实际 pid。
 
 ## 超时转后台后的模型行为
 
