@@ -299,6 +299,36 @@ def wechat_connector_sync_path(account_id: str) -> str:
     return os.path.join(wechat_connector_root(), f"sync-{safe_id}.txt")
 
 
+def wechat_inbox_dir(root: str) -> str:
+    base = root if root else wechat_connector_root()
+    return os.path.join(base, "wechat_inbox")
+
+
+WECHAT_EXT_TO_MIME = {
+    ".pdf": "application/pdf",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".zip": "application/zip",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+}
+
+
+def wechat_mime_from_filename(filename: str) -> str:
+    return WECHAT_EXT_TO_MIME.get(os.path.splitext(str(filename or ""))[1].lower(), "application/octet-stream")
+
+
 def wechat_connector_state_text() -> str:
     path = wechat_connector_account_path()
     if not os.path.exists(path):
@@ -3514,21 +3544,56 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 """
 
 WECHAT_COMMAND_MENU_TEXT = """你可以这样说：
-显示菜单：查看这份说明
-停止当前任务：停止 AI 输出或本地执行
-列出会话列表：查看所有会话
+/ 或 /help：查看这份说明
+/stop：停止 AI 输出或本地执行
+/threads：查看所有会话
 切换到 会话ID：切换会话
 新建会话 名称：创建一个新会话
 显示文件列表：返回当前工作区的多层级文本树
 列出定时计划：查看当前计划
 每天 7 点做某事：创建每日计划
+删除计划 名称/序号：删除一个定时计划
+发送文件 路径/文件名：把工作区文件发到微信
+/think：查看推理模式
+/think on：开启推理模式
+/think off：关闭推理模式
 
 也可以直接发送自然语言需求，让 Agent Qt 处理当前工作区。"""
 
 
 def is_wechat_menu_command(text: str) -> bool:
     normalized = str(text or "").strip().lower()
-    return normalized in {"/help", "help", "/menu", "menu", "菜单", "帮助", "指令", "/指令", "/菜单", "/帮助"}
+    return normalized in {"/", "/help", "/ help", "help", "/menu", "menu", "菜单", "帮助", "指令", "/指令", "/菜单", "/帮助"}
+
+
+def automation_model_label(model_id: str) -> str:
+    target = str(model_id or "")
+    for label, candidate in AUTOMATION_MODELS:
+        if candidate == target:
+            return label
+    return target or AUTOMATION_DEFAULT_MODEL
+
+
+def automation_thinking_enabled(model_id: str) -> bool:
+    text = f"{automation_model_label(model_id)} {model_id}".lower()
+    return "thinking" in text or "推理" in text
+
+
+def automation_model_for_thinking(enabled: bool, current_model: str) -> str:
+    current = str(current_model or AUTOMATION_DEFAULT_MODEL)
+    if enabled:
+        if automation_thinking_enabled(current):
+            return current
+        for label, model_id in AUTOMATION_MODELS:
+            if "thinking" in label.lower() or automation_thinking_enabled(model_id):
+                return model_id
+        return current
+    if not automation_thinking_enabled(current):
+        return current
+    for _label, model_id in AUTOMATION_MODELS:
+        if not automation_thinking_enabled(model_id):
+            return model_id
+    return AUTOMATION_DEFAULT_MODEL
 
 
 def parse_wechat_builtin_command(text: str) -> Dict[str, str]:
@@ -3536,6 +3601,12 @@ def parse_wechat_builtin_command(text: str) -> Dict[str, str]:
     compact = re.sub(r"\s+", "", raw).lower()
     if not compact:
         return {}
+    if compact in {"/think", "/thinking", "推理", "推理状态", "查看推理", "查看推理模式"}:
+        return {"action": "thinking", "mode": "status"}
+    if compact in {"/thinkon", "/thinkingon", "推理开", "开启推理", "打开推理", "开启推理模式"}:
+        return {"action": "thinking", "mode": "on"}
+    if compact in {"/thinkoff", "/thinkingoff", "推理关", "关闭推理", "关掉推理", "关闭推理模式"}:
+        return {"action": "thinking", "mode": "off"}
     if compact in {"/stop", "停止", "暂停", "中断", "停止当前任务", "暂停当前任务", "停止输出", "停止执行"}:
         return {"action": "stop"}
     if (
@@ -3554,6 +3625,18 @@ def parse_wechat_builtin_command(text: str) -> Dict[str, str]:
         or (("计划" in compact or "日程" in compact or "任务" in compact) and any(word in compact for word in ("列表", "列出", "显示", "查看", "有哪些")))
     ):
         return {"action": "schedules"}
+    delete_schedule_match = re.match(r"^(?:/delete_schedule|/del_schedule|删除计划|删除定时计划|移除计划|取消计划|删除任务|取消任务)[:：\s]*(.+)$", raw, re.I)
+    if delete_schedule_match:
+        return {"action": "delete_schedule", "target": (delete_schedule_match.group(1) or "").strip()}
+    send_file_match = re.match(r"^(?:/sendfile|发送文件|发文件|把文件发给我|把(.+?)发给我|发送(.+))[:：\s]*(.*)$", raw, re.I)
+    if send_file_match:
+        target = (send_file_match.group(3) or send_file_match.group(1) or send_file_match.group(2) or "").strip()
+        return {"action": "send_file", "target": target}
+    view_file_match = re.match(r"^(?:打开|查看|看一下|给我看|发给我)[:：\s]*(.+)$", raw, re.I)
+    if view_file_match:
+        target = (view_file_match.group(1) or "").strip()
+        if re.search(r"\.(?:png|jpe?g|gif|webp|pdf|docx?|xlsx?|pptx?|csv|txt|zip)\b", target, re.I):
+            return {"action": "send_file", "target": target}
     schedule_payload = parse_daily_schedule_request(raw)
     if schedule_payload:
         return {"action": "create_schedule", **schedule_payload}
@@ -3570,10 +3653,10 @@ def build_wechat_user_prompt(text: str) -> str:
     return (
         "【微信远控消息】\n"
         "用户从手机微信发送以下需求。请按 Agent Qt 输出协议行动；最终给微信的回复会被压缩展示，所以结论要短。"
-        "微信可用控制指令包括：显示菜单、停止当前任务、列出会话列表、切换到某个会话、新建会话、显示文件列表。"
+        "微信可用控制指令包括：显示菜单、停止当前任务、列出会话列表、切换到某个会话、新建会话、显示文件列表、列出/创建/删除定时计划、发送工作区文件。"
         "用户会用自然语言表达这些指令，例如“列出会话列表”“切换到 xxx”“新建一个会话”“显示文件夹”。"
         "用户也可以说“列出定时计划”或“每天 7 点做某事”来查看/创建 schedule；这类计划由 Agent Qt 定时触发。"
-        "如果用户要求截图、打开文件给他看、或发送图片，请优先生成可查看的图片文件并在结论里说明；原生图片回传由微信通道处理。"
+        "如果用户要求查看图片、PDF、表格或文档，优先定位或生成对应文件；微信通道会尝试把本地文件作为附件发送。"
         "如果用户询问菜单、帮助或支持哪些指令，请直接说明这些指令，不要执行项目命令。\n\n"
         f"用户消息：\n{text.strip()}"
     )
@@ -3995,6 +4078,43 @@ def project_tree_text(root: str, max_depth: int = 4, max_entries: int = 180) -> 
     return summary + "\n" + "\n".join(lines)
 
 
+def resolve_project_file_target(root: str, target: str) -> str:
+    root = os.path.abspath(os.path.expanduser(root or ""))
+    raw = str(target or "").strip().strip("\"'")
+    if not root or not os.path.isdir(root) or not raw:
+        return ""
+    candidates = []
+    expanded = os.path.abspath(os.path.expanduser(raw))
+    if os.path.isfile(expanded):
+        candidates.append(expanded)
+    candidates.append(os.path.abspath(os.path.join(root, raw)))
+    raw_name = os.path.basename(raw)
+    for candidate in candidates:
+        try:
+            if os.path.isfile(candidate) and os.path.commonpath([root, candidate]) == root:
+                return candidate
+        except ValueError:
+            continue
+    matches: List[str] = []
+    needle = raw.lower()
+    name_needle = raw_name.lower()
+    skip_dirs = {".git", ".agent_qt", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".next"}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in skip_dirs and not name.startswith(".")]
+        for filename in filenames:
+            full = os.path.join(dirpath, filename)
+            rel = os.path.relpath(full, root)
+            rel_lower = rel.lower()
+            filename_lower = filename.lower()
+            if rel_lower == needle or filename_lower == needle or name_needle and filename_lower == name_needle:
+                return full
+            if needle and (needle in rel_lower or needle in filename_lower):
+                matches.append(full)
+        if len(matches) > 20:
+            break
+    return sorted(matches, key=lambda p: (len(os.path.relpath(p, root)), os.path.relpath(p, root).lower()))[0] if matches else ""
+
+
 def schedules_path(root: str) -> str:
     return os.path.join(root, HISTORY_DIR_NAME, SCHEDULES_FILE_NAME)
 
@@ -4125,10 +4245,35 @@ def update_workspace_schedule(root: str, schedule_id: str, patch: Dict[str, obje
     return found and save_workspace_schedules(root, updated)
 
 
+def resolve_schedule_target(schedules: List[Dict[str, object]], target: str) -> str:
+    raw = str(target or "").strip()
+    if not raw:
+        return ""
+    if raw.isdigit():
+        index = int(raw) - 1
+        if 0 <= index < len(schedules):
+            return str(schedules[index].get("id") or "")
+    safe_target = safe_schedule_id(raw)
+    for schedule_item in schedules:
+        schedule_id = str(schedule_item.get("id") or "")
+        title = str(schedule_item.get("title") or "")
+        if raw == schedule_id or safe_target == schedule_id or raw == title:
+            return schedule_id
+    for schedule_item in schedules:
+        schedule_id = str(schedule_item.get("id") or "")
+        title = str(schedule_item.get("title") or "")
+        if raw in title or raw in schedule_id:
+            return schedule_id
+    return ""
+
+
 def delete_workspace_schedule(root: str, schedule_id: str) -> bool:
-    safe_id = safe_schedule_id(schedule_id)
-    schedules = [schedule for schedule in load_workspace_schedules(root) if str(schedule.get("id") or "") != safe_id]
-    return save_workspace_schedules(root, schedules)
+    schedules = load_workspace_schedules(root)
+    resolved = resolve_schedule_target(schedules, schedule_id)
+    if not resolved:
+        return False
+    remaining = [schedule for schedule in schedules if str(schedule.get("id") or "") != resolved]
+    return len(remaining) != len(schedules) and save_workspace_schedules(root, remaining)
 
 
 def parse_daily_schedule_request(text: str) -> Dict[str, str]:
@@ -6821,6 +6966,80 @@ class AutomationChatWorker(QThread):
             self.finished_signal.emit("", str(exc))
 
 
+SCHEDULE_PLAN_DONE_MARKER = "SCHEDULE_PLAN_DONE"
+
+
+class SchedulePlanWorker(QThread):
+    finished_signal = Signal(str, str, str)
+
+    def __init__(
+        self,
+        manager: AutomationProviderManager,
+        model: str,
+        thread_id: str,
+        title: str,
+        user_request: str,
+        project_tree: str = "",
+        skills_summary: str = "",
+    ):
+        super().__init__()
+        self.manager = manager
+        self.model = model
+        self.thread_id = thread_id
+        self.title = title
+        self.user_request = user_request
+        self.project_tree = project_tree
+        self.skills_summary = skills_summary
+
+    def run(self):
+        try:
+            system = (
+                "你是 Agent Qt 的定时计划编写器。你只负责把用户的自然语言需求改写成可每天执行的计划 MD 文档。\n"
+                "要求：\n"
+                "1. 输出最终 Markdown 文档后，最后一行必须单独写 SCHEDULE_PLAN_DONE；没有这个完成标记，本轮视为未完成。\n"
+                "2. 不要寒暄，不要 fenced 代码块，不要输出 shell 命令块，不要真的执行项目命令。\n"
+                "3. 文档要让未来的 Agent 到点后能独立执行：目标、输入来源、步骤、验收标准、失败处理都要写清楚。\n"
+                "4. 你可以参考随后的文件树和技能摘要，必要时把“读取某文件/使用某技能/生成某脚本”写成计划步骤；不要为了生成计划展开长篇探索。\n"
+                "5. 控制长度，通常 300-900 字；第一行必须是 H1 标题。"
+            )
+            user = (
+                f"计划名称：{self.title or '定时计划'}\n\n"
+                f"用户原始需求：\n{self.user_request}\n\n"
+                f"当前工作区文件树（可能已截断）：\n{self.project_tree or '未提供'}\n\n"
+                f"当前工作区技能摘要：\n{self.skills_summary or '未提供'}\n\n"
+                "请生成最终要保存到定时计划里的 Markdown 文档。"
+            )
+            messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            text = ""
+            done = False
+            for attempt in range(3):
+                text = self.manager.chat(messages, self.model, f"{self.thread_id}-schedule-plan").strip()
+                if SCHEDULE_PLAN_DONE_MARKER in text:
+                    done = True
+                    break
+                messages.extend([
+                    {"role": "assistant", "content": text},
+                    {
+                        "role": "user",
+                        "content": (
+                            "还不能结束：请输出一份完整且更简洁的计划 Markdown，并在最后一行单独写 "
+                            f"{SCHEDULE_PLAN_DONE_MARKER}。不要解释原因。"
+                        ),
+                    },
+                ])
+            if not done:
+                raise RuntimeError("计划生成未完成：AI 没有返回完成标记。")
+            text = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
+            text = text.replace(SCHEDULE_PLAN_DONE_MARKER, "").strip()
+            if not text:
+                raise RuntimeError("计划文档为空。")
+            if not text.startswith("#"):
+                text = f"# {self.title or '定时计划'}\n\n{text}"
+            self.finished_signal.emit(text, "", self.user_request)
+        except Exception as exc:
+            self.finished_signal.emit("", str(exc), self.user_request)
+
+
 class AutomationContextBuildWorker(QThread):
     status_signal = Signal(str)
     finished_signal = Signal(int, list, str, str)
@@ -7213,6 +7432,8 @@ class WeChatBridge(QObject):
                         "text": text,
                         "silent": payload.get("silent", True),
                         "thread_id": payload.get("user") or payload.get("thread_id") or "",
+                        "to_user": payload.get("to_user") or payload.get("user") or payload.get("thread_id") or "",
+                        "context_token": payload.get("context_token") or "",
                     }, wait=True)
                     reply = str(result.get("reply") or result.get("text") or result.get("error") or "")
                     if not reply and result.get("ok"):
@@ -7567,14 +7788,186 @@ class WeChatConnector(QObject):
                 parts.append(str(voice_item.get("text")))
         return "\n".join(part for part in parts if part.strip()).strip()
 
+    def _parse_aes_key(self, value: str) -> bytes:
+        text = str(value or "").strip()
+        if not text:
+            return b""
+        if re.fullmatch(r"[0-9a-fA-F]{32}", text):
+            return bytes.fromhex(text)
+        decoded = base64.b64decode(text)
+        if len(decoded) == 16:
+            return decoded
+        if len(decoded) == 32 and re.fullmatch(rb"[0-9a-fA-F]{32}", decoded):
+            return bytes.fromhex(decoded.decode("ascii"))
+        raise RuntimeError(f"aes_key 长度不支持：{len(decoded)}")
+
+    def _decrypt_aes_ecb(self, data: bytes, key: bytes) -> bytes:
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives import padding
+        except Exception as exc:
+            raise RuntimeError("当前 Python 环境缺少 cryptography，无法解密微信附件。") from exc
+        decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+        padded = decryptor.update(data) + decryptor.finalize()
+        unpadder = padding.PKCS7(128).unpadder()
+        return unpadder.update(padded) + unpadder.finalize()
+
+    def _encrypt_aes_ecb(self, data: bytes, key: bytes) -> bytes:
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives import padding
+        except Exception as exc:
+            raise RuntimeError("当前 Python 环境缺少 cryptography，无法上传微信附件。") from exc
+        padder = padding.PKCS7(128).padder()
+        padded = padder.update(data) + padder.finalize()
+        encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+        return encryptor.update(padded) + encryptor.finalize()
+
+    def _aes_ecb_padded_size(self, size: int) -> int:
+        return ((int(size) + 16) // 16) * 16
+
+    def _download_cdn_bytes(self, media: dict, aes_key: str = "") -> bytes:
+        full_url = str(media.get("full_url") or "").strip()
+        query = str(media.get("encrypt_query_param") or "").strip()
+        account = self.account() or {}
+        cdn_base = str(account.get("cdn_base_url") or self.DEFAULT_CDN_BASE_URL).rstrip("/")
+        if full_url:
+            url = full_url
+        elif query:
+            url = f"{cdn_base}/download?encrypted_query_param={urllib.parse.quote(query)}"
+        else:
+            raise RuntimeError("缺少微信 CDN 下载参数。")
+        req = urllib.request.Request(url, headers={"User-Agent": "AgentQt/5.1"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+        if aes_key:
+            return self._decrypt_aes_ecb(data, self._parse_aes_key(aes_key))
+        return data
+
+    def _upload_wechat_media(self, path: str, to_user: str, media_type: int) -> Dict[str, object]:
+        account = self.account() or {}
+        base_url = str(account.get("base_url") or self.DEFAULT_BASE_URL)
+        cdn_base = str(account.get("cdn_base_url") or self.DEFAULT_CDN_BASE_URL).rstrip("/")
+        token = str(account.get("token") or "")
+        with open(path, "rb") as f:
+            data = f.read()
+        aes_key = os.urandom(16)
+        filekey = uuid.uuid4().hex
+        ciphertext = self._encrypt_aes_ecb(data, aes_key)
+        upload_info = self._api_post(
+            base_url,
+            "ilink/bot/getuploadurl",
+            {
+                "filekey": filekey,
+                "media_type": int(media_type),
+                "to_user_id": to_user,
+                "rawsize": len(data),
+                "rawfilemd5": hashlib.md5(data).hexdigest(),
+                "filesize": len(ciphertext),
+                "no_need_thumb": True,
+                "aeskey": aes_key.hex(),
+                "base_info": {"channel_version": self.CHANNEL_VERSION},
+            },
+            token=token,
+            timeout=20,
+        )
+        upload_param = str(upload_info.get("upload_param") or "")
+        if not upload_param:
+            raise RuntimeError(f"微信没有返回上传地址：{upload_info}")
+        upload_url = (
+            f"{cdn_base}/upload?"
+            f"encrypted_query_param={urllib.parse.quote(upload_param)}&"
+            f"filekey={urllib.parse.quote(filekey)}"
+        )
+        req = urllib.request.Request(
+            upload_url,
+            data=ciphertext,
+            headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(ciphertext))},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"微信 CDN 上传失败：HTTP {resp.status}")
+            download_param = resp.headers.get("x-encrypted-param", "")
+        if not download_param:
+            raise RuntimeError("微信 CDN 上传响应缺少 x-encrypted-param。")
+        return {
+            "download_param": download_param,
+            "aes_key_b64": base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii"),
+            "plain_size": len(data),
+            "cipher_size": len(ciphertext),
+        }
+
+    def _save_wechat_file(self, data: bytes, filename: str) -> str:
+        root = str(getattr(self.chat_page, "project_root", "") or "")
+        inbox = wechat_inbox_dir(root)
+        os.makedirs(inbox, exist_ok=True)
+        safe_name = re.sub(r"[\\/:*?\"<>|]+", "_", filename or "wechat-file.bin").strip(" .") or "wechat-file.bin"
+        stem, ext = os.path.splitext(safe_name)
+        path = os.path.join(inbox, safe_name)
+        suffix = 2
+        while os.path.exists(path):
+            path = os.path.join(inbox, f"{stem}-{suffix}{ext}")
+            suffix += 1
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def _download_message_files(self, message: dict) -> List[Dict[str, str]]:
+        files: List[Dict[str, str]] = []
+        for index, item in enumerate(message.get("item_list") or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            try:
+                item_type = int(item.get("type") or 0)
+                if item_type == 2:
+                    image = item.get("image_item") if isinstance(item.get("image_item"), dict) else {}
+                    media = image.get("media") if isinstance(image.get("media"), dict) else {}
+                    aes_key = str(image.get("aeskey") or media.get("aes_key") or "")
+                    data = self._download_cdn_bytes(media, aes_key)
+                    path = self._save_wechat_file(data, f"wechat-image-{index}.jpg")
+                    files.append({"type": "image", "path": path, "mime": "image/*"})
+                elif item_type == 4:
+                    file_item = item.get("file_item") if isinstance(item.get("file_item"), dict) else {}
+                    media = file_item.get("media") if isinstance(file_item.get("media"), dict) else {}
+                    filename = str(file_item.get("file_name") or f"wechat-file-{index}.bin")
+                    data = self._download_cdn_bytes(media, str(media.get("aes_key") or ""))
+                    path = self._save_wechat_file(data, filename)
+                    files.append({"type": "file", "path": path, "mime": wechat_mime_from_filename(filename)})
+                elif item_type == 5:
+                    video = item.get("video_item") if isinstance(item.get("video_item"), dict) else {}
+                    media = video.get("media") if isinstance(video.get("media"), dict) else {}
+                    data = self._download_cdn_bytes(media, str(media.get("aes_key") or ""))
+                    path = self._save_wechat_file(data, f"wechat-video-{index}.mp4")
+                    files.append({"type": "video", "path": path, "mime": "video/mp4"})
+                elif item_type == 3:
+                    voice = item.get("voice_item") if isinstance(item.get("voice_item"), dict) else {}
+                    media = voice.get("media") if isinstance(voice.get("media"), dict) else {}
+                    data = self._download_cdn_bytes(media, str(media.get("aes_key") or ""))
+                    path = self._save_wechat_file(data, f"wechat-voice-{index}.silk")
+                    files.append({"type": "audio", "path": path, "mime": "audio/silk"})
+            except Exception as exc:
+                files.append({"type": "error", "path": "", "mime": "", "error": str(exc)})
+        return files
+
     def _handle_inbound_message(self, message: dict):
         to_user = str(message.get("from_user_id") or "").strip()
         context_token = str(message.get("context_token") or "")
         text = self._extract_message_text(message)
+        files = self._download_message_files(message)
+        file_lines = []
+        for item in files:
+            if item.get("error"):
+                file_lines.append(f"- 附件下载失败：{item.get('error')}")
+            elif item.get("path"):
+                file_lines.append(f"- {item.get('type')} {item.get('mime')}: {item.get('path')}")
+        if file_lines:
+            attachment_text = "微信附件已保存到本地，后续需要查看内容时请直接读取这些文件：\n" + "\n".join(file_lines)
+            text = f"{text}\n\n{attachment_text}".strip()
         if not text:
-            text = "[微信媒体消息] 当前内置连接器第一版只处理文本；图片/文件稍后支持。"
+            text = "[微信消息] 收到空文本消息。"
         try:
-            reply = self._call_agent_qt(text, to_user)
+            reply = self._call_agent_qt(text, to_user, context_token)
         except Exception as exc:
             reply = f"Agent Qt 调用失败：{exc}"
         if reply and to_user:
@@ -7583,13 +7976,15 @@ class WeChatConnector(QObject):
             except Exception as exc:
                 self.status_signal.emit(f"微信回复发送失败：{exc}")
 
-    def _call_agent_qt(self, text: str, conversation_id: str) -> str:
+    def _call_agent_qt(self, text: str, conversation_id: str, context_token: str = "") -> str:
         cfg = wechat_bridge_settings()
         bridge_url = self.chat_page.wechat_bridge.url().rstrip("/")
         payload = {
             "model": "agent-qt-wechat",
             "user": conversation_id or "wechat",
             "thread_id": conversation_id or "",
+            "to_user": conversation_id or "",
+            "context_token": context_token,
             "silent": bool(cfg.get("silent", True)),
             "messages": [{"role": "user", "content": text}],
         }
@@ -7637,6 +8032,55 @@ class WeChatConnector(QObject):
             "base_info": {"channel_version": self.CHANNEL_VERSION},
         }
         self._api_post(base_url, "ilink/bot/sendmessage", body, token=token, timeout=20)
+
+    def _send_file(self, to_user: str, path: str, context_token: str, caption: str = ""):
+        account = self.account() or {}
+        base_url = str(account.get("base_url") or self.DEFAULT_BASE_URL)
+        token = str(account.get("token") or "")
+        if not context_token:
+            raise RuntimeError("缺少 context_token，无法确定微信回复上下文。")
+        if not os.path.isfile(path):
+            raise RuntimeError(f"文件不存在：{path}")
+        mime = wechat_mime_from_filename(path)
+        if mime.startswith("image/"):
+            media_type = 1
+            item_type = 2
+        elif mime.startswith("video/"):
+            media_type = 2
+            item_type = 5
+        else:
+            media_type = 3
+            item_type = 4
+        uploaded = self._upload_wechat_media(path, to_user, media_type)
+        media = {
+            "encrypt_query_param": uploaded["download_param"],
+            "aes_key": uploaded["aes_key_b64"],
+            "encrypt_type": 1,
+        }
+        if item_type == 2:
+            item = {"type": item_type, "image_item": {"media": media, "mid_size": int(uploaded["cipher_size"])}}
+        elif item_type == 5:
+            item = {"type": item_type, "video_item": {"media": media, "video_size": int(uploaded["cipher_size"])}}
+        else:
+            item = {"type": item_type, "file_item": {"media": media, "file_name": os.path.basename(path), "len": str(uploaded["plain_size"])}}
+        items = []
+        if caption:
+            items.append({"type": 1, "text_item": {"text": caption}})
+        items.append(item)
+        for out_item in items:
+            body = {
+                "msg": {
+                    "from_user_id": "",
+                    "to_user_id": to_user,
+                    "client_id": "agent-qt-" + uuid.uuid4().hex,
+                    "message_type": 2,
+                    "message_state": 2,
+                    "item_list": [out_item],
+                    "context_token": context_token,
+                },
+                "base_info": {"channel_version": self.CHANNEL_VERSION},
+            }
+            self._api_post(base_url, "ilink/bot/sendmessage", body, token=token, timeout=25)
 
 
 class WeChatQrImageWorker(QThread):
@@ -10145,6 +10589,7 @@ class ChatPage(QWidget):
         self.automation_preview_dots_timer = QTimer(self)
         self.automation_preview_dots_timer.setInterval(520)
         self.automation_preview_dots_timer.timeout.connect(self.tick_automation_preview_status)
+        self.schedule_plan_workers: List[SchedulePlanWorker] = []
         self.history_save_timer = QTimer(self)
         self.history_save_timer.setSingleShot(True)
         self.history_save_timer.timeout.connect(self.flush_history_save)
@@ -10796,6 +11241,21 @@ class ChatPage(QWidget):
             if action in {"provider"}:
                 self.wechat_bridge.finish_request(request_id, {"ok": True, **self.provider_info_payload()})
                 return
+            if action in {"thinking", "think"}:
+                mode = str((payload or {}).get("mode") or (payload or {}).get("enabled") or "status").strip().lower()
+                if mode in {"1", "true", "yes", "on", "开启", "开", "enable", "enabled"}:
+                    target_model = automation_model_for_thinking(True, self.automation_model)
+                    self.set_automation_model(target_model)
+                    reply = f"已开启推理模式：{automation_model_label(self.automation_model)}"
+                elif mode in {"0", "false", "no", "off", "关闭", "关", "disable", "disabled"}:
+                    target_model = automation_model_for_thinking(False, self.automation_model)
+                    self.set_automation_model(target_model)
+                    reply = f"已关闭推理模式：{automation_model_label(self.automation_model)}"
+                else:
+                    state = "开启" if automation_thinking_enabled(self.automation_model) else "关闭"
+                    reply = f"当前推理模式：{state}（{automation_model_label(self.automation_model)}）。可发送 /think on 或 /think off 切换。"
+                self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": reply, "text": reply, "model": self.automation_model})
+                return
             if action in {"terminals", "terminal_list"}:
                 grep_text = str((payload or {}).get("grep") or (payload or {}).get("q") or "").strip()
                 try:
@@ -10886,6 +11346,39 @@ class ChatPage(QWidget):
                 reply = schedules_summary_text(load_workspace_schedules(self.project_root))
                 self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": reply, "text": reply})
                 return
+            if action == "delete_schedule":
+                if not self.project_root:
+                    raise RuntimeError("尚未打开工作区。")
+                target = str((payload or {}).get("target") or (payload or {}).get("id") or "").strip()
+                if not target:
+                    raise RuntimeError("缺少要删除的计划名称或序号。")
+                schedules = load_workspace_schedules(self.project_root)
+                resolved = resolve_schedule_target(schedules, target)
+                if not resolved:
+                    raise RuntimeError(f"没有找到计划：{target}")
+                deleted_title = next((str(item.get("title") or resolved) for item in schedules if str(item.get("id") or "") == resolved), resolved)
+                if not delete_workspace_schedule(self.project_root, resolved):
+                    raise RuntimeError(f"删除计划失败：{target}")
+                reply = f"已删除定时计划：{deleted_title}"
+                self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": reply, "text": reply})
+                return
+            if action == "send_file":
+                if not self.project_root:
+                    raise RuntimeError("尚未打开工作区。")
+                target = str((payload or {}).get("target") or (payload or {}).get("path") or "").strip()
+                to_user = str((payload or {}).get("to_user") or (payload or {}).get("user") or (payload or {}).get("thread_id") or "").strip()
+                context_token = str((payload or {}).get("context_token") or "")
+                if not target:
+                    raise RuntimeError("缺少要发送的文件路径或文件名。")
+                path = resolve_project_file_target(self.project_root, target)
+                if not path:
+                    raise RuntimeError(f"没有找到文件：{target}")
+                if not to_user or not context_token:
+                    raise RuntimeError("当前通道缺少微信回复上下文，无法直接发送附件。")
+                self.wechat_connector._send_file(to_user, path, context_token, f"已发送文件：{os.path.basename(path)}")
+                reply = f"已发送文件：{os.path.relpath(path, self.project_root)}"
+                self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": reply, "text": reply, "path": path})
+                return
             if action == "create_schedule":
                 if not self.project_root:
                     raise RuntimeError("尚未打开工作区。")
@@ -10895,9 +11388,13 @@ class ChatPage(QWidget):
                 title = str((payload or {}).get("title") or prompt[:36] or "每日计划").strip()
                 if not prompt:
                     raise RuntimeError("缺少计划内容。")
-                schedule_item = create_workspace_schedule(self.project_root, title, prompt, hour, minute)
-                reply = f"已创建定时计划：{schedule_item.get('title')}，每天 {format_schedule_time(schedule_item)} 触发。"
-                self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": reply, "schedule": schedule_item})
+                self.create_schedule_with_ai_plan(
+                    title=title,
+                    user_request=prompt,
+                    hour=hour,
+                    minute=minute,
+                    request_id=request_id,
+                )
                 return
             if action == "message":
                 self.start_wechat_message_request(request_id, payload or {})
@@ -10929,7 +11426,12 @@ class ChatPage(QWidget):
             return
         builtin = parse_wechat_builtin_command(command)
         if builtin:
-            payload_for_command = {"request_id": request_id, **builtin}
+            payload_for_command = {
+                "request_id": request_id,
+                "to_user": payload.get("to_user") or payload.get("user") or payload.get("thread_id") or "",
+                "context_token": payload.get("context_token") or "",
+                **builtin,
+            }
             self.handle_wechat_bridge_request(payload_for_command)
             return
         requested_thread_id = str(payload.get("thread_id") or payload.get("conversation_id") or "").strip()
@@ -10987,6 +11489,71 @@ class ChatPage(QWidget):
             "thread_id": self.thread_id,
             "silent": silent,
         })
+
+    def create_schedule_with_ai_plan(
+        self,
+        *,
+        title: str,
+        user_request: str,
+        hour: int,
+        minute: int,
+        on_done=None,
+        request_id: str = "",
+    ):
+        if not self.project_root:
+            raise RuntimeError("尚未打开工作区。")
+        raw_title = (title.strip() or user_request[:36] or "每日计划")[:80]
+        raw_request = user_request.strip()
+        if not raw_request:
+            raise RuntimeError("缺少计划内容。")
+        dep = self.automation_manager.dependency_status()
+        if not dep.get("ready"):
+            raise RuntimeError("自动化插件依赖未就绪，无法生成计划文档。")
+        self.add_status_bubble("正在让 AI 生成定时计划文档...")
+        worker = SchedulePlanWorker(
+            self.automation_manager,
+            AUTOMATION_SIMPLE_MODEL_BY_MODEL.get(self.automation_model, self.automation_model),
+            self.thread_id,
+            raw_title,
+            raw_request,
+            project_tree_text(self.project_root, max_depth=4, max_entries=140),
+            skills_summary_text(self.skills),
+        )
+        self.schedule_plan_workers.append(worker)
+
+        def finish(plan_md: str, error: str, original_request: str):
+            try:
+                self.schedule_plan_workers.remove(worker)
+            except ValueError:
+                pass
+            worker.deleteLater()
+            if error:
+                if request_id:
+                    self.wechat_bridge.finish_request(request_id, {"ok": False, "error": error})
+                if on_done:
+                    on_done(None, error)
+                else:
+                    styled_warning(self, "定时计划", error)
+                return
+            try:
+                schedule_item = create_workspace_schedule(self.project_root, raw_title, plan_md, hour, minute)
+            except Exception as exc:
+                if request_id:
+                    self.wechat_bridge.finish_request(request_id, {"ok": False, "error": str(exc)})
+                if on_done:
+                    on_done(None, str(exc))
+                else:
+                    styled_warning(self, "定时计划", str(exc))
+                return
+            reply = f"已创建定时计划：{schedule_item.get('title')}，每天 {format_schedule_time(schedule_item)} 触发。"
+            self.add_status_bubble(reply)
+            if request_id:
+                self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": reply, "schedule": schedule_item})
+            if on_done:
+                on_done(schedule_item, "")
+
+        worker.finished_signal.connect(finish)
+        worker.start()
 
     def is_automation_request_running(self) -> bool:
         return bool(
@@ -12186,15 +12753,28 @@ class ChatPage(QWidget):
                 styled_warning(dialog, "定时计划", "请填写计划内容。")
                 return
             try:
-                create_workspace_schedule(self.project_root, title_input.text().strip() or prompt[:36], prompt, hour, minute)
+                add_btn.setEnabled(False)
+                add_btn.setText("生成计划中...")
+                self.create_schedule_with_ai_plan(
+                    title=title_input.text().strip() or prompt[:36],
+                    user_request=prompt,
+                    hour=hour,
+                    minute=minute,
+                    on_done=lambda _item, error: (
+                        add_btn.setEnabled(True),
+                        add_btn.setText("新增计划"),
+                        None if error else title_input.clear(),
+                        None if error else hour_input.clear(),
+                        None if error else minute_input.clear(),
+                        None if error else prompt_input.clear(),
+                        styled_warning(dialog, "定时计划", error) if error else refresh_list(),
+                    ),
+                )
             except Exception as exc:
+                add_btn.setEnabled(True)
+                add_btn.setText("新增计划")
                 styled_warning(dialog, "定时计划", str(exc))
                 return
-            title_input.clear()
-            hour_input.clear()
-            minute_input.clear()
-            prompt_input.clear()
-            refresh_list()
 
         add_btn.clicked.connect(add_schedule)
         form_layout.addWidget(add_btn)
@@ -13333,13 +13913,13 @@ class ChatPage(QWidget):
         busy = self.is_automation_busy()
         local_execution_running = self.is_execution_running()
         if self.automation_composer_input_column is not None:
-            self.automation_composer_input_column.setVisible(not busy)
-        self.automation_input.setEnabled(not local_execution_running)
+            self.automation_composer_input_column.setVisible(True)
+        self.automation_input.setEnabled(True)
         if self.automation_skill_btn is not None:
             self.automation_skill_btn.setEnabled(not local_execution_running)
             self.update_automation_skill_button()
         if busy:
-            self.automation_input.setPlaceholderText("可以先写下一轮草稿；点击右侧按钮可暂停当前回复。")
+            self.automation_input.setPlaceholderText("等待执行完成。现在可以输入草稿")
             self.automation_send_btn.setIcon(line_icon("pause", "#ffffff", 20))
             self.automation_send_btn.setStyleSheet(f"""
                 QToolButton {{
