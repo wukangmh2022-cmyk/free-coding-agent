@@ -249,6 +249,15 @@ def set_wechat_bridge_enabled_setting(enabled: bool):
     settings["wechat_bridge_enabled"] = _WECHAT_BRIDGE_ENABLED
     save_app_settings(settings)
 
+def wechat_connector_autostart_setting() -> bool:
+    return bool(load_app_settings().get("wechat_connector_autostart", True))
+
+
+def set_wechat_connector_autostart_setting(enabled: bool):
+    settings = load_app_settings()
+    settings["wechat_connector_autostart"] = bool(enabled)
+    save_app_settings(settings)
+
 
 def wechat_bridge_settings() -> Dict[str, object]:
     settings = load_app_settings()
@@ -281,131 +290,27 @@ def wechat_connector_root() -> str:
     return os.path.join(AGENT_HOME_DIR, "wechat_connector")
 
 
-def wechat_connector_script_path() -> str:
-    return os.path.join(wechat_connector_root(), "agent-qt-wechat.mjs")
+def wechat_connector_account_path() -> str:
+    return os.path.join(wechat_connector_root(), "account.json")
 
 
-def write_wechat_connector_files() -> str:
-    root = wechat_connector_root()
-    os.makedirs(root, exist_ok=True)
-    package_json = {
-        "type": "module",
-        "private": True,
-        "dependencies": {
-            "weixin-agent-sdk": "^0.1.0",
-        },
-    }
-    with open(os.path.join(root, "package.json"), "w", encoding="utf-8") as f:
-        json.dump(package_json, f, ensure_ascii=False, indent=2)
-    script = r'''import { login, start } from "weixin-agent-sdk";
-
-const bridgeUrl = (process.env.AGENT_QT_WECHAT_BRIDGE_URL || "http://127.0.0.1:8798").replace(/\/$/, "");
-const apiKey = process.env.AGENT_QT_WECHAT_API_KEY || "";
-const model = process.env.AGENT_QT_WECHAT_MODEL || "agent-qt-wechat";
-
-async function askAgentQt(req) {
-  const text = String(req.text || "").trim();
-  if (!text && !req.media) {
-    return { text: "收到空消息。" };
-  }
-  const messages = [
-    {
-      role: "user",
-      content: text || `[微信${req.media?.type || "媒体"}消息] ${req.media?.fileName || req.media?.filePath || ""}`,
-    },
-  ];
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  const resp = await fetch(`${bridgeUrl}/v1/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model,
-      user: req.conversationId || "wechat",
-      thread_id: req.conversationId || "wechat",
-      silent: true,
-      messages,
-    }),
-  });
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    return { text: `Agent Qt 调用失败：${payload.error || payload.detail || resp.statusText}` };
-  }
-  const reply = payload?.choices?.[0]?.message?.content || payload.reply || payload.text || "已处理。";
-  return { text: String(reply) };
-}
-
-const agent = { chat: askAgentQt };
-const command = process.argv[2] || "start";
-
-if (command === "login") {
-  console.log("请用微信扫描下面的二维码完成登录。");
-  await login();
-  console.log("微信登录完成。");
-} else if (command === "start") {
-  console.log(`Agent Qt 微信机器人已启动，连接到 ${bridgeUrl}`);
-  const bot = start(agent);
-  await bot.wait();
-} else {
-  console.log("用法: node agent-qt-wechat.mjs login|start");
-  process.exit(1);
-}
-'''
-    with open(wechat_connector_script_path(), "w", encoding="utf-8") as f:
-        f.write(script)
-    return root
+def wechat_connector_sync_path(account_id: str) -> str:
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", account_id or "default")
+    return os.path.join(wechat_connector_root(), f"sync-{safe_id}.txt")
 
 
-def wechat_connector_command(action: str, bridge_url: str, api_key: str = "") -> str:
-    root = write_wechat_connector_files()
-    script = wechat_connector_script_path()
-    action = "login" if action == "login" else "start"
-    if platform.system() == "Windows":
-        return POWERSHELL_COMMAND_PREFIX + f"""$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$Root = {ps_quote(root)}
-Set-Location -LiteralPath $Root
-Write-Host "[Agent Qt] 微信连接器"
-Write-Host "目录: $Root"
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) {{
-    throw "未找到 Node.js。微信连接器需要 Node.js 22+。请先安装 Node.js 后重试。"
-}}
-$nodeMajor = [int]((& node -p "process.versions.node.split('.')[0]").Trim())
-if ($nodeMajor -lt 22) {{
-    throw "当前 Node.js 版本低于 22。微信连接器需要 Node.js 22+。"
-}}
-if (-not (Test-Path -LiteralPath (Join-Path $Root 'node_modules'))) {{
-    Write-Host "首次使用，安装微信连接器依赖..."
-    npm install
-    if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
-}}
-$env:AGENT_QT_WECHAT_BRIDGE_URL = {ps_quote(bridge_url)}
-$env:AGENT_QT_WECHAT_API_KEY = {ps_quote(api_key)}
-$env:AGENT_QT_WECHAT_MODEL = 'agent-qt-wechat'
-node {ps_quote(script)} {action}
-"""
-    return f"""set -e
-cd {shlex.quote(root)}
-echo "[Agent Qt] 微信连接器"
-echo "目录: {root}"
-if ! command -v node >/dev/null 2>&1; then
-  echo "未找到 Node.js。微信连接器需要 Node.js 22+。请先安装 Node.js 后重试。"
-  exit 1
-fi
-NODE_MAJOR="$(node -p "process.versions.node.split('.')[0]")"
-if [ "$NODE_MAJOR" -lt 22 ]; then
-  echo "当前 Node.js 版本低于 22。微信连接器需要 Node.js 22+。"
-  exit 1
-fi
-if [ ! -d node_modules ]; then
-  echo "首次使用，安装微信连接器依赖..."
-  npm install
-fi
-export AGENT_QT_WECHAT_BRIDGE_URL={shlex.quote(bridge_url)}
-export AGENT_QT_WECHAT_API_KEY={shlex.quote(api_key)}
-export AGENT_QT_WECHAT_MODEL=agent-qt-wechat
-node {shlex.quote(script)} {action}
-"""
+def wechat_connector_state_text() -> str:
+    path = wechat_connector_account_path()
+    if not os.path.exists(path):
+        return "未登录"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        account_id = str(payload.get("account_id") or "")
+        saved_at = str(payload.get("saved_at") or "")
+        return f"已保存登录：{account_id or 'unknown'} {saved_at}".strip()
+    except Exception:
+        return "登录状态文件损坏，请重新扫码登录"
 
 
 def set_wechat_bridge_settings(payload: Dict[str, object]):
@@ -956,15 +861,17 @@ def install_agent_python_runtime(status_callback=None) -> str:
 # 系统提示词
 # ============================================================
 SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
+## 历史消息与最新消息权衡
+- 如果用户最新的消息与之前正在处理的事情不同，那么优先转为新的任务，处理用户最新的对话需求，除非用户主动提到历史任务，否则不用再主动继续历史任务。
 
 ## 输出协议
 - 自然问答或展示代码时，正常使用 Markdown fenced 代码块即可。
 - 需要本地执行时，只输出一个 Markdown fenced `{command_block_lang}` 命令块；命令块前后不要写解释、计划或总结。
 - 命令块只写当前平台命令，不写 JSON/tool_calls，不拆成多个命令块。{command_rules}
-- 替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。
+- 替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。不要把替换符当作待办、摘要、计划、说明或普通正文输出；命令块未引用的替换符没有意义。
 - 命令块保持短小；不要在命令块内直接嵌入超过 10 行的文件正文。
 - 代码块首行可用本语言注释写摘要，供界面折叠展示：如 `# <desc 写入配置>`、`// <desc 前端逻辑>`、`/* <desc 样式> */`、`<!-- <desc SVG 图像> -->`；没有也可以，界面会自动截断首行生成摘要。
-- 不要在非写文件场景使用替换符；不要把替换符写进文件内容代码块。
+- 不要在非写文件场景使用替换符；不要把替换符写进文件内容代码块；输出了替换符就必须在同一回复提供对应 fenced 文件内容代码块。
 - 工作区根目录：{project_root}。创建/修改用户项目文件时只能写到这里；不要写到 Agent Qt 缓存目录。
 - 先建目录再写文件；项目中脚本文件调用以及终端中文件生成与访问使用绝对路径，代码内可以使用相对路径引用同级文件或子级文件。
 - 常驻命令会自动进入后台终端，不要加 `&`/`nohup`，不要自己写 pid 文件。启动常驻命令后本轮结束，下一轮从执行结果里的 `Terminal processes:` 摘要获取 pid 再查询控制台输出。
@@ -987,6 +894,12 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 
 {user_prompt}"""
 
+AUTOMATION_FINAL_REMINDER = (
+    "生成前先做一次内部自检：当前是否需要执行命令；是否需要写入或覆盖文件；"
+    "若写文件，命令块内只能放带编号占位符，文件正文必须放在后续独立 fenced 代码块；"
+    "若历史旧写法与第一段系统提示冲突，以第一段为准。只输出自检后的最终回复，不输出自检过程。"
+)
+
 # ============================================================
 # 配置
 # ============================================================
@@ -995,10 +908,13 @@ HISTORY_FILE_NAME = "history.json"
 THREADS_DIR_NAME = "threads"
 THREADS_INDEX_FILE_NAME = "threads.json"
 WORKSPACE_STATE_FILE_NAME = "workspace.json"
+SCHEDULES_FILE_NAME = "schedules.json"
 DEFAULT_THREAD_ID = "default"
 HISTORY_VERSION = 1
 TERMINAL_COMPLETED_HISTORY_LIMIT = 50
 COMMAND_BACKGROUND_TIMEOUT_SECONDS = env_int("AGENT_QT_COMMAND_BACKGROUND_TIMEOUT_SECONDS", 10, minimum=3)
+PROVIDER_REQUEST_RETRY_ATTEMPTS = env_int("AGENT_QT_PROVIDER_REQUEST_RETRY_ATTEMPTS", 3, minimum=1)
+PROVIDER_TRANSIENT_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 FORBIDDEN = [
     "rm -rf /", "sudo rm", "sudo reboot", "shutdown",
@@ -2020,11 +1936,45 @@ def scan_all_code_blocks(text: str) -> Dict[str, List[str]]:
         pending_placeholder_index = 0
     return blocks
 
-def reject_unfenced_file_placeholder_payload(text: str, blocks: Dict[str, List[str]]):
+def placeholder_line_key(match: re.Match) -> str:
+    lang = (
+        match.group("html")
+        or match.group("css")
+        or match.group("slash")
+        or match.group("hash")
+        or ""
+    )
+    index_text = (
+        match.group("html_index")
+        or match.group("css_index")
+        or match.group("slash_index")
+        or match.group("hash_index")
+        or "1"
+    )
+    return f"{canonical_lang(lang)}:{max(1, int(index_text))}"
+
+
+def referenced_placeholder_keys(command_text: str) -> set[str]:
+    keys: set[str] = set()
+    for line in str(command_text or "").splitlines():
+        match = NUMBERED_PLACEHOLDER_LINE_RE.match(line)
+        if match:
+            keys.add(placeholder_line_key(match))
+    return keys
+
+
+def reject_unfenced_file_placeholder_payload(
+    text: str,
+    blocks: Dict[str, List[str]],
+    required_keys: Optional[set[str]] = None,
+):
     lines = str(text or "").splitlines()
     in_code = False
     fence_char = ""
     fence_len = 0
+    required_keys = required_keys or set()
+    if not required_keys:
+        return
 
     def opening_fence(line: str) -> Optional[re.Match]:
         return re.match(r"^\s*(`{3,}|~{3,})", line)
@@ -2051,6 +2001,8 @@ def reject_unfenced_file_placeholder_payload(text: str, blocks: Dict[str, List[s
             continue
         placeholder_match = NUMBERED_PLACEHOLDER_LINE_RE.match(line)
         if not placeholder_match:
+            continue
+        if placeholder_line_key(placeholder_match) not in required_keys:
             continue
         lang = (
             placeholder_match.group("html")
@@ -2450,7 +2402,6 @@ def command_block_from_blocks(blocks: Dict[str, List[str]]) -> tuple[str, str]:
 
 def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
     """提取当前平台命令块并替换占位符。"""
-    reject_unfenced_file_placeholder_payload(text, blocks)
     command_text, command_lang = command_block_from_blocks(blocks)
     if not command_text:
         plain_block = get_code_block(blocks, "text") or ""
@@ -2462,6 +2413,7 @@ def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
             command_text = text
     if not command_text:
         return []
+    reject_unfenced_file_placeholder_payload(text, blocks, referenced_placeholder_keys(command_text))
     command_text = resolve_all_placeholders(command_text, blocks)
     if command_lang == "powershell":
         return [POWERSHELL_COMMAND_PREFIX + command_text.strip()] if command_text.strip() else []
@@ -3561,6 +3513,71 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
 """
 
+WECHAT_COMMAND_MENU_TEXT = """你可以这样说：
+显示菜单：查看这份说明
+停止当前任务：停止 AI 输出或本地执行
+列出会话列表：查看所有会话
+切换到 会话ID：切换会话
+新建会话 名称：创建一个新会话
+显示文件列表：返回当前工作区的多层级文本树
+列出定时计划：查看当前计划
+每天 7 点做某事：创建每日计划
+
+也可以直接发送自然语言需求，让 Agent Qt 处理当前工作区。"""
+
+
+def is_wechat_menu_command(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    return normalized in {"/help", "help", "/menu", "menu", "菜单", "帮助", "指令", "/指令", "/菜单", "/帮助"}
+
+
+def parse_wechat_builtin_command(text: str) -> Dict[str, str]:
+    raw = str(text or "").strip()
+    compact = re.sub(r"\s+", "", raw).lower()
+    if not compact:
+        return {}
+    if compact in {"/stop", "停止", "暂停", "中断", "停止当前任务", "暂停当前任务", "停止输出", "停止执行"}:
+        return {"action": "stop"}
+    if (
+        compact in {"/threads", "/conversations", "/ls", "会话列表", "对话列表", "列出会话", "列出对话", "显示会话", "显示对话"}
+        or ("会话" in compact and any(word in compact for word in ("列表", "列出", "显示", "查看", "有哪些")))
+        or ("对话" in compact and any(word in compact for word in ("列表", "列出", "显示", "查看", "有哪些")))
+    ):
+        return {"action": "threads"}
+    if (
+        compact in {"文件列表", "文件树", "目录树", "显示文件", "显示文件夹", "显示目录", "列出文件", "列出目录", "有哪些文件", "项目文件"}
+        or (("文件" in compact or "文件夹" in compact or "目录" in compact) and any(word in compact for word in ("列表", "列出", "显示", "查看", "有哪些", "多少", "数量", "树")))
+    ):
+        return {"action": "project_tree"}
+    if (
+        compact in {"/schedule", "/schedules", "计划列表", "日程列表", "定时计划", "列出计划", "列出定时计划", "显示计划", "显示定时计划", "查看计划", "查看定时计划", "任务列表", "定时任务", "列出任务", "列出定时任务", "显示任务", "显示定时任务", "查看任务", "查看定时任务"}
+        or (("计划" in compact or "日程" in compact or "任务" in compact) and any(word in compact for word in ("列表", "列出", "显示", "查看", "有哪些")))
+    ):
+        return {"action": "schedules"}
+    schedule_payload = parse_daily_schedule_request(raw)
+    if schedule_payload:
+        return {"action": "create_schedule", **schedule_payload}
+    new_match = re.match(r"^(?:/new|新建会话|创建会话|新建对话|创建对话|新开会话|新开对话)[:：\s]*(.*)$", raw, re.I)
+    if new_match:
+        return {"action": "new_thread", "title": (new_match.group(1) or "").strip() or "微信会话"}
+    select_match = re.match(r"^(?:/select|切换到|切换会话|切到|进入会话|选择会话)[:：\s]*(.+)$", raw, re.I)
+    if select_match:
+        return {"action": "select_thread", "thread_id": (select_match.group(1) or "").strip()}
+    return {}
+
+
+def build_wechat_user_prompt(text: str) -> str:
+    return (
+        "【微信远控消息】\n"
+        "用户从手机微信发送以下需求。请按 Agent Qt 输出协议行动；最终给微信的回复会被压缩展示，所以结论要短。"
+        "微信可用控制指令包括：显示菜单、停止当前任务、列出会话列表、切换到某个会话、新建会话、显示文件列表。"
+        "用户会用自然语言表达这些指令，例如“列出会话列表”“切换到 xxx”“新建一个会话”“显示文件夹”。"
+        "用户也可以说“列出定时计划”或“每天 7 点做某事”来查看/创建 schedule；这类计划由 Agent Qt 定时触发。"
+        "如果用户要求截图、打开文件给他看、或发送图片，请优先生成可查看的图片文件并在结论里说明；原生图片回传由微信通道处理。"
+        "如果用户询问菜单、帮助或支持哪些指令，请直接说明这些指令，不要执行项目命令。\n\n"
+        f"用户消息：\n{text.strip()}"
+    )
+
 
 def plaintext_fence(title: str, content: str) -> str:
     safe_content = str(content or "").strip()
@@ -3905,6 +3922,274 @@ def create_workspace_thread(root: str, threads: List[Dict[str, object]]) -> Dict
     save_workspace_threads(root, updated)
     os.makedirs(history_dir(root, thread_id), exist_ok=True)
     return thread
+
+
+def ensure_workspace_thread(root: str, threads: List[Dict[str, object]], thread_id: str, title: str) -> Dict[str, object]:
+    safe_id = safe_thread_id(thread_id)
+    normalized = normalize_threads(threads)
+    for thread in normalized:
+        if str(thread.get("id")) == safe_id:
+            return thread
+    thread = {
+        "id": safe_id,
+        "title": title.strip() or "微信会话",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_workspace_threads(root, [*normalized, thread])
+    os.makedirs(history_dir(root, safe_id), exist_ok=True)
+    return thread
+
+
+def project_tree_text(root: str, max_depth: int = 4, max_entries: int = 180) -> str:
+    root = os.path.abspath(os.path.expanduser(root or ""))
+    if not root or not os.path.isdir(root):
+        return "当前工作区目录不可用。"
+    skip_dirs = {".git", ".agent_qt", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".next"}
+    lines = [os.path.basename(root) or root]
+    counts = {"dirs": 0, "files": 0, "omitted": 0}
+
+    def visible_entries(path: str):
+        try:
+            names = sorted(os.listdir(path), key=lambda value: (not os.path.isdir(os.path.join(path, value)), value.lower()))
+        except OSError:
+            return []
+        result = []
+        for name in names:
+            if name.startswith(".") and name not in {".env", ".gitignore"}:
+                continue
+            full = os.path.join(path, name)
+            if os.path.isdir(full) and name in skip_dirs:
+                continue
+            result.append((name, full))
+        return result
+
+    def walk(path: str, prefix: str = "", depth: int = 0):
+        if len(lines) >= max_entries:
+            counts["omitted"] += 1
+            return
+        if depth >= max_depth:
+            remaining = len(visible_entries(path))
+            if remaining:
+                lines.append(f"{prefix}└── ...（还有 {remaining} 项）")
+                counts["omitted"] += remaining
+            return
+        entries = visible_entries(path)
+        for index, (name, full) in enumerate(entries):
+            if len(lines) >= max_entries:
+                counts["omitted"] += len(entries) - index
+                break
+            last = index == len(entries) - 1
+            branch = "└── " if last else "├── "
+            if os.path.isdir(full):
+                counts["dirs"] += 1
+                lines.append(f"{prefix}{branch}{name}/")
+                walk(full, prefix + ("    " if last else "│   "), depth + 1)
+            else:
+                counts["files"] += 1
+                lines.append(f"{prefix}{branch}{name}")
+
+    walk(root)
+    summary = f"目录 {counts['dirs']} 个，文件 {counts['files']} 个"
+    if counts["omitted"]:
+        summary += f"，省略 {counts['omitted']} 项"
+    return summary + "\n" + "\n".join(lines)
+
+
+def schedules_path(root: str) -> str:
+    return os.path.join(root, HISTORY_DIR_NAME, SCHEDULES_FILE_NAME)
+
+
+def safe_schedule_id(schedule_id: str = "") -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(schedule_id or "").strip().lower()).strip("-_")
+    return cleaned[:72] or f"schedule-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+
+def normalize_schedule(raw: object) -> Optional[Dict[str, object]]:
+    if not isinstance(raw, dict):
+        return None
+    schedule_id = safe_schedule_id(str(raw.get("id") or ""))
+    title = str(raw.get("title") or raw.get("name") or "定时计划").strip() or "定时计划"
+    prompt = str(raw.get("prompt") or raw.get("content") or "").strip()
+    schedule = dict(raw.get("schedule") or {})
+    hour = schedule.get("hour")
+    minute = schedule.get("minute")
+    try:
+        hour = int(hour)
+        minute = int(minute)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and prompt):
+        return None
+    return {
+        "id": schedule_id,
+        "title": title[:80],
+        "prompt": prompt,
+        "enabled": bool(raw.get("enabled", True)),
+        "schedule": {"type": "daily", "hour": hour, "minute": minute},
+        "schedule_text": str(raw.get("schedule_text") or f"每天 {hour:02d}:{minute:02d}").strip(),
+        "created_at": str(raw.get("created_at") or datetime.now().isoformat(timespec="seconds")),
+        "updated_at": str(raw.get("updated_at") or datetime.now().isoformat(timespec="seconds")),
+        "last_run_key": str(raw.get("last_run_key") or ""),
+        "last_run_at": str(raw.get("last_run_at") or ""),
+    }
+
+
+def load_workspace_schedules(root: str) -> List[Dict[str, object]]:
+    path = schedules_path(root)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if payload.get("version") != HISTORY_VERSION:
+        return []
+    schedules: List[Dict[str, object]] = []
+    for raw in payload.get("tasks") or []:
+        schedule = normalize_schedule(raw)
+        if schedule:
+            schedules.append(schedule)
+    for raw in payload.get("schedules") or []:
+        schedule = normalize_schedule(raw)
+        if schedule and not any(item.get("id") == schedule.get("id") for item in schedules):
+            schedules.append(schedule)
+    schedules.sort(key=lambda item: str(item.get("created_at") or ""))
+    return schedules
+
+
+def save_workspace_schedules(root: str, schedules: List[Dict[str, object]]) -> bool:
+    if not root:
+        return False
+    normalized = [schedule for schedule in (normalize_schedule(item) for item in schedules) if schedule]
+    try:
+        os.makedirs(os.path.join(root, HISTORY_DIR_NAME), exist_ok=True)
+        path = schedules_path(root)
+        tmp_path = path + ".tmp"
+        payload = {
+            "version": HISTORY_VERSION,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "schedules": normalized,
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+        return True
+    except OSError:
+        return False
+
+
+def create_workspace_schedule(root: str, title: str, prompt: str, hour: int, minute: int, enabled: bool = True) -> Dict[str, object]:
+    schedules = load_workspace_schedules(root)
+    now = datetime.now().isoformat(timespec="seconds")
+    base = safe_schedule_id(title or f"daily-{hour:02d}{minute:02d}")
+    existing = {str(schedule.get("id") or "") for schedule in schedules}
+    schedule_id = base
+    suffix = 2
+    while schedule_id in existing:
+        schedule_id = f"{base}-{suffix}"
+        suffix += 1
+    schedule_item = {
+        "id": schedule_id,
+        "title": (title.strip() or "定时计划")[:80],
+        "prompt": prompt.strip(),
+        "enabled": bool(enabled),
+        "schedule": {"type": "daily", "hour": int(hour), "minute": int(minute)},
+        "schedule_text": f"每天 {int(hour):02d}:{int(minute):02d}",
+        "created_at": now,
+        "updated_at": now,
+        "last_run_key": "",
+        "last_run_at": "",
+    }
+    normalized = normalize_schedule(schedule_item)
+    if not normalized:
+        raise RuntimeError("计划内容不完整。")
+    if not save_workspace_schedules(root, [*schedules, normalized]):
+        raise RuntimeError("保存计划失败。")
+    return normalized
+
+
+def update_workspace_schedule(root: str, schedule_id: str, patch: Dict[str, object]) -> bool:
+    schedules = load_workspace_schedules(root)
+    safe_id = safe_schedule_id(schedule_id)
+    updated = []
+    found = False
+    for schedule_item in schedules:
+        if str(schedule_item.get("id") or "") == safe_id:
+            merged = dict(schedule_item)
+            merged.update(patch)
+            merged["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            schedule_item = merged
+            found = True
+        updated.append(schedule_item)
+    return found and save_workspace_schedules(root, updated)
+
+
+def delete_workspace_schedule(root: str, schedule_id: str) -> bool:
+    safe_id = safe_schedule_id(schedule_id)
+    schedules = [schedule for schedule in load_workspace_schedules(root) if str(schedule.get("id") or "") != safe_id]
+    return save_workspace_schedules(root, schedules)
+
+
+def parse_daily_schedule_request(text: str) -> Dict[str, str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    if not any(word in raw for word in ("每天", "每日")):
+        return {}
+    time_match = re.search(r"(每天|每日)\s*(凌晨|早上|上午|中午|下午|晚上|夜里)?\s*(\d{1,2})(?:\s*(?:点|:|：)\s*(\d{1,2}|半)?)?", raw)
+    if not time_match:
+        return {}
+    hour = int(time_match.group(3))
+    minute_text = time_match.group(4) or "0"
+    minute = 30 if minute_text == "半" else int(minute_text)
+    period = time_match.group(2) or ""
+    if period in {"下午", "晚上", "夜里"} and 1 <= hour < 12:
+        hour += 12
+    if period == "中午" and 1 <= hour < 11:
+        hour += 12
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return {}
+    title_source = re.sub(r"^(帮我|请|创建|新建|添加|设置|设定|安排)?\s*(一个)?\s*(定时)?(计划|日程|任务)?[:：，,\s]*", "", raw).strip()
+    title = title_source[:36] or "每日计划"
+    return {
+        "title": title,
+        "prompt": raw,
+        "hour": str(hour),
+        "minute": str(minute),
+    }
+
+
+def format_schedule_time(schedule_item: Dict[str, object]) -> str:
+    schedule = dict(schedule_item.get("schedule") or {})
+    try:
+        return f"{int(schedule.get('hour')):02d}:{int(schedule.get('minute')):02d}"
+    except (TypeError, ValueError):
+        return "--:--"
+
+
+def schedules_summary_text(schedules: List[Dict[str, object]]) -> str:
+    if not schedules:
+        return "当前没有定时计划。"
+    lines = ["当前定时计划："]
+    for index, schedule_item in enumerate(schedules, start=1):
+        state = "开启" if bool(schedule_item.get("enabled", True)) else "暂停"
+        title = str(schedule_item.get("title") or schedule_item.get("id") or "定时计划")
+        lines.append(f"{index}. {title}｜每天 {format_schedule_time(schedule_item)}｜{state}")
+    return "\n".join(lines)
+
+
+def skills_summary_text(skills: List[Dict[str, str]]) -> str:
+    if not skills:
+        return "当前工作区没有已安装技能。"
+    lines = ["当前工作区技能："]
+    for skill in skills[:30]:
+        name = str(skill.get("name") or skill.get("id") or "").strip()
+        description = str(skill.get("description") or "").strip()
+        lines.append(f"- {name}: {description or '暂无简介'}")
+    if len(skills) > 30:
+        lines.append(f"- 另外还有 {len(skills) - 30} 个技能未展开。")
+    return "\n".join(lines)
 
 
 def skills_root(root: str) -> str:
@@ -6179,7 +6464,14 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         plugin_python = automation_venv_python(self.plugin_root)
         return plugin_python if os.path.exists(plugin_python) else ""
 
-    def request_json(self, method: str, path: str, payload: Optional[dict] = None, timeout: int = 30) -> dict:
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[dict] = None,
+        timeout: int = 30,
+        attempts: int = 1,
+    ) -> dict:
         started = time.perf_counter()
         encode_started = time.perf_counter()
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -6188,43 +6480,73 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         if payload is not None:
             request.add_header("Content-Type", "application/json")
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        try:
-            http_started = time.perf_counter()
-            with opener.open(request, timeout=timeout) as response:
-                raw = response.read()
-            http_ms = int((time.perf_counter() - http_started) * 1000)
-            decode_started = time.perf_counter()
-            decoded = json.loads(raw.decode("utf-8"))
-            decode_ms = int((time.perf_counter() - decode_started) * 1000)
-            total_ms = int((time.perf_counter() - started) * 1000)
-            if total_ms >= 250 or encode_ms >= 80 or decode_ms >= 80:
-                logger.warning(
-                    "Provider request timing method=%s path=%s request_bytes=%d response_bytes=%d encode_ms=%d http_ms=%d decode_ms=%d total_ms=%d",
-                    method,
-                    path,
-                    len(data or b""),
-                    len(raw),
-                    encode_ms,
-                    http_ms,
-                    decode_ms,
-                    total_ms,
-                )
-            return decoded
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            message = detail.strip() or f"HTTP {exc.code}"
+        attempts = max(1, int(attempts or 1))
+        for attempt in range(1, attempts + 1):
             try:
-                payload_detail = json.loads(detail)
-                if isinstance(payload_detail, dict) and payload_detail.get("detail"):
-                    message = str(payload_detail["detail"])
-            except Exception:
-                pass
-            if "input box not found" in message.lower() or "please login" in message.lower():
-                message = (
-                    "网页登录还没有准备好，provider 没找到聊天输入框。\n\n"
-                    "请在设置里点击“打开网页登录”，完成登录后保持页面在聊天界面，再重新发送。"
-                )
-            raise RuntimeError(message) from exc
+                http_started = time.perf_counter()
+                with opener.open(request, timeout=timeout) as response:
+                    raw = response.read()
+                http_ms = int((time.perf_counter() - http_started) * 1000)
+                decode_started = time.perf_counter()
+                decoded = json.loads(raw.decode("utf-8"))
+                decode_ms = int((time.perf_counter() - decode_started) * 1000)
+                total_ms = int((time.perf_counter() - started) * 1000)
+                if total_ms >= 250 or encode_ms >= 80 or decode_ms >= 80:
+                    logger.warning(
+                        "Provider request timing method=%s path=%s request_bytes=%d response_bytes=%d encode_ms=%d http_ms=%d decode_ms=%d total_ms=%d attempt=%d/%d",
+                        method,
+                        path,
+                        len(data or b""),
+                        len(raw),
+                        encode_ms,
+                        http_ms,
+                        decode_ms,
+                        total_ms,
+                        attempt,
+                        attempts,
+                    )
+                return decoded
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                message = detail.strip() or f"HTTP {exc.code}"
+                try:
+                    payload_detail = json.loads(detail)
+                    if isinstance(payload_detail, dict) and payload_detail.get("detail"):
+                        message = str(payload_detail["detail"])
+                except Exception:
+                    pass
+                if "input box not found" in message.lower() or "please login" in message.lower():
+                    message = (
+                        "网页登录还没有准备好，provider 没找到聊天输入框。\n\n"
+                        "请在设置里点击“打开网页登录”，完成登录后保持页面在聊天界面，再重新发送。"
+                    )
+                if exc.code in PROVIDER_TRANSIENT_HTTP_CODES and attempt < attempts:
+                    logger.warning(
+                        "Provider transient HTTP error method=%s path=%s code=%s attempt=%d/%d message=%s",
+                        method,
+                        path,
+                        exc.code,
+                        attempt,
+                        attempts,
+                        message[:300],
+                    )
+                    time.sleep(min(5.0, 0.8 * attempt))
+                    continue
+                raise RuntimeError(f"HTTP {exc.code}: {message}") from exc
+            except (TimeoutError, urllib.error.URLError, ConnectionError) as exc:
+                if attempt < attempts:
+                    logger.warning(
+                        "Provider transient network error method=%s path=%s attempt=%d/%d error=%s",
+                        method,
+                        path,
+                        attempt,
+                        attempts,
+                        str(exc)[:300],
+                    )
+                    time.sleep(min(5.0, 0.8 * attempt))
+                    continue
+                raise RuntimeError(f"provider 网络请求失败（已重试 {attempts} 次）: {exc}") from exc
+        raise RuntimeError("provider 请求失败。")
 
     def health(self) -> bool:
         try:
@@ -6367,6 +6689,7 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
                 "extra_body": {"output_protocol": "plain"},
             },
             timeout=900,
+            attempts=PROVIDER_REQUEST_RETRY_ATTEMPTS,
         )
         try:
             return unwrap_provider_text(str(payload["choices"][0]["message"].get("content") or ""))
@@ -6535,6 +6858,7 @@ class AutomationContextBuildWorker(QThread):
             plaintext_fence("第一段：系统提示词", self.system_context),
             plaintext_fence("第二段：历史对话", history),
             plaintext_fence("第三段：当前指令", self.current_prompt),
+            plaintext_fence("第四段：生成前提醒", AUTOMATION_FINAL_REMINDER),
         ])
 
     def llm_summarize_history(self, old_text: str, recent_text: str, input_budget: int) -> str:
@@ -6891,8 +7215,24 @@ class WeChatBridge(QObject):
                         "thread_id": payload.get("user") or payload.get("thread_id") or "",
                     }, wait=True)
                     reply = str(result.get("reply") or result.get("text") or result.get("error") or "")
-                    status = 200 if result.get("ok") else 500
-                    self._send(status, {
+                    if not reply and result.get("ok"):
+                        if isinstance(result.get("threads"), list):
+                            active = str(result.get("active_thread_id") or "")
+                            items = []
+                            for thread in result.get("threads") or []:
+                                if not isinstance(thread, dict):
+                                    continue
+                                thread_id = str(thread.get("id") or "")
+                                title = str(thread.get("title") or thread_id)
+                                mark = "当前 " if thread_id == active else ""
+                                items.append(f"{mark}{title} ({thread_id})")
+                            reply = "会话列表：\n" + "\n".join(items) if items else "暂无会话。"
+                        elif result.get("active_thread_id"):
+                            reply = f"当前会话：{result.get('active_thread_id')}"
+                        else:
+                            reply = json.dumps(result, ensure_ascii=False)
+                    finish_reason = "stop" if result.get("ok") else "error"
+                    self._send(200, {
                         "id": "chatcmpl-" + uuid.uuid4().hex,
                         "object": "chat.completion",
                         "created": int(time.time()),
@@ -6900,8 +7240,10 @@ class WeChatBridge(QObject):
                         "choices": [{
                             "index": 0,
                             "message": {"role": "assistant", "content": reply},
-                            "finish_reason": "stop" if result.get("ok") else "error",
+                            "finish_reason": finish_reason,
                         }],
+                        "ok": bool(result.get("ok")),
+                        "error": "" if result.get("ok") else reply,
                     })
                     return
                 if path in {"/message", "/wechat/message", "/api/message", "/send"}:
@@ -6978,6 +7320,422 @@ class WeChatBridge(QObject):
             event = item.get("event")
         if isinstance(event, threading.Event):
             event.set()
+
+
+class WeChatConnector(QObject):
+    status_signal = Signal(str)
+    qr_signal = Signal(str)
+
+    DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
+    DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
+    BOT_TYPE = "3"
+    CHANNEL_VERSION = "agent-qt"
+
+    def __init__(self, chat_page):
+        super().__init__(chat_page)
+        self.chat_page = chat_page
+        self.stop_event = threading.Event()
+        self.monitor_thread: Optional[threading.Thread] = None
+        self.login_thread: Optional[threading.Thread] = None
+        self._running_lock = threading.Lock()
+
+    def is_running(self) -> bool:
+        thread = self.monitor_thread
+        return bool(thread and thread.is_alive())
+
+    def account(self) -> Optional[Dict[str, object]]:
+        path = wechat_connector_account_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
+    def login_async(self):
+        thread = self.login_thread
+        if thread and thread.is_alive():
+            self.status_signal.emit("微信扫码登录已在进行中。")
+            return
+        self.login_thread = threading.Thread(target=self._login_loop, name="AgentQtWeChatLogin", daemon=True)
+        self.login_thread.start()
+
+    def start(self):
+        with self._running_lock:
+            if self.is_running():
+                self.status_signal.emit("内置微信连接器已在运行。")
+                return
+            if not self.account():
+                self.status_signal.emit("还没有微信登录信息，请先扫码登录。")
+                return
+            self.stop_event.clear()
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, name="AgentQtWeChatConnector", daemon=True)
+            self.monitor_thread.start()
+            self.status_signal.emit("内置微信连接器已启动，开始监听微信消息。")
+
+    def stop(self, notify: bool = True):
+        self.stop_event.set()
+        if notify:
+            self.status_signal.emit("内置微信连接器已停止。")
+
+    def clear_login(self):
+        self.stop(notify=False)
+        try:
+            os.remove(wechat_connector_account_path())
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            self.status_signal.emit(f"清除微信登录信息失败：{exc}")
+            return
+        self.status_signal.emit("已清除微信登录信息。")
+
+    def _api_get(self, base_url: str, endpoint: str, timeout: int = 15) -> dict:
+        url = urllib.parse.urljoin(base_url.rstrip("/") + "/", endpoint)
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw or "{}")
+        return payload if isinstance(payload, dict) else {}
+
+    def _api_post(self, base_url: str, endpoint: str, body: dict, token: str = "", timeout: int = 35) -> dict:
+        url = urllib.parse.urljoin(base_url.rstrip("/") + "/", endpoint)
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        uin = base64.b64encode(str(int.from_bytes(os.urandom(4), "big")).encode("utf-8")).decode("ascii")
+        headers = {
+            "Content-Type": "application/json",
+            "Content-Length": str(len(raw)),
+            "AuthorizationType": "ilink_bot_token",
+            "X-WECHAT-UIN": uin,
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(url, data=raw, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        payload = json.loads(text or "{}")
+        return payload if isinstance(payload, dict) else {}
+
+    def _is_timeout_error(self, exc: Exception) -> bool:
+        if isinstance(exc, TimeoutError):
+            return True
+        reason = getattr(exc, "reason", None)
+        return isinstance(reason, TimeoutError) or "timed out" in str(exc).lower()
+
+    def _login_loop(self):
+        try:
+            qr = self._api_get(
+                self.DEFAULT_BASE_URL,
+                f"ilink/bot/get_bot_qrcode?bot_type={urllib.parse.quote(self.BOT_TYPE)}",
+                timeout=8,
+            )
+            qrcode = str(qr.get("qrcode") or "")
+            qrcode_url = str(qr.get("qrcode_img_content") or "")
+            if not qrcode or not qrcode_url:
+                raise RuntimeError("微信服务器没有返回二维码。")
+            self.qr_signal.emit(qrcode_url)
+            self.status_signal.emit("二维码已生成，请用微信扫码并在手机上确认。")
+            poll_base = self.DEFAULT_BASE_URL
+            deadline = time.time() + 480
+            refresh_count = 0
+            while time.time() < deadline and not self.stop_event.is_set():
+                try:
+                    status = self._api_get(
+                        poll_base,
+                        f"ilink/bot/get_qrcode_status?qrcode={urllib.parse.quote(qrcode)}",
+                        timeout=38,
+                    )
+                except Exception as exc:
+                    if not self._is_timeout_error(exc):
+                        self.status_signal.emit(f"二维码状态查询暂时失败：{exc}")
+                    time.sleep(1)
+                    continue
+                state = str(status.get("status") or "")
+                if state == "scaned":
+                    self.status_signal.emit("已扫码，请在微信里确认登录。")
+                elif state == "scaned_but_redirect":
+                    redirect_host = str(status.get("redirect_host") or "").strip()
+                    if redirect_host:
+                        poll_base = f"https://{redirect_host}"
+                elif state == "expired":
+                    refresh_count += 1
+                    if refresh_count > 3:
+                        raise RuntimeError("二维码已过期，请重新扫码登录。")
+                    qr = self._api_get(
+                        self.DEFAULT_BASE_URL,
+                        f"ilink/bot/get_bot_qrcode?bot_type={urllib.parse.quote(self.BOT_TYPE)}",
+                        timeout=8,
+                    )
+                    qrcode = str(qr.get("qrcode") or "")
+                    qrcode_url = str(qr.get("qrcode_img_content") or "")
+                    self.qr_signal.emit(qrcode_url)
+                    self.status_signal.emit("二维码已刷新，请重新扫码。")
+                elif state == "confirmed":
+                    account_id = str(status.get("ilink_bot_id") or "").strip()
+                    if not account_id:
+                        raise RuntimeError("登录成功但服务器没有返回 bot id。")
+                    payload = {
+                        "account_id": account_id,
+                        "token": str(status.get("bot_token") or ""),
+                        "base_url": str(status.get("baseurl") or self.DEFAULT_BASE_URL),
+                        "cdn_base_url": self.DEFAULT_CDN_BASE_URL,
+                        "user_id": str(status.get("ilink_user_id") or ""),
+                        "saved_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    os.makedirs(wechat_connector_root(), exist_ok=True)
+                    with open(wechat_connector_account_path(), "w", encoding="utf-8") as f:
+                        json.dump(payload, f, ensure_ascii=False, indent=2)
+                    self.status_signal.emit("微信扫码登录完成，可以启动内置连接器。")
+                    return
+                time.sleep(1)
+            raise RuntimeError("微信扫码登录超时。")
+        except Exception as exc:
+            self.status_signal.emit(f"微信扫码登录失败：{exc}")
+
+    def _monitor_loop(self):
+        account = self.account()
+        if not account:
+            self.status_signal.emit("没有微信登录信息，请先扫码登录。")
+            return
+        try:
+            self.chat_page.start_wechat_bridge_quietly()
+        except Exception:
+            pass
+        account_id = str(account.get("account_id") or "default")
+        base_url = str(account.get("base_url") or self.DEFAULT_BASE_URL)
+        token = str(account.get("token") or "")
+        sync_path = wechat_connector_sync_path(account_id)
+        get_updates_buf = ""
+        try:
+            with open(sync_path, "r", encoding="utf-8") as f:
+                get_updates_buf = f.read()
+        except Exception:
+            get_updates_buf = ""
+        failures = 0
+        while not self.stop_event.is_set():
+            try:
+                resp = self._api_post(
+                    base_url,
+                    "ilink/bot/getupdates",
+                    {
+                        "get_updates_buf": get_updates_buf,
+                        "base_info": {"channel_version": self.CHANNEL_VERSION},
+                    },
+                    token=token,
+                    timeout=38,
+                )
+                if resp.get("ret") not in (None, 0) or resp.get("errcode") not in (None, 0):
+                    failures += 1
+                    self.status_signal.emit(f"微信轮询失败：{resp.get('errmsg') or resp.get('errcode') or resp.get('ret')}")
+                    time.sleep(30 if failures >= 3 else 2)
+                    if failures >= 3:
+                        failures = 0
+                    continue
+                failures = 0
+                if resp.get("get_updates_buf"):
+                    get_updates_buf = str(resp.get("get_updates_buf") or "")
+                    os.makedirs(os.path.dirname(sync_path), exist_ok=True)
+                    with open(sync_path, "w", encoding="utf-8") as f:
+                        f.write(get_updates_buf)
+                for message in resp.get("msgs") or []:
+                    if self.stop_event.is_set() or not isinstance(message, dict):
+                        break
+                    if int(message.get("message_type") or 0) != 1:
+                        continue
+                    self._handle_inbound_message(message)
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    break
+                if self._is_timeout_error(exc):
+                    continue
+                failures += 1
+                self.status_signal.emit(f"微信连接器异常：{exc}")
+                time.sleep(30 if failures >= 3 else 2)
+                if failures >= 3:
+                    failures = 0
+
+    def _extract_message_text(self, message: dict) -> str:
+        parts: List[str] = []
+        for item in message.get("item_list") or []:
+            if not isinstance(item, dict):
+                continue
+            text_item = item.get("text_item") if isinstance(item.get("text_item"), dict) else {}
+            if text_item.get("text"):
+                parts.append(str(text_item.get("text")))
+                continue
+            voice_item = item.get("voice_item") if isinstance(item.get("voice_item"), dict) else {}
+            if voice_item.get("text"):
+                parts.append(str(voice_item.get("text")))
+        return "\n".join(part for part in parts if part.strip()).strip()
+
+    def _handle_inbound_message(self, message: dict):
+        to_user = str(message.get("from_user_id") or "").strip()
+        context_token = str(message.get("context_token") or "")
+        text = self._extract_message_text(message)
+        if not text:
+            text = "[微信媒体消息] 当前内置连接器第一版只处理文本；图片/文件稍后支持。"
+        try:
+            reply = self._call_agent_qt(text, to_user)
+        except Exception as exc:
+            reply = f"Agent Qt 调用失败：{exc}"
+        if reply and to_user:
+            try:
+                self._send_text(to_user, reply, context_token)
+            except Exception as exc:
+                self.status_signal.emit(f"微信回复发送失败：{exc}")
+
+    def _call_agent_qt(self, text: str, conversation_id: str) -> str:
+        cfg = wechat_bridge_settings()
+        bridge_url = self.chat_page.wechat_bridge.url().rstrip("/")
+        payload = {
+            "model": "agent-qt-wechat",
+            "user": conversation_id or "wechat",
+            "thread_id": conversation_id or "",
+            "silent": bool(cfg.get("silent", True)),
+            "messages": [{"role": "user", "content": text}],
+        }
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(raw))}
+        api_key = str(cfg.get("api_key") or "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(f"{bridge_url}/v1/chat/completions", data=raw, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=int(cfg.get("timeout_seconds") or 900) + 30) as resp:
+                result = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+            try:
+                payload = json.loads(detail)
+                message = payload.get("error") or payload.get("detail") or detail
+            except Exception:
+                message = detail or f"HTTP {exc.code}: {exc.reason}"
+            raise RuntimeError(str(message)) from exc
+        choices = result.get("choices") if isinstance(result, dict) else None
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+            if isinstance(message, dict) and message.get("content"):
+                return str(message.get("content"))
+        return str(result.get("reply") or result.get("text") or "已处理。")
+
+    def _send_text(self, to_user: str, text: str, context_token: str):
+        account = self.account() or {}
+        base_url = str(account.get("base_url") or self.DEFAULT_BASE_URL)
+        token = str(account.get("token") or "")
+        if not context_token:
+            raise RuntimeError("缺少 context_token，无法确定微信回复上下文。")
+        client_id = "agent-qt-" + uuid.uuid4().hex
+        body = {
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": to_user,
+                "client_id": client_id,
+                "message_type": 2,
+                "message_state": 2,
+                "item_list": [{"type": 1, "text_item": {"text": text}}],
+                "context_token": context_token,
+            },
+            "base_info": {"channel_version": self.CHANNEL_VERSION},
+        }
+        self._api_post(base_url, "ilink/bot/sendmessage", body, token=token, timeout=20)
+
+
+class WeChatQrImageWorker(QThread):
+    loaded = Signal(str, bytes, str)
+
+    def __init__(self, qr_url: str):
+        super().__init__()
+        self.qr_url = qr_url
+
+    def _generate_qr_png_with_coreimage(self, text: str) -> bytes:
+        if platform.system() != "Darwin":
+            return b""
+        swift_bin = shutil.which("swift") or "/usr/bin/swift"
+        if not os.path.exists(swift_bin):
+            return b""
+        fd, output_path = tempfile.mkstemp(prefix="agent_qt_wechat_qr_", suffix=".png")
+        os.close(fd)
+        script_fd, script_path = tempfile.mkstemp(prefix="agent_qt_wechat_qr_", suffix=".swift")
+        os.close(script_fd)
+        script = r'''
+import AppKit
+import CoreImage
+import Foundation
+
+let args = CommandLine.arguments
+guard args.count >= 3 else { exit(2) }
+let text = args[1]
+let output = args[2]
+guard let data = text.data(using: .utf8) else { exit(3) }
+let filter = CIFilter(name: "CIQRCodeGenerator")!
+filter.setValue(data, forKey: "inputMessage")
+filter.setValue("M", forKey: "inputCorrectionLevel")
+guard let image = filter.outputImage else { exit(4) }
+let scaled = image.transformed(by: CGAffineTransform(scaleX: 12, y: 12))
+let rep = NSCIImageRep(ciImage: scaled)
+let bitmap = NSBitmapImageRep(
+    bitmapDataPlanes: nil,
+    pixelsWide: rep.pixelsWide,
+    pixelsHigh: rep.pixelsHigh,
+    bitsPerSample: 8,
+    samplesPerPixel: 4,
+    hasAlpha: true,
+    isPlanar: false,
+    colorSpaceName: .deviceRGB,
+    bytesPerRow: 0,
+    bitsPerPixel: 0
+)!
+NSGraphicsContext.saveGraphicsState()
+NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+rep.draw(in: NSRect(x: 0, y: 0, width: rep.pixelsWide, height: rep.pixelsHigh))
+NSGraphicsContext.restoreGraphicsState()
+guard let png = bitmap.representation(using: .png, properties: [:]) else { exit(5) }
+try png.write(to: URL(fileURLWithPath: output))
+'''
+        try:
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script)
+            result = subprocess.run(
+                [swift_bin, script_path, text, output_path],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                **subprocess_no_window_kwargs(),
+            )
+            if result.returncode != 0:
+                return b""
+            with open(output_path, "rb") as f:
+                return f.read()
+        except Exception:
+            return b""
+        finally:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+            try:
+                os.remove(script_path)
+            except OSError:
+                pass
+
+    def run(self):
+        try:
+            url = str(self.qr_url or "")
+            if url.startswith("data:image/"):
+                _, payload = url.split(",", 1)
+                self.loaded.emit(url, base64.b64decode(payload), "")
+                return
+            generated = self._generate_qr_png_with_coreimage(url)
+            if generated:
+                self.loaded.emit(url, generated, "")
+                return
+            if url.startswith("http://") or url.startswith("https://"):
+                req = urllib.request.Request(url, headers={"User-Agent": "AgentQt/5.1"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    self.loaded.emit(url, resp.read(), "")
+                return
+            self.loaded.emit(url, b"", "二维码不是可直接加载的图片链接。")
+        except Exception as exc:
+            self.loaded.emit(str(self.qr_url or ""), b"", str(exc))
 
 
 class MarkdownRenderWorker(QThread):
@@ -9357,9 +10115,15 @@ class ChatPage(QWidget):
         self.automation_manager = AutomationProviderManager()
         self.wechat_bridge = WeChatBridge(self)
         self.wechat_bridge.request_signal.connect(self.handle_wechat_bridge_request)
+        self.wechat_connector = WeChatConnector(self)
+        self.wechat_connector.status_signal.connect(self.add_status_bubble)
+        self.wechat_connector.qr_signal.connect(self.show_wechat_qr_dialog)
+        self.wechat_qr_image_workers: List[WeChatQrImageWorker] = []
         self.wechat_active_request_id = ""
         self.wechat_active_start_index = 0
         self.wechat_active_silent = True
+        self.automation_active_messages: List[Dict[str, str]] = []
+        self.automation_active_model = ""
         self.automation_enabled = automation_enabled_setting()
         self.automation_model = AUTOMATION_DEFAULT_MODEL
         self.automation_context_mode = automation_context_mode_setting()
@@ -9400,6 +10164,11 @@ class ChatPage(QWidget):
         self.automation_loop_round = 0
         self.automation_loop_max_rounds = AUTOMATION_LOOP_MAX_ROUNDS
         self.automation_loop_goal = ""
+        self.active_schedule_id = ""
+        self.schedule_timer = QTimer(self)
+        self.schedule_timer.setInterval(30000)
+        self.schedule_timer.timeout.connect(self.check_due_schedules)
+        self.schedule_timer.start()
         self._ensure_ai_entry_pending = False
         self._last_status_message = ""
         self._last_status_at = 0.0
@@ -9407,6 +10176,7 @@ class ChatPage(QWidget):
         self.chat_scroll_programmatic = False
         self.chat_scroll_bottom_tolerance = 12
         self.automation_composer: Optional[QFrame] = None
+        self.automation_composer_input_column: Optional[QWidget] = None
         self.automation_input: Optional[QTextEdit] = None
         self.automation_send_btn: Optional[QToolButton] = None
         self.automation_context_mode_btn: Optional[QToolButton] = None
@@ -9421,6 +10191,8 @@ class ChatPage(QWidget):
         self.setup_ui()
         if wechat_bridge_enabled_setting():
             QTimer.singleShot(0, self.start_wechat_bridge_quietly)
+            if wechat_connector_autostart_setting() and self.wechat_connector.account():
+                QTimer.singleShot(600, self.start_wechat_connector_from_menu)
         else:
             QTimer.singleShot(0, self.start_console_bridge_quietly)
 
@@ -9647,6 +10419,7 @@ class ChatPage(QWidget):
         composer_layout.setContentsMargins(10, 8, 8, 8)
         composer_layout.setSpacing(8)
         composer_input_column = QWidget()
+        self.automation_composer_input_column = composer_input_column
         composer_input_column.setStyleSheet("background: transparent;")
         composer_input_layout = QVBoxLayout(composer_input_column)
         composer_input_layout.setContentsMargins(0, 0, 0, 0)
@@ -10059,12 +10832,18 @@ class ChatPage(QWidget):
             if action == "select_thread":
                 if not self.project_root:
                     raise RuntimeError("尚未打开工作区。")
-                thread_id = safe_thread_id(str((payload or {}).get("thread_id") or (payload or {}).get("id") or ""))
+                requested = str((payload or {}).get("thread_id") or (payload or {}).get("id") or "").strip()
+                thread_id = safe_thread_id(requested)
                 if not thread_id:
                     raise RuntimeError("缺少 thread_id。")
                 if self.is_automation_busy() or self.is_execution_running():
                     raise RuntimeError("当前还有任务在运行，无法切换会话。")
-                if not any(str(thread.get("id")) == thread_id for thread in normalize_threads(self.threads)):
+                threads = normalize_threads(self.threads)
+                if not any(str(thread.get("id")) == thread_id for thread in threads):
+                    title_match = next((thread for thread in threads if str(thread.get("title") or "") == requested), None)
+                    if title_match:
+                        thread_id = str(title_match.get("id") or thread_id)
+                if not any(str(thread.get("id")) == thread_id for thread in threads):
                     raise RuntimeError(f"会话不存在：{thread_id}")
                 self.switch_thread(thread_id)
                 self.wechat_bridge.finish_request(request_id, {"ok": True, "active_thread_id": self.thread_id})
@@ -10095,6 +10874,31 @@ class ChatPage(QWidget):
                 else:
                     self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": "当前没有正在运行的任务。"})
                 return
+            if action == "project_tree":
+                if not self.project_root:
+                    raise RuntimeError("尚未打开工作区。")
+                tree_text = project_tree_text(self.project_root)
+                self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": tree_text, "text": tree_text})
+                return
+            if action in {"schedules", "schedule_list"}:
+                if not self.project_root:
+                    raise RuntimeError("尚未打开工作区。")
+                reply = schedules_summary_text(load_workspace_schedules(self.project_root))
+                self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": reply, "text": reply})
+                return
+            if action == "create_schedule":
+                if not self.project_root:
+                    raise RuntimeError("尚未打开工作区。")
+                hour = int((payload or {}).get("hour"))
+                minute = int((payload or {}).get("minute") or 0)
+                prompt = str((payload or {}).get("prompt") or "").strip()
+                title = str((payload or {}).get("title") or prompt[:36] or "每日计划").strip()
+                if not prompt:
+                    raise RuntimeError("缺少计划内容。")
+                schedule_item = create_workspace_schedule(self.project_root, title, prompt, hour, minute)
+                reply = f"已创建定时计划：{schedule_item.get('title')}，每天 {format_schedule_time(schedule_item)} 触发。"
+                self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": reply, "schedule": schedule_item})
+                return
             if action == "message":
                 self.start_wechat_message_request(request_id, payload or {})
                 return
@@ -10115,24 +10919,27 @@ class ChatPage(QWidget):
         if not self.project_root:
             raise RuntimeError("尚未打开工作区。")
         command = text.strip()
-        if command == "/stop":
-            self.handle_wechat_bridge_request({"request_id": request_id, "action": "stop"})
+        if is_wechat_menu_command(command):
+            self.wechat_bridge.finish_request(request_id, {
+                "ok": True,
+                "reply": WECHAT_COMMAND_MENU_TEXT,
+                "text": WECHAT_COMMAND_MENU_TEXT,
+                "thread_id": self.thread_id,
+            })
             return
-        if command in {"/threads", "/conversations", "/ls"}:
-            self.handle_wechat_bridge_request({"request_id": request_id, "action": "threads"})
-            return
-        if command.startswith("/select "):
-            self.handle_wechat_bridge_request({"request_id": request_id, "action": "select_thread", "thread_id": command.split(None, 1)[1]})
-            return
-        if command.startswith("/new"):
-            title = command[4:].strip() or "微信会话"
-            self.handle_wechat_bridge_request({"request_id": request_id, "action": "new_thread", "title": title})
+        builtin = parse_wechat_builtin_command(command)
+        if builtin:
+            payload_for_command = {"request_id": request_id, **builtin}
+            self.handle_wechat_bridge_request(payload_for_command)
             return
         requested_thread_id = str(payload.get("thread_id") or payload.get("conversation_id") or "").strip()
         if requested_thread_id and safe_thread_id(requested_thread_id) != self.thread_id:
             target_thread_id = safe_thread_id(requested_thread_id)
             if not any(str(thread.get("id")) == target_thread_id for thread in normalize_threads(self.threads)):
-                raise RuntimeError(f"会话不存在：{target_thread_id}")
+                self.threads = load_workspace_threads(self.project_root)
+                thread = ensure_workspace_thread(self.project_root, self.threads, target_thread_id, "微信会话")
+                self.threads = load_workspace_threads(self.project_root)
+                self.sidebar.set_threads(self.threads, self.thread_id)
             if self.is_automation_busy() or self.is_execution_running():
                 raise RuntimeError("当前还有任务在运行，无法切换会话。")
             self.switch_thread(target_thread_id)
@@ -10152,10 +10959,11 @@ class ChatPage(QWidget):
         self.wechat_active_request_id = request_id
         self.wechat_active_start_index = len(self.history_entries)
         self.wechat_active_silent = silent
-        full_prompt = self.build_system_prompt(text)
+        prompt_text = build_wechat_user_prompt(text)
+        full_prompt = self.build_system_prompt(prompt_text)
         prompt_entry_id = self.add_automation_user_prompt_bubble(full_prompt, animate=True)
         self.begin_automation_loop(text)
-        self.start_automation_worker(text, "", None, None, prompt_entry_id)
+        self.start_automation_worker(prompt_text, "", None, None, prompt_entry_id)
         if self.is_automation_request_running() and self.selected_skill_ids:
             self.clear_automation_skills()
 
@@ -10200,6 +11008,7 @@ class ChatPage(QWidget):
         self.automation_loop_active = False
         self.automation_loop_round = 0
         self.automation_loop_goal = ""
+        self.active_schedule_id = ""
         self.refresh_prompt_bubble_buttons()
         self.update_automation_composer_state()
         if message:
@@ -11148,6 +11957,260 @@ class ChatPage(QWidget):
         apply_theme_palette(next_theme)
         self.apply_chat_visual_settings()
 
+    def show_preferences_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("偏好设置")
+        dialog.setMinimumWidth(460)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        title = QLabel("偏好设置")
+        title.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 15px; font-weight: 900;")
+        layout.addWidget(title)
+
+        theme_toggle = SettingsToggleRow(
+            "夜间模式",
+            "切换深色界面",
+            app_theme_setting() == "dark",
+            parent=dialog,
+        )
+        layout.addWidget(theme_toggle)
+
+        font_label = QLabel("对话字号")
+        font_label.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900;")
+        layout.addWidget(font_label)
+        font_row = QHBoxLayout()
+        font_row.setSpacing(8)
+        current_scale = chat_font_scale_setting()
+        font_buttons: List[QPushButton] = []
+        for label, scale in (("小", 0.9), ("标准", 1.0), ("大", 1.15), ("特大", 1.3)):
+            btn = QPushButton(label, cursor=Qt.CursorShape.PointingHandCursor)
+            btn.setCheckable(True)
+            btn.setChecked(abs(current_scale - scale) < 0.01)
+            btn.setFixedHeight(34)
+            font_buttons.append(btn)
+
+            def choose_font(_checked=False, value=scale, clicked=btn):
+                for item in font_buttons:
+                    item.setChecked(item is clicked)
+                self.set_chat_font_scale(value)
+
+            btn.clicked.connect(choose_font)
+            font_row.addWidget(btn, 1)
+        layout.addLayout(font_row)
+
+        language_label = QLabel("语言设置")
+        language_label.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900;")
+        layout.addWidget(language_label)
+        language_value = QLabel("简体中文")
+        language_value.setStyleSheet(f"color: {COLORS['text_secondary']}; background: {COLORS['surface_alt']}; border: 1px solid {COLORS['border']}; border-radius: 10px; padding: 9px 12px; font-size: 12px; font-weight: 800;")
+        layout.addWidget(language_value)
+
+        def refresh_font_buttons():
+            for item in font_buttons:
+                item.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {COLORS['accent'] if item.isChecked() else COLORS['surface']};
+                        color: {'white' if item.isChecked() else COLORS['text']};
+                        border: 1px solid {COLORS['accent'] if item.isChecked() else COLORS['border']};
+                        border-radius: 10px;
+                        padding: 6px 12px;
+                        font-size: 12px;
+                        font-weight: 900;
+                    }}
+                    QPushButton:hover {{ background: {COLORS['accent_dark'] if item.isChecked() else COLORS['surface_alt']}; }}
+                """)
+
+        for btn in font_buttons:
+            btn.toggled.connect(lambda _checked=False: refresh_font_buttons())
+        refresh_font_buttons()
+
+        def on_theme_toggled(enabled: bool):
+            set_app_theme_setting("dark" if enabled else "light")
+            apply_theme_palette(app_theme_setting())
+            self.apply_chat_visual_settings()
+            dialog.close()
+            self.show_preferences_dialog()
+
+        theme_toggle.toggled.connect(on_theme_toggled)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        close_btn = QPushButton("关闭", cursor=Qt.CursorShape.PointingHandCursor)
+        close_btn.setFixedHeight(34)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['surface']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+                padding: 6px 18px;
+                font-size: 12px;
+                font-weight: 900;
+            }}
+            QPushButton:hover {{ background: {COLORS['surface_alt']}; }}
+        """)
+        close_btn.clicked.connect(dialog.close)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+        dialog.exec()
+
+    def show_schedules_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("定时计划")
+        dialog.setMinimumSize(620, 520)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        title = QLabel("定时计划")
+        title.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 15px; font-weight: 900;")
+        layout.addWidget(title)
+
+        list_area = QScrollArea()
+        list_area.setWidgetResizable(True)
+        list_area.setFrameShape(QFrame.Shape.NoFrame)
+        list_area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        list_body = QWidget()
+        list_layout = QVBoxLayout(list_body)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(8)
+        list_area.setWidget(list_body)
+        layout.addWidget(list_area, 1)
+
+        def button_style(primary: bool = False) -> str:
+            return f"""
+                QPushButton {{
+                    background: {COLORS['accent'] if primary else COLORS['surface']};
+                    color: {'white' if primary else COLORS['text']};
+                    border: 1px solid {COLORS['accent'] if primary else COLORS['border']};
+                    border-radius: 10px;
+                    padding: 7px 13px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS['accent_dark'] if primary else COLORS['surface_alt']};
+                }}
+            """
+
+        def refresh_list():
+            while list_layout.count():
+                item = list_layout.takeAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.deleteLater()
+            schedules = load_workspace_schedules(self.project_root) if self.project_root else []
+            if not schedules:
+                empty = QLabel("当前没有定时计划。可以在微信里说“每天 7 点整理项目进度”，或在这里新增。")
+                empty.setWordWrap(True)
+                empty.setStyleSheet(f"color: {COLORS['text_secondary']}; background: {COLORS['surface_alt']}; border: 1px solid {COLORS['border']}; border-radius: 10px; padding: 14px; font-size: 12px; font-weight: 800;")
+                list_layout.addWidget(empty)
+            for schedule_item in schedules:
+                card = QFrame()
+                card.setStyleSheet(f"QFrame {{ background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 10px; }}")
+                card_layout = QVBoxLayout(card)
+                card_layout.setContentsMargins(12, 10, 12, 10)
+                card_layout.setSpacing(8)
+                header = QHBoxLayout()
+                name = QLabel(str(schedule_item.get("title") or "定时计划"))
+                name.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900; border: none;")
+                header.addWidget(name, 1)
+                state = SettingsToggleRow("", "", bool(schedule_item.get("enabled", True)), parent=card)
+                state.setFixedWidth(76)
+                state.toggled.connect(lambda enabled, sid=str(schedule_item.get("id") or ""): (update_workspace_schedule(self.project_root, sid, {"enabled": enabled}) if self.project_root else False, refresh_list()))
+                header.addWidget(state, 0)
+                card_layout.addLayout(header)
+                meta = QLabel(f"每天 {format_schedule_time(schedule_item)}")
+                meta.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px; font-weight: 800; border: none;")
+                card_layout.addWidget(meta)
+                prompt = QLabel(str(schedule_item.get("prompt") or ""))
+                prompt.setWordWrap(True)
+                prompt.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 12px; font-weight: 700; border: none;")
+                card_layout.addWidget(prompt)
+                action_row = QHBoxLayout()
+                run_btn = QPushButton("立即执行", cursor=Qt.CursorShape.PointingHandCursor)
+                run_btn.setStyleSheet(button_style(primary=True))
+                run_btn.clicked.connect(lambda _checked=False, item=dict(schedule_item): (dialog.close(), self.start_schedule(item)))
+                action_row.addWidget(run_btn)
+                delete_btn = QPushButton("删除", cursor=Qt.CursorShape.PointingHandCursor)
+                delete_btn.setStyleSheet(button_style())
+                delete_btn.clicked.connect(lambda _checked=False, sid=str(schedule_item.get("id") or ""): (delete_workspace_schedule(self.project_root, sid) if self.project_root else False, refresh_list()))
+                action_row.addWidget(delete_btn)
+                action_row.addStretch()
+                card_layout.addLayout(action_row)
+                list_layout.addWidget(card)
+            list_layout.addStretch()
+
+        form = QFrame()
+        form.setStyleSheet(f"QFrame {{ background: {COLORS['surface_alt']}; border: 1px solid {COLORS['border']}; border-radius: 10px; }}")
+        form_layout = QVBoxLayout(form)
+        form_layout.setContentsMargins(12, 10, 12, 10)
+        form_layout.setSpacing(8)
+        form_title = QLabel("新增每日计划")
+        form_title.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900; border: none;")
+        form_layout.addWidget(form_title)
+        title_input = QLineEdit()
+        title_input.setPlaceholderText("计划名称")
+        prompt_input = QTextEdit()
+        prompt_input.setPlaceholderText("每天到点后要让智能体做什么")
+        prompt_input.setFixedHeight(72)
+        time_row = QHBoxLayout()
+        hour_input = QLineEdit()
+        hour_input.setPlaceholderText("小时")
+        minute_input = QLineEdit()
+        minute_input.setPlaceholderText("分钟")
+        for editor in (title_input, hour_input, minute_input):
+            editor.setFixedHeight(34)
+        for editor in (title_input, hour_input, minute_input, prompt_input):
+            editor.setStyleSheet(f"background: {COLORS['surface']}; color: {COLORS['text']}; border: 1px solid {COLORS['border']}; border-radius: 9px; padding: 7px 10px; font-size: 12px; font-weight: 800;")
+        time_row.addWidget(hour_input)
+        time_row.addWidget(minute_input)
+        form_layout.addWidget(title_input)
+        form_layout.addLayout(time_row)
+        form_layout.addWidget(prompt_input)
+        add_btn = QPushButton("新增计划", cursor=Qt.CursorShape.PointingHandCursor)
+        add_btn.setFixedHeight(36)
+        add_btn.setStyleSheet(button_style(primary=True))
+
+        def add_schedule():
+            try:
+                hour = int(hour_input.text().strip())
+                minute = int(minute_input.text().strip() or "0")
+            except ValueError:
+                styled_warning(dialog, "定时计划", "时间必须是数字。")
+                return
+            prompt = prompt_input.toPlainText().strip()
+            if not prompt:
+                styled_warning(dialog, "定时计划", "请填写计划内容。")
+                return
+            try:
+                create_workspace_schedule(self.project_root, title_input.text().strip() or prompt[:36], prompt, hour, minute)
+            except Exception as exc:
+                styled_warning(dialog, "定时计划", str(exc))
+                return
+            title_input.clear()
+            hour_input.clear()
+            minute_input.clear()
+            prompt_input.clear()
+            refresh_list()
+
+        add_btn.clicked.connect(add_schedule)
+        form_layout.addWidget(add_btn)
+        layout.addWidget(form)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton("关闭", cursor=Qt.CursorShape.PointingHandCursor)
+        close_btn.setFixedHeight(34)
+        close_btn.setStyleSheet(button_style())
+        close_btn.clicked.connect(dialog.close)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+        refresh_list()
+        dialog.exec()
+
     def show_settings_menu(self):
         if agent_runtime_enabled() and not agent_runtime_ready():
             set_agent_runtime_enabled(False)
@@ -11175,6 +12238,17 @@ class ChatPage(QWidget):
         automation_toggle_action.setDefaultWidget(automation_toggle)
         menu.addAction(automation_toggle_action)
 
+        wechat_bridge_toggle = SettingsToggleRow(
+            "微信远控",
+            "开启微信手机端控制智能体的功能",
+            wechat_bridge_enabled_setting(),
+            parent=menu,
+        )
+        wechat_bridge_toggle.toggled.connect(lambda enabled, row=wechat_bridge_toggle: self.set_wechat_bridge_enabled(enabled, row))
+        wechat_bridge_toggle_action = QWidgetAction(menu)
+        wechat_bridge_toggle_action.setDefaultWidget(wechat_bridge_toggle)
+        menu.addAction(wechat_bridge_toggle_action)
+
         developer_toggle = SettingsToggleRow(
             "开发者模式",
             "显示完整代码块和详细错误信息",
@@ -11197,11 +12271,16 @@ class ChatPage(QWidget):
         runtime_open_action = QAction("打开运行环境目录", self)
         runtime_open_action.triggered.connect(self.open_python_runtime_dir)
         runtime_menu.addAction(runtime_open_action)
-        runtime_copy_action = QAction("复制 Python 路径", self)
-        runtime_copy_action.triggered.connect(self.copy_python_runtime_path)
-        runtime_menu.addAction(runtime_copy_action)
 
         automation_menu = style_compact_popup_menu(menu.addMenu("自动化插件"))
+        login_action = QAction("打开网页登录", self)
+        login_action.triggered.connect(lambda: self.run_automation_setup("login"))
+        automation_menu.addAction(login_action)
+        install_action = QAction("安装/修复", self)
+        install_action.triggered.connect(lambda: self.run_automation_setup("install"))
+        automation_menu.addAction(install_action)
+        automation_menu.addSeparator()
+
         model_menu = style_compact_popup_menu(automation_menu.addMenu("模型"))
         for label, model_id in AUTOMATION_MODELS:
             action = QAction(label, self)
@@ -11210,7 +12289,7 @@ class ChatPage(QWidget):
             action.triggered.connect(lambda _checked=False, value=model_id: self.set_automation_model(value))
             model_menu.addAction(action)
 
-        rounds_menu = style_compact_popup_menu(automation_menu.addMenu("自动化最大轮数"))
+        rounds_menu = style_compact_popup_menu(automation_menu.addMenu("最大轮数"))
         for rounds in (8, 12, 20, 50, 100):
             action = QAction(f"{rounds} 轮", self)
             action.setCheckable(True)
@@ -11219,65 +12298,42 @@ class ChatPage(QWidget):
             rounds_menu.addAction(action)
 
         automation_menu.addSeparator()
-        status_action = QAction("检查插件状态", self)
+        diagnostics_menu = style_compact_popup_menu(automation_menu.addMenu("高级诊断"))
+        status_action = QAction("检查状态", self)
         status_action.triggered.connect(self.show_automation_status)
-        automation_menu.addAction(status_action)
-        open_log_action = QAction("打开插件日志", self)
+        diagnostics_menu.addAction(status_action)
+        open_log_action = QAction("打开日志", self)
         open_log_action.triggered.connect(self.open_automation_log_file)
-        automation_menu.addAction(open_log_action)
-        copy_log_action = QAction("复制插件日志路径", self)
+        diagnostics_menu.addAction(open_log_action)
+        copy_log_action = QAction("复制日志路径", self)
         copy_log_action.triggered.connect(self.copy_automation_log_path)
-        automation_menu.addAction(copy_log_action)
-        install_action = QAction("安装/修复插件依赖", self)
-        install_action.triggered.connect(lambda: self.run_automation_setup("install"))
-        automation_menu.addAction(install_action)
-        login_action = QAction("打开网页登录", self)
-        login_action.triggered.connect(lambda: self.run_automation_setup("login"))
-        automation_menu.addAction(login_action)
+        diagnostics_menu.addAction(copy_log_action)
         open_plugin_dir_action = QAction("打开插件目录", self)
         open_plugin_dir_action.triggered.connect(self.open_automation_plugin_dir)
-        automation_menu.addAction(open_plugin_dir_action)
+        diagnostics_menu.addAction(open_plugin_dir_action)
         copy_plugin_dir_action = QAction("复制插件目录路径", self)
         copy_plugin_dir_action.triggered.connect(self.copy_automation_plugin_dir)
-        automation_menu.addAction(copy_plugin_dir_action)
-
-        wechat_menu = style_compact_popup_menu(menu.addMenu("微信接入"))
-        wechat_config_action = QAction("微信配置页", self)
-        wechat_config_action.triggered.connect(self.show_wechat_config_dialog)
-        wechat_menu.addAction(wechat_config_action)
-        wechat_start_action = QAction("启动微信 Bridge", self)
-        wechat_start_action.triggered.connect(self.start_wechat_bridge_from_menu)
-        wechat_menu.addAction(wechat_start_action)
-        wechat_stop_action = QAction("停止微信 Bridge", self)
-        wechat_stop_action.triggered.connect(self.stop_wechat_bridge_from_menu)
-        wechat_menu.addAction(wechat_stop_action)
-        wechat_copy_action = QAction("复制微信 Bridge 地址", self)
-        wechat_copy_action.triggered.connect(self.copy_wechat_bridge_url)
-        wechat_menu.addAction(wechat_copy_action)
-
+        diagnostics_menu.addAction(copy_plugin_dir_action)
         provider_action = QAction("Provider 查看", self)
         provider_action.triggered.connect(self.show_provider_info_dialog)
-        automation_menu.addAction(provider_action)
+        diagnostics_menu.addAction(provider_action)
+
+        wechat_config_action = QAction("微信配置", self)
+        wechat_config_action.triggered.connect(self.show_wechat_config_dialog)
+        menu.addAction(wechat_config_action)
+
+        schedules_action = QAction("定时计划", self)
+        schedules_action.triggered.connect(self.show_schedules_dialog)
+        menu.addAction(schedules_action)
 
         menu.addSeparator()
         home_action = QAction("返回首页", self)
         home_action.triggered.connect(self.confirm_back_home)
         menu.addAction(home_action)
         menu.addSeparator()
-        font_menu = style_compact_popup_menu(menu.addMenu("对话字号"))
-        current_scale = chat_font_scale_setting()
-        for label, scale in (("小 · 90%", 0.9), ("标准 · 100%", 1.0), ("大 · 115%", 1.15), ("特大 · 130%", 1.3)):
-            action = QAction(label, self)
-            action.setCheckable(True)
-            action.setChecked(abs(current_scale - scale) < 0.01)
-            action.triggered.connect(lambda _checked=False, value=scale: self.set_chat_font_scale(value))
-            font_menu.addAction(action)
-        theme_action = QAction("白天模式" if app_theme_setting() == "dark" else "夜间模式", self)
-        theme_action.triggered.connect(self.toggle_app_theme)
-        menu.addAction(theme_action)
-        language_action = QAction("语言设置（待实现）", self)
-        language_action.setEnabled(False)
-        menu.addAction(language_action)
+        preferences_action = QAction("偏好设置", self)
+        preferences_action.triggered.connect(self.show_preferences_dialog)
+        menu.addAction(preferences_action)
         menu.aboutToHide.connect(lambda menu=menu: setattr(self, "_settings_menu", None))
         menu.popup(self.settings_btn.mapToGlobal(self.settings_btn.rect().bottomRight()))
 
@@ -11436,38 +12492,84 @@ class ChatPage(QWidget):
         set_wechat_bridge_enabled_setting(False)
         self.add_status_bubble("微信 Bridge 已停止。")
 
+    def set_wechat_bridge_enabled(self, enabled: bool, toggle_row: Optional[SettingsToggleRow] = None):
+        if enabled:
+            try:
+                url = self.wechat_bridge.start()
+                set_wechat_bridge_enabled_setting(True)
+                if toggle_row is not None:
+                    toggle_row.setChecked(True)
+                self.add_status_bubble(f"微信本地接口已开启：{url}")
+            except Exception as exc:
+                set_wechat_bridge_enabled_setting(False)
+                if toggle_row is not None:
+                    toggle_row.setChecked(False)
+                styled_warning(self, "微信接入", str(exc))
+            return
+        self.wechat_bridge.stop()
+        set_wechat_bridge_enabled_setting(False)
+        if toggle_row is not None:
+            toggle_row.setChecked(False)
+        self.add_status_bubble("微信本地接口已关闭。")
+
     def copy_wechat_bridge_url(self):
         QApplication.clipboard().setText(self.wechat_bridge.url())
         self.add_status_bubble(f"已复制微信 Bridge 地址：{self.wechat_bridge.url()}")
 
-    def show_wechat_config_dialog(self):
-        cfg = wechat_bridge_settings()
+    def start_wechat_connector_login(self):
+        self.start_wechat_bridge_quietly()
+        self.wechat_connector.login_async()
+
+    def start_wechat_connector_from_menu(self):
+        self.start_wechat_bridge_quietly()
+        set_wechat_connector_autostart_setting(True)
+        self.wechat_connector.start()
+
+    def stop_wechat_connector_from_menu(self):
+        set_wechat_connector_autostart_setting(False)
+        self.wechat_connector.stop()
+
+    def show_wechat_qr_dialog(self, qr_url: str):
         dialog = QDialog(self)
-        dialog.setWindowTitle("微信机器人配置")
-        dialog.setMinimumWidth(560)
+        dialog.setWindowTitle("微信扫码登录")
+        dialog.setMinimumWidth(520)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
-        hint = QLabel(
-            "先说明白：只开这个页面，还不能直接读你的微信消息。微信个人号没有给桌面程序直接收发消息的接口，"
-            "中间必须有一个“微信连接器”负责登录微信、收消息、发回复。"
-        )
+        title = QLabel("用微信扫描二维码链接")
+        title.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 15px; font-weight: 900;")
+        layout.addWidget(title)
+        hint = QLabel("如果没有直接显示二维码，点“打开二维码链接”，用微信扫码后在手机上确认。")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px;")
         layout.addWidget(hint)
-
-        explain = QPlainTextEdit()
-        explain.setReadOnly(True)
-        explain.setPlainText(
-            "你手头会有 3 个东西：\n"
-            "1. 微信：真实收发消息的地方。\n"
-            "2. 微信连接器：会弹出微信扫码二维码，把微信消息转发给 Agent Qt。\n"
-            "3. Agent Qt：真正做代码、执行命令、整理回复的机器人。\n\n"
-            "本页“一键开启”做的是第 3 步：打开 Agent Qt 的本地机器人接口。\n"
-            "扫码不在 Agent Qt 这里发生，而是在“微信连接器”启动时发生。"
-        )
-        explain.setFixedHeight(170)
-        explain.setStyleSheet(f"""
+        image_label = QLabel("二维码加载中...")
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        image_label.setFixedSize(260, 260)
+        image_label.setStyleSheet(f"""
+            QLabel {{
+                background: {COLORS['surface']};
+                color: {COLORS['text_secondary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 14px;
+                padding: 10px;
+                font-size: 12px;
+            }}
+        """)
+        image_row = QHBoxLayout()
+        image_row.addStretch()
+        image_row.addWidget(image_label)
+        image_row.addStretch()
+        layout.addLayout(image_row)
+        success_hint = QLabel("如果扫码成功，微信已创建 ClawBot，可关闭此页面。")
+        success_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        success_hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px; font-weight: 800;")
+        layout.addWidget(success_hint)
+        link = QPlainTextEdit()
+        link.setReadOnly(True)
+        link.setPlainText(qr_url)
+        link.setFixedHeight(90)
+        link.setStyleSheet(f"""
             QPlainTextEdit {{
                 background: {COLORS['surface_alt']};
                 color: {COLORS['text']};
@@ -11477,30 +12579,160 @@ class ChatPage(QWidget):
                 font-size: 12px;
             }}
         """)
-        layout.addWidget(explain)
+        layout.addWidget(link)
+        row = QHBoxLayout()
+        row.addStretch()
+        open_btn = QPushButton("打开二维码链接", cursor=Qt.CursorShape.PointingHandCursor)
+        copy_btn = QPushButton("复制链接", cursor=Qt.CursorShape.PointingHandCursor)
+        close_btn = QPushButton("关闭", cursor=Qt.CursorShape.PointingHandCursor)
+        for btn in (open_btn, copy_btn, close_btn):
+            btn.setFixedHeight(34)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 10px;
+                    padding: 6px 16px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{ background: {COLORS['surface_alt']}; }}
+            """)
+            row.addWidget(btn)
+        open_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(qr_url)))
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(qr_url))
+        close_btn.clicked.connect(dialog.close)
+        layout.addLayout(row)
 
-        enabled_box = QCheckBox("启用微信 Bridge")
-        enabled_box.setChecked(wechat_bridge_enabled_setting())
+        worker = WeChatQrImageWorker(qr_url)
+        self.wechat_qr_image_workers.append(worker)
+
+        def on_loaded(url: str, data: bytes, error: str):
+            if error or not data:
+                image_label.setText("二维码图片加载失败\n请打开或复制下方链接")
+            else:
+                pixmap = QPixmap()
+                if pixmap.loadFromData(QByteArray(data)):
+                    target_size = QSize(max(1, image_label.width() - 20), max(1, image_label.height() - 20))
+                    image_label.setPixmap(pixmap.scaled(
+                        target_size,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    ))
+                else:
+                    image_label.setText("二维码图片解析失败\n请打开或复制下方链接")
+            try:
+                self.wechat_qr_image_workers.remove(worker)
+            except ValueError:
+                pass
+            worker.deleteLater()
+
+        worker.loaded.connect(on_loaded)
+        worker.start()
+        dialog.exec()
+
+    def show_wechat_config_dialog(self):
+        cfg = wechat_bridge_settings()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("微信机器人配置")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        hint = QLabel("扫码登录后启动连接器，即可用微信消息驱动当前工作区。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px; font-weight: 800;")
+        layout.addWidget(hint)
+
+        login_status = QLabel(f"当前登录状态：{wechat_connector_state_text()}")
+        login_status.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900;")
+        layout.addWidget(login_status)
+
+        primary_row = QHBoxLayout()
+        primary_row.setContentsMargins(0, 4, 0, 4)
+        primary_row.setSpacing(10)
+        login_btn = QPushButton("扫码登录微信", cursor=Qt.CursorShape.PointingHandCursor)
+        start_connector_btn = QPushButton("启动内置连接器", cursor=Qt.CursorShape.PointingHandCursor)
+        stop_connector_btn = QPushButton("停止连接器", cursor=Qt.CursorShape.PointingHandCursor)
+        for btn in (login_btn, start_connector_btn):
+            btn.setMinimumHeight(44)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['success']};
+                    color: white;
+                    border: none;
+                    border-radius: 12px;
+                    padding: 9px 18px;
+                    font-size: 13px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{ background: #0f8a59; }}
+            """)
+            primary_row.addWidget(btn, 1)
+        stop_connector_btn.setMinimumHeight(44)
+        stop_connector_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['surface']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+                padding: 9px 18px;
+                font-size: 13px;
+                font-weight: 900;
+            }}
+            QPushButton:hover {{ background: {COLORS['surface_alt']}; }}
+        """)
+        primary_row.addWidget(stop_connector_btn, 1)
+        layout.addLayout(primary_row)
+
+        advanced_btn = QToolButton(cursor=Qt.CursorShape.PointingHandCursor)
+        advanced_btn.setText("高级设置")
+        advanced_btn.setCheckable(True)
+        advanced_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        advanced_btn.setFixedHeight(28)
+        advanced_btn.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {COLORS['text_secondary']};
+                border: none;
+                font-size: 12px;
+                font-weight: 900;
+                text-align: left;
+            }}
+            QToolButton:hover {{ color: {COLORS['text']}; }}
+        """)
+        layout.addWidget(advanced_btn, 0, Qt.AlignmentFlag.AlignLeft)
+
+        advanced_panel = QWidget(dialog)
+        advanced_panel.setVisible(False)
+        advanced_panel.setStyleSheet("background: transparent;")
+        advanced_layout = QVBoxLayout(advanced_panel)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(8)
+
         silent_box = QCheckBox("静默模式：不把代码块/命令块正文回给微信")
         silent_box.setChecked(bool(cfg.get("silent", True)))
-        for box in (enabled_box, silent_box):
-            box.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 12px; font-weight: 800;")
-            layout.addWidget(box)
+        silent_box.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 12px; font-weight: 800;")
+        advanced_layout.addWidget(silent_box)
 
         host_edit = QLineEdit(str(cfg["host"]))
         port_edit = QLineEdit(str(cfg["port"]))
         key_edit = QLineEdit(str(cfg.get("api_key") or ""))
         timeout_edit = QLineEdit(str(cfg.get("timeout_seconds") or 900))
+        fields_grid = QGridLayout()
+        fields_grid.setContentsMargins(0, 0, 0, 0)
+        fields_grid.setHorizontalSpacing(10)
+        fields_grid.setVerticalSpacing(8)
         fields = [
-            ("Host", host_edit),
-            ("Port", port_edit),
-            ("API Key（可空）", key_edit),
-            ("等待超时秒数", timeout_edit),
+            ("Host", host_edit, 0, 0),
+            ("Port", port_edit, 0, 2),
+            ("API Key（可空）", key_edit, 1, 0),
+            ("等待超时秒数", timeout_edit, 1, 2),
         ]
-        for label, editor in fields:
-            row = QHBoxLayout()
+        for label, editor, row_index, col_index in fields:
             lab = QLabel(label)
-            lab.setFixedWidth(110)
+            lab.setFixedWidth(92)
             lab.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px; font-weight: 800;")
             editor.setStyleSheet(f"""
                 QLineEdit {{
@@ -11512,28 +12744,21 @@ class ChatPage(QWidget):
                     font-size: 12px;
                 }}
             """)
-            row.addWidget(lab)
-            row.addWidget(editor, 1)
-            layout.addLayout(row)
+            fields_grid.addWidget(lab, row_index, col_index)
+            fields_grid.addWidget(editor, row_index, col_index + 1)
+        fields_grid.setColumnStretch(1, 1)
+        fields_grid.setColumnStretch(3, 1)
+        advanced_layout.addLayout(fields_grid)
 
         endpoint = QPlainTextEdit()
         endpoint.setReadOnly(True)
         endpoint.setPlainText(
-            "如果你已经有微信连接器，就把它配置成调用 Agent Qt：\n"
-            f"接口地址 / Base URL: http://{cfg['host']}:{cfg['port']}/v1\n"
-            "模型名 / Model: agent-qt-wechat\n"
-            "API Key: 本页留空则随便填；本页填写了就填同一个。\n\n"
-            "如果你只有 Agent Qt 和微信，没有微信连接器：\n"
-            "这版还不能做到“点一下就让微信扫码接入”。下一步应该把连接器内置进 Agent Qt，"
-            "到时候按钮会变成“启动微信连接器”，二维码会直接在 Agent Qt 里显示。\n\n"
-            "给懂一点配置的人用的测试接口：\n"
+            f"Base URL: http://{cfg['host']}:{cfg['port']}/v1\n"
+            "Model: agent-qt-wechat\n"
             f"POST http://{cfg['host']}:{cfg['port']}/message\n"
-            '{"text":"帮我继续完成项目","thread_id":"default","silent":true}\n'
-            f"POST http://{cfg['host']}:{cfg['port']}/stop\n"
-            f"GET  http://{cfg['host']}:{cfg['port']}/threads\n\n"
-            "微信命令：/stop 停止，/threads 查看会话，/select 会话ID 切换，/new 名称 新建。"
+            '{"text":"帮我继续完成项目","thread_id":"default","silent":true}'
         )
-        endpoint.setFixedHeight(240)
+        endpoint.setFixedHeight(92)
         endpoint.setStyleSheet(f"""
             QPlainTextEdit {{
                 background: {COLORS['surface_alt']};
@@ -11544,14 +12769,17 @@ class ChatPage(QWidget):
                 font-size: 12px;
             }}
         """)
-        layout.addWidget(endpoint)
+        advanced_layout.addWidget(endpoint)
+        layout.addWidget(advanced_panel)
+        advanced_btn.toggled.connect(advanced_panel.setVisible)
 
         row = QHBoxLayout()
         row.addStretch()
-        save_btn = QPushButton("保存", cursor=Qt.CursorShape.PointingHandCursor)
+        save_btn = QPushButton("保存配置", cursor=Qt.CursorShape.PointingHandCursor)
+        clear_login_btn = QPushButton("清除登录", cursor=Qt.CursorShape.PointingHandCursor)
         copy_btn = QPushButton("复制示例", cursor=Qt.CursorShape.PointingHandCursor)
         close_btn = QPushButton("关闭", cursor=Qt.CursorShape.PointingHandCursor)
-        for btn in (save_btn, copy_btn, close_btn):
+        for btn in (save_btn, clear_login_btn, copy_btn, close_btn):
             btn.setFixedHeight(34)
             btn.setStyleSheet(f"""
                 QPushButton {{
@@ -11580,14 +12808,13 @@ class ChatPage(QWidget):
                 styled_warning(dialog, "微信配置", "端口和超时必须是数字。")
                 return
             set_wechat_bridge_settings(payload)
-            set_wechat_bridge_enabled_setting(enabled_box.isChecked())
-            if enabled_box.isChecked():
-                self.start_wechat_bridge_from_menu()
-            else:
-                self.wechat_bridge.stop()
             dialog.close()
 
         save_btn.clicked.connect(save)
+        login_btn.clicked.connect(self.start_wechat_connector_login)
+        start_connector_btn.clicked.connect(self.start_wechat_connector_from_menu)
+        stop_connector_btn.clicked.connect(self.stop_wechat_connector_from_menu)
+        clear_login_btn.clicked.connect(self.wechat_connector.clear_login)
         copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(endpoint.toPlainText()))
         close_btn.clicked.connect(dialog.close)
         layout.addLayout(row)
@@ -11660,6 +12887,19 @@ class ChatPage(QWidget):
                 lines.append(f"===== Provider Round {raw_count} / History Entry {index} =====")
                 lines.append(json.dumps(provider_io, ensure_ascii=False, indent=2))
                 lines.append("")
+            live_response = (self.automation_preview_pending_text or self.automation_preview_last_rendered_text or "").strip()
+            if live_response:
+                raw_count += 1
+                lines.append(f"===== Provider Round {raw_count} / Live Interrupted Or Running =====")
+                lines.append(json.dumps({
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "model": self.automation_active_model or self.effective_automation_model(),
+                    "thread_id": self.thread_id,
+                    "messages": self.automation_active_messages,
+                    "response": live_response,
+                    "error": "live_or_interrupted",
+                }, ensure_ascii=False, indent=2))
+                lines.append("")
             if raw_count == 0:
                 lines.append("当前会话历史里没有 provider_io 原始字段；可能是旧版本会话或非自动化对话。下面附上当前 history_entries 原始 JSON，便于排查。")
                 lines.append("")
@@ -11691,11 +12931,18 @@ class ChatPage(QWidget):
                 title = "用户需求"
                 content = self.prompt_bubble_display_text(content).strip() or self.prompt_text_from_system_prompt(content).strip()
             elif entry_type == "ai":
-                title = "AI 输出"
+                if entry.get("failure_reason"):
+                    title = "AI 输出（请求失败前）"
+                elif entry.get("interrupted"):
+                    title = "AI 输出（已中断）"
+                else:
+                    title = "AI 输出"
             elif entry_type == "result":
                 title = "执行结果"
             elif entry_type == "terminal_result":
                 title = "终端执行结果"
+            elif entry_type == "provider_io":
+                title = "Provider 请求失败"
             else:
                 title = entry_type or "记录"
             if fmt == "md":
@@ -11706,6 +12953,28 @@ class ChatPage(QWidget):
             else:
                 lines.append(f"===== {title} =====")
                 lines.append(content)
+                lines.append("")
+        live_ai_text = (self.automation_preview_pending_text or self.automation_preview_last_rendered_text or "").strip()
+        if live_ai_text:
+            if fmt == "md":
+                lines.append("## AI 输出（进行中/已中断）")
+                lines.append("")
+                lines.append(live_ai_text)
+                lines.append("")
+            else:
+                lines.append("===== AI 输出（进行中/已中断） =====")
+                lines.append(live_ai_text)
+                lines.append("")
+        live_result_text = "\n\n".join(self.cmd_outputs).strip() if self.is_execution_running() else ""
+        if live_result_text:
+            if fmt == "md":
+                lines.append("## 执行结果（进行中/已中断）")
+                lines.append("")
+                lines.append(live_result_text)
+                lines.append("")
+            else:
+                lines.append("===== 执行结果（进行中/已中断） =====")
+                lines.append(live_result_text)
                 lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
@@ -11974,6 +13243,69 @@ class ChatPage(QWidget):
         self.add_chat_widget(bubble, animate=True)
         self.scroll_to_bottom()
 
+    def schedule_execution_prompt(self, schedule_item: Dict[str, object]) -> str:
+        title = str(schedule_item.get("title") or "定时计划").strip()
+        prompt = str(schedule_item.get("prompt") or "").strip()
+        return (
+            f"【定时计划触发】\n"
+            f"计划名称：{title}\n"
+            f"触发时间：每天 {format_schedule_time(schedule_item)}\n\n"
+            f"计划内容：\n{prompt}\n\n"
+            f"{skills_summary_text(self.skills)}"
+        )
+
+    def check_due_schedules(self):
+        if not self.project_root:
+            return
+        if self.is_automation_busy() or self.is_execution_running():
+            return
+        now = datetime.now()
+        run_key = now.strftime("%Y%m%d")
+        for schedule_item in load_workspace_schedules(self.project_root):
+            if not bool(schedule_item.get("enabled", True)):
+                continue
+            schedule = dict(schedule_item.get("schedule") or {})
+            try:
+                hour = int(schedule.get("hour"))
+                minute = int(schedule.get("minute"))
+            except (TypeError, ValueError):
+                continue
+            if now.hour != hour or now.minute != minute:
+                continue
+            if str(schedule_item.get("last_run_key") or "") == run_key:
+                continue
+            self.start_schedule(schedule_item, run_key)
+            break
+
+    def start_schedule(self, schedule_item: Dict[str, object], run_key: str = ""):
+        if not self.project_root:
+            return
+        if self.is_automation_busy() or self.is_execution_running():
+            return
+        if not self.automation_enabled:
+            dep = self.automation_manager.dependency_status()
+            if not dep.get("ready"):
+                self.add_status_bubble("定时计划未执行：自动化插件依赖未就绪。")
+                return
+            self.automation_enabled = True
+            set_automation_enabled_setting(True)
+            self.show_automation_composer(focus=False)
+        self.refresh_skills()
+        schedule_id = str(schedule_item.get("id") or "")
+        self.active_schedule_id = schedule_id
+        run_key = run_key or datetime.now().strftime("%Y%m%d")
+        update_workspace_schedule(self.project_root, schedule_id, {
+            "last_run_key": run_key,
+            "last_run_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        title = str(schedule_item.get("title") or "定时计划")
+        self.add_status_bubble(f"定时计划开始执行：{title}")
+        prompt_text = self.schedule_execution_prompt(schedule_item)
+        full_prompt = self.build_system_prompt(prompt_text)
+        prompt_entry_id = self.add_automation_user_prompt_bubble(full_prompt, animate=True)
+        self.begin_automation_loop(f"定时计划：{title}")
+        self.start_automation_worker(prompt_text, "", None, None, prompt_entry_id)
+
     def show_automation_composer(self, focus: bool = False):
         if self.automation_composer is None:
             return
@@ -12000,6 +13332,8 @@ class ChatPage(QWidget):
             return
         busy = self.is_automation_busy()
         local_execution_running = self.is_execution_running()
+        if self.automation_composer_input_column is not None:
+            self.automation_composer_input_column.setVisible(not busy)
         self.automation_input.setEnabled(not local_execution_running)
         if self.automation_skill_btn is not None:
             self.automation_skill_btn.setEnabled(not local_execution_running)
@@ -12039,6 +13373,22 @@ class ChatPage(QWidget):
 
     def cancel_automation_request(self):
         self.automation_request_serial += 1
+        partial_text = (
+            self.automation_preview_pending_text
+            or self.automation_preview_last_rendered_text
+            or ""
+        ).strip()
+        partial_provider_io = None
+        if partial_text:
+            partial_provider_io = {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "model": self.automation_active_model or self.effective_automation_model(),
+                "thread_id": self.thread_id,
+                "messages": copy.deepcopy(self.automation_active_messages),
+                "response": partial_text,
+                "error": "interrupted",
+            }
+        self.preserve_interrupted_automation_preview(partial_provider_io)
         context_worker = self.automation_context_worker
         if context_worker is not None:
             self.automation_manager.cancel_generation(
@@ -12078,6 +13428,10 @@ class ChatPage(QWidget):
                         worker.finished.connect(worker.deleteLater)
             if self.automation_worker is worker:
                 self.automation_worker = None
+        self.automation_active_messages = []
+        self.automation_active_model = ""
+        if self.is_execution_running() and self.worker is not None:
+            self.worker.requestInterruption()
         self.stop_automation_preview(remove_bubble=True)
         self.stop_automation_loop("", ensure_manual_entry=True)
         if self.wechat_active_request_id:
@@ -12217,6 +13571,53 @@ class ChatPage(QWidget):
             bubble.deleteLater()
             self.chat_container.adjustSize()
 
+    def preserve_interrupted_automation_preview(
+        self,
+        provider_io: Optional[Dict[str, object]] = None,
+        *,
+        interrupted: bool = True,
+        failure_reason: str = "",
+    ) -> bool:
+        text = (
+            self.automation_preview_pending_text
+            or self.automation_preview_last_rendered_text
+            or ""
+        ).strip()
+        bubble = self.automation_preview_bubble
+        if not text and isinstance(bubble, ChatBubble):
+            text = str(getattr(bubble, "content", "") or "").strip()
+        if not text:
+            return False
+        if isinstance(bubble, ChatBubble):
+            self.finalize_automation_preview_bubble(text)
+        else:
+            ai_bubble = ChatBubble(
+                "ai",
+                text,
+                show_copy=True,
+                parent=self.chat_container,
+                copy_text="复制 AI 输出",
+                scrollable=True,
+                max_content_height=QT_WIDGET_MAX_HEIGHT,
+                markdown=self.automation_enabled,
+                expand_to_content=True,
+                flat=self.automation_enabled,
+            )
+            self.add_chat_widget(ai_bubble, animate=True)
+        history_entry = {
+            "type": "ai",
+            "content": text,
+        }
+        if interrupted:
+            history_entry["interrupted"] = True
+        if failure_reason:
+            history_entry["failure_reason"] = failure_reason
+        if isinstance(provider_io, dict):
+            history_entry["provider_io"] = copy.deepcopy(provider_io)
+        self.append_history(history_entry)
+        self.add_status_bubble("已保留中断前的 AI 输出。" if interrupted else "已保留异常前的 AI 输出。")
+        return True
+
     def cleanup_retired_preview_worker(self, worker: AutomationPreviewWorker):
         try:
             self.automation_preview_retired_workers.remove(worker)
@@ -12353,6 +13754,13 @@ class ChatPage(QWidget):
     def compact_automation_entry_text(self, text: str, limit: int = AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT) -> str:
         return truncate_middle(str(text or "").strip(), limit)
 
+    def provider_error_history_content(self, error: str, response: str = "") -> str:
+        parts = ["Provider 请求失败，本轮自动化已暂停。"]
+        if response.strip():
+            parts.append("失败前已生成的 AI 输出：\n" + response.strip())
+        parts.append("错误信息：\n" + str(error or "").strip())
+        return "\n\n".join(parts).strip()
+
     def automation_context_system_text(self) -> str:
         skills_context = self.selected_skills_context()
         skills_text = (
@@ -12363,6 +13771,7 @@ class ChatPage(QWidget):
         return self.build_automation_system_text() + skills_text + (
             "\n\n补充说明：provider 每次可能会打开新的网页对话，所以第二段包含 Agent Qt 保存的本会话上下文。"
             "请把这些上下文视为连续对话历史。上下文按纯文本给出，不是 JSON 或工具调用协议。"
+            "第一段系统提示词始终是当前最新规则，优先级高于第二段历史；第二段里的旧提示词、旧命令写法或旧工具说明只作为事实参考，不要沿用已经被第一段替换的旧规则。"
             f"自动化上下文按 {context_k_label(AUTOMATION_CONTEXT_DISPLAY_TOKENS)} 估算展示；当历史超过约 {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)} 时，"
             "Agent Qt 会把较早历史 compact 成 plaintext 摘要，近期上下文保留原文后继续。"
         )
@@ -12444,10 +13853,15 @@ class ChatPage(QWidget):
             prompt_limit = 2000 if detail == "full" else (900 if detail == "lean" else 500)
             return "【用户需求】\n" + self.compact_automation_entry_text(user_text, prompt_limit)
         if entry_type == "ai":
+            prefix = ""
+            if entry.get("interrupted"):
+                prefix = "状态：用户强制中断，本条是中断前已生成的 AI 输出。\n\n"
+            elif entry.get("failure_reason"):
+                prefix = "状态：Provider 请求失败，本条是失败前已生成的 AI 输出。\n错误信息：\n" + str(entry.get("failure_reason") or "").strip() + "\n\n"
             if detail == "full":
-                return "【AI 回复】\n" + self.compact_automation_entry_text(content)
+                return "【AI 回复】\n" + prefix + self.compact_automation_entry_text(content)
             ai_limit = 2600 if detail == "lean" else 1000
-            return "【AI 回复摘要】\n" + self.summarize_automation_text(content, ai_limit)
+            return "【AI 回复摘要】\n" + prefix + self.summarize_automation_text(content, ai_limit)
         if entry_type == "result":
             if detail == "full":
                 if "【文件变更摘要（高密度，优先保留）】" in content:
@@ -12460,6 +13874,11 @@ class ChatPage(QWidget):
                 return "【终端执行结果】\n" + self.compact_automation_entry_text(content)
             result_limit = 1800 if detail == "lean" else 800
             return "【终端执行结果摘要】\n" + self.summarize_automation_text(content, result_limit)
+        if entry_type == "provider_io":
+            if detail == "full":
+                return "【Provider 请求失败】\n" + self.compact_automation_entry_text(content)
+            result_limit = 1800 if detail == "lean" else 800
+            return "【Provider 请求失败摘要】\n" + self.summarize_automation_text(content, result_limit)
         return ""
 
     def collapse_repeated_history_chunks(self, chunks: List[str]) -> List[str]:
@@ -12537,6 +13956,7 @@ class ChatPage(QWidget):
                 plaintext_fence("第一段：系统提示词", system_context),
                 plaintext_fence("第二段：历史对话", history),
                 plaintext_fence("第三段：当前指令", current_prompt),
+                plaintext_fence("第四段：生成前提醒", AUTOMATION_FINAL_REMINDER),
             ])
 
         payload = build_payload(history_text)
@@ -12714,6 +14134,8 @@ class ChatPage(QWidget):
                 self.thread_id,
             )
             self.automation_worker = worker
+            self.automation_active_messages = copy.deepcopy(messages)
+            self.automation_active_model = provider_model
             self.update_automation_composer_state()
             self.start_automation_preview()
 
@@ -12722,26 +14144,41 @@ class ChatPage(QWidget):
                     worker.deleteLater()
                     return
                 self.automation_worker = None
-                self.stop_automation_preview(remove_bubble=bool(error))
                 self.update_automation_composer_state()
                 if copy_btn is not None and not self.automation_loop_active:
                     copy_btn.setEnabled(True)
                     copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
                 if error:
+                    partial_text = (
+                        self.automation_preview_pending_text
+                        or self.automation_preview_last_rendered_text
+                        or ""
+                    ).strip()
                     self.pending_provider_io = {
                         "created_at": datetime.now().isoformat(timespec="seconds"),
                         "model": provider_model,
                         "thread_id": self.thread_id,
                         "messages": copy.deepcopy(messages),
-                        "response": "",
+                        "response": partial_text,
                         "error": str(error or ""),
                     }
-                    self.append_history({
-                        "type": "provider_io",
-                        "content": "",
-                        "provider_io": copy.deepcopy(self.pending_provider_io),
-                    })
+                    if partial_text:
+                        self.preserve_interrupted_automation_preview(
+                            self.pending_provider_io,
+                            interrupted=False,
+                            failure_reason=str(error or ""),
+                        )
+                    else:
+                        self.append_history({
+                            "type": "provider_io",
+                            "content": self.provider_error_history_content(str(error or "")),
+                            "provider_io": copy.deepcopy(self.pending_provider_io),
+                            "failed": True,
+                        })
                     self.pending_provider_io = None
+                    self.automation_active_messages = []
+                    self.automation_active_model = ""
+                    self.stop_automation_preview(remove_bubble=True)
                     quiet_message = quiet_automation_error_message(error)
                     self.stop_automation_loop(
                         quiet_message or "自动化循环已暂停。",
@@ -12760,6 +14197,8 @@ class ChatPage(QWidget):
                         "response": text,
                         "error": "",
                     }
+                    self.automation_active_messages = []
+                    self.automation_active_model = ""
                     preview_bubble = self.finalize_automation_preview_bubble(text)
                     self.handle_ai_response_text(text, existing_bubble=preview_bubble, provider_io=provider_io)
                 worker.deleteLater()
@@ -13176,6 +14615,8 @@ class ChatPage(QWidget):
     def shutdown(self):
         self.flush_history_save(wait=True)
         self.stop_automation_preview(remove_bubble=False)
+        if hasattr(self, "wechat_connector"):
+            self.wechat_connector.stop(notify=False)
         if hasattr(self, "wechat_bridge"):
             self.wechat_bridge.stop()
 
