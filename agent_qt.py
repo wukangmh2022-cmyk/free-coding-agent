@@ -898,6 +898,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 自然问答或展示代码时，正常使用 Markdown fenced 代码块即可。
 - 需要本地执行时，只输出一个 Markdown fenced `{command_block_lang}` 命令块；命令块前后不要写解释、计划或总结。
 - 命令块只写当前平台命令，不写 JSON/tool_calls，不拆成多个命令块。{command_rules}
+- 命令块内只能写真实要执行的 shell 代码；不要把执行结果、文件变更摘要、结论、`AGENT_DONE`、`AGENT_WECHAT_*` 触发器或任何聊天正文写进命令块。
 - 替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。不要把替换符当作待办、摘要、计划、说明或普通正文输出；命令块未引用的替换符没有意义。
 - 命令块保持短小；不要在命令块内直接嵌入超过 10 行的文件正文。
 - 代码块首行可用本语言注释写摘要，供界面折叠展示：如 `# <desc 写入配置>`、`// <desc 前端逻辑>`、`/* <desc 样式> */`、`<!-- <desc SVG 图像> -->`；没有也可以，界面会自动截断首行生成摘要。
@@ -909,6 +910,10 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 自动化循环完成时只回复 `{done_marker}` 加简短总结；未完成则继续给下一轮完整命令块。
 - Agent Qt 会给文件变更生成 internal git 快照/commit；需要 diff 细节时可按摘要里的 repo/commit 查询。
 - 查看后台终端输出只用这一种方式：`curl -s '{terminal_logs_url}?pid=xxx'`。把 `xxx` 换成终端摘要里的 pid。
+
+## 数据与事实
+- 涉及表格、统计、排行、金额、数量、日志或文件内容时，必须用程序读取、搜索或计算真实数据；不要根据示例行、记忆或猜测补全数字。
+- 如果只抽样查看了数据，只能说“示例/预览”，不能给出定量结论、模型结论、比较结论或总体判断。给出这类结论前，必须完整读取相应数据范围并说明关键来源。
 
 ## 回答风格
 - 不展开隐藏思考链；只给关键判断、验证依据、最终方案和必要指令。
@@ -927,6 +932,8 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 AUTOMATION_FINAL_REMINDER = (
     "生成前先做一次内部自检：当前是否需要执行命令；是否需要写入或覆盖文件；"
     "若写文件，命令块内只能放带编号占位符，文件正文必须放在后续独立 fenced 代码块；"
+    "命令块内不得包含执行结果、结论、AGENT_DONE 或 AGENT_WECHAT_* 触发器；"
+    "若涉及统计/数据/文件事实，必须基于完整读取或计算结果，不得根据示例行编造。"
     "若历史旧写法与第一段系统提示冲突，以第一段为准。只输出自检后的最终回复，不输出自检过程。"
 )
 
@@ -945,6 +952,7 @@ TERMINAL_COMPLETED_HISTORY_LIMIT = 50
 COMMAND_BACKGROUND_TIMEOUT_SECONDS = env_int("AGENT_QT_COMMAND_BACKGROUND_TIMEOUT_SECONDS", 10, minimum=3)
 PROVIDER_REQUEST_RETRY_ATTEMPTS = env_int("AGENT_QT_PROVIDER_REQUEST_RETRY_ATTEMPTS", 3, minimum=1)
 PROVIDER_TRANSIENT_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+SCHEDULE_MISSED_GRACE_SECONDS = env_int("AGENT_QT_SCHEDULE_MISSED_GRACE_SECONDS", 300, minimum=30)
 
 FORBIDDEN = [
     "rm -rf /", "sudo rm", "sudo reboot", "shutdown",
@@ -2342,12 +2350,42 @@ def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
         return []
     if not command_text:
         return []
+    reject_internal_context_in_command_block(command_text)
     reject_unfenced_file_placeholder_payload(text, blocks, referenced_placeholder_keys(command_text))
     command_text = resolve_all_placeholders(command_text, blocks)
+    reject_internal_context_in_command_block(command_text)
     if command_lang == "powershell":
         return [POWERSHELL_COMMAND_PREFIX + command_text.strip()] if command_text.strip() else []
     command_text = command_text.strip()
     return [command_text] if command_text else []
+
+
+def reject_internal_context_in_command_block(command_text: str):
+    """拒绝把执行结果/微信触发器等聊天协议误塞进 shell 块。"""
+    text = str(command_text or "")
+    internal_markers = (
+        "【本地执行结果和文件变更】",
+        "【执行结果】",
+        "Execution log:",
+        "Git diff file names:",
+        "文件变更：",
+        "===== 执行结果 =====",
+        "===== AI 输出 =====",
+        "AGENT_WECHAT_SEND_FILE:",
+        "AGENT_WECHAT_SEND_FILE：",
+        "AGENT_WECHAT_CREATE_SCHEDULE:",
+        "AGENT_WECHAT_CREATE_SCHEDULE：",
+        "AGENT_WECHAT_SCHEDULE_ACTION:",
+        "AGENT_WECHAT_SCHEDULE_ACTION：",
+        "AGENT_DONE",
+        "AGENT_QT_DONE",
+    )
+    for marker in internal_markers:
+        if marker in text:
+            raise ValueError(
+                "命令块混入了执行结果、结论或微信触发器。"
+                "请只在命令块内写真实 shell 命令；完成结论和 AGENT_WECHAT_* 行必须放在命令块外。"
+            )
 
 def is_long_running(cmd: str) -> bool:
     cmd = strip_shell_command_marker(cmd)
@@ -3473,6 +3511,8 @@ def build_automation_feedback_prompt(
 请判断下一步：
 - 已完成：只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。
 - 未完成：输出一个完整且短小的 ```{command_block_lang} 命令块；写入超过 10 行的文件内容时，必须用带编号替换符引用同一回复里的同语言 fenced 文件内容。
+- 命令块内只能写真实要执行的 shell 代码；不要把上一轮执行结果、文件变更、结论、`{AUTOMATION_DONE_MARKER}` 或 `AGENT_WECHAT_*` 触发器写进命令块。
+- 涉及统计、表格、数据查找或文件事实时，必须完整读取/计算后再下结论；示例行只能用于判断结构，不能据此编造定量结论、模型结论或总体判断。
 - 后台安装/构建/拉取不要当作完成；启动常驻命令时不要加 `&`/`nohup`，等执行结果给出 `Terminal processes:` 摘要后，再使用 `curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'` 查询控制台输出。
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
 {wechat_completion_note}
@@ -4197,6 +4237,7 @@ def normalize_schedule(raw: object) -> Optional[Dict[str, object]]:
         "notify_wechat_context_token": str(raw.get("notify_wechat_context_token") or ""),
         "notify_wechat_enabled": bool(raw.get("notify_wechat_enabled", False)),
         "last_success_note": str(raw.get("last_success_note") or ""),
+        "expired_at": str(raw.get("expired_at") or ""),
     }
 
 
@@ -4416,12 +4457,39 @@ def schedule_run_key(schedule_item: Dict[str, object], now: datetime) -> str:
 
 
 def schedule_due(schedule_item: Dict[str, object], now: datetime) -> bool:
+    if str(schedule_item.get("expired_at") or "").strip():
+        return False
     schedule = dict(schedule_item.get("schedule") or {})
     until_at = parse_schedule_datetime(schedule.get("until_at"))
     if until_at and now > until_at:
         return False
     run_at = parse_schedule_datetime(schedule.get("run_at"))
     return bool(run_at and now >= run_at)
+
+
+def schedule_expired(schedule_item: Dict[str, object], now: datetime) -> bool:
+    if str(schedule_item.get("expired_at") or "").strip():
+        return True
+    schedule = dict(schedule_item.get("schedule") or {})
+    until_at = parse_schedule_datetime(schedule.get("until_at"))
+    repeat_seconds = normalize_repeat_seconds(schedule.get("repeat_every_seconds"))
+    if until_at and now > until_at and not schedule_due(schedule_item, now):
+        return True
+    if repeat_seconds:
+        return False
+    run_at = parse_schedule_datetime(schedule.get("run_at"))
+    if not run_at:
+        return False
+    if str(schedule_item.get("last_run_key") or "").strip():
+        return False
+    return now > run_at + timedelta(seconds=SCHEDULE_MISSED_GRACE_SECONDS)
+
+
+def expire_workspace_schedule(root: str, schedule_id: str, when: Optional[datetime] = None) -> bool:
+    return update_workspace_schedule(root, schedule_id, {
+        "enabled": False,
+        "expired_at": (when or datetime.now()).isoformat(timespec="seconds"),
+    })
 
 
 def schedule_run_thread_id(schedule_id: str, run_key: str) -> str:
@@ -4447,7 +4515,7 @@ def schedules_summary_text(schedules: List[Dict[str, object]]) -> str:
         return "当前没有定时计划。"
     lines = ["当前定时计划："]
     for index, schedule_item in enumerate(schedules, start=1):
-        state = "开启" if bool(schedule_item.get("enabled", True)) else "暂停"
+        state = "过期" if str(schedule_item.get("expired_at") or "").strip() else ("开启" if bool(schedule_item.get("enabled", True)) else "暂停")
         title = str(schedule_item.get("title") or schedule_item.get("id") or "定时计划")
         lines.append(f"{index}. {title}｜{format_schedule_time(schedule_item)}｜{state}")
     return "\n".join(lines)
@@ -11678,10 +11746,13 @@ class ChatPage(QWidget):
         schedule_summary = schedules_summary_text(load_workspace_schedules(self.project_root)) if self.project_root else "当前没有定时计划。"
         prompt_text = build_wechat_user_prompt(text, allow_file_delivery=allow_file_delivery, schedule_summary=schedule_summary)
         full_prompt = self.build_system_prompt(prompt_text)
-        prompt_entry_id = self.add_automation_user_prompt_bubble(full_prompt, animate=True)
-        self.update_history_entry(prompt_entry_id, {
-            "context_content": f"【微信用户需求】\n{text.strip()}",
-        })
+        clean_context = f"【微信用户需求】\n{text.strip()}"
+        prompt_entry_id = self.add_automation_user_prompt_bubble(
+            full_prompt,
+            animate=True,
+            display_text=clean_context,
+            context_content=clean_context,
+        )
         self.begin_automation_loop(text)
         self.start_automation_worker(prompt_text, "", None, None, prompt_entry_id)
         if self.is_automation_request_running() and self.selected_skill_ids:
@@ -12983,12 +13054,16 @@ class ChatPage(QWidget):
                 name = QLabel(str(schedule_item.get("title") or "定时计划"))
                 name.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900; border: none;")
                 header.addWidget(name, 1)
-                state = SettingsToggleRow("", "", bool(schedule_item.get("enabled", True)), parent=card)
+                is_expired = bool(str(schedule_item.get("expired_at") or "").strip())
+                state = SettingsToggleRow("", "", bool(schedule_item.get("enabled", True)) and not is_expired, parent=card)
                 state.setFixedWidth(76)
+                state.setEnabled(not is_expired)
                 state.toggled.connect(lambda enabled, sid=str(schedule_item.get("id") or ""): (update_workspace_schedule(self.project_root, sid, {"enabled": enabled}) if self.project_root else False, refresh_list()))
                 header.addWidget(state, 0)
                 card_layout.addLayout(header)
                 meta = QLabel(format_schedule_time(schedule_item))
+                if is_expired:
+                    meta.setText(f"{meta.text()}｜已过期")
                 meta.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px; font-weight: 800; border: none;")
                 card_layout.addWidget(meta)
                 prompt = QLabel(str(schedule_item.get("prompt") or ""))
@@ -13840,7 +13915,9 @@ class ChatPage(QWidget):
                 continue
             if entry_type == "prompt":
                 title = "用户需求"
-                content = self.prompt_bubble_display_text(content).strip() or self.prompt_text_from_system_prompt(content).strip()
+                content = str(entry.get("context_content") or "").strip()
+                if not content:
+                    content = self.prompt_bubble_display_text(str(entry.get("content") or "")).strip() or self.prompt_text_from_system_prompt(str(entry.get("content") or "")).strip()
             elif entry_type == "ai":
                 title = "AI 输出"
             elif entry_type == "result":
@@ -14180,16 +14257,21 @@ class ChatPage(QWidget):
     def check_due_schedules(self):
         if not self.project_root:
             return
-        if self.is_automation_busy() or self.is_execution_running():
+        if self.is_automation_request_running() or self.is_execution_running():
             return
+        if self.automation_loop_active:
+            self.stop_automation_loop("", ensure_manual_entry=False)
         now = datetime.now()
         for schedule_item in load_workspace_schedules(self.project_root):
             if not bool(schedule_item.get("enabled", True)):
                 continue
+            if schedule_expired(schedule_item, now):
+                expire_workspace_schedule(self.project_root, str(schedule_item.get("id") or ""), now)
+                continue
             schedule_spec = dict(schedule_item.get("schedule") or {})
             until_at = parse_schedule_datetime(schedule_spec.get("until_at"))
             if until_at and now > until_at and not schedule_due(schedule_item, now):
-                update_workspace_schedule(self.project_root, str(schedule_item.get("id") or ""), {"enabled": False})
+                expire_workspace_schedule(self.project_root, str(schedule_item.get("id") or ""), now)
                 continue
             if not schedule_due(schedule_item, now):
                 continue
@@ -14220,8 +14302,10 @@ class ChatPage(QWidget):
     def start_schedule(self, schedule_item: Dict[str, object], run_key: str = ""):
         if not self.project_root:
             return
-        if self.is_automation_busy() or self.is_execution_running():
+        if self.is_automation_request_running() or self.is_execution_running():
             return
+        if self.automation_loop_active:
+            self.stop_automation_loop("", ensure_manual_entry=False)
         if not self.automation_enabled:
             dep = self.automation_manager.dependency_status()
             if not dep.get("ready"):
@@ -14479,12 +14563,18 @@ class ChatPage(QWidget):
         if self.is_automation_request_running() and self.selected_skill_ids:
             self.clear_automation_skills()
 
-    def add_automation_user_prompt_bubble(self, full_prompt: str, animate: bool = True) -> str:
+    def add_automation_user_prompt_bubble(
+        self,
+        full_prompt: str,
+        animate: bool = True,
+        display_text: str = "",
+        context_content: str = "",
+    ) -> str:
         self.hide_empty_state()
         entry_id = uuid.uuid4().hex
         bubble = ChatBubble(
             "user",
-            self.prompt_bubble_display_text(full_prompt),
+            display_text.strip() or self.prompt_bubble_display_text(full_prompt),
             parent=self.chat_container,
             show_copy=False,
             show_prompt_input=False,
@@ -14495,11 +14585,14 @@ class ChatPage(QWidget):
         bubble.content = full_prompt
         bubble.history_entry_id = entry_id
         self.add_chat_widget(bubble, animate=animate)
-        self.append_history({
+        entry = {
             "id": entry_id,
             "type": "prompt",
             "content": full_prompt,
-        })
+        }
+        if context_content.strip():
+            entry["context_content"] = context_content.strip()
+        self.append_history(entry)
         self.scroll_to_bottom()
         return entry_id
 
@@ -14764,10 +14857,21 @@ class ChatPage(QWidget):
             return self.display_prompt_text(full_prompt)
         user_text = self.prompt_text_from_system_prompt(full_prompt).strip()
         if user_text:
-            return user_text
+            return self.compact_wechat_prompt_for_history(user_text)
         if PROMPT_BUBBLE_MARKER not in full_prompt:
             return str(full_prompt or "").strip()
         return ""
+
+    def compact_wechat_prompt_for_history(self, text: str) -> str:
+        content = str(text or "").strip()
+        if "【微信远控消息】" not in content:
+            return content
+        marker = "用户消息："
+        marker_index = content.rfind(marker)
+        if marker_index < 0:
+            return "【微信用户需求】\n" + truncate_middle(content, 2000)
+        message = content[marker_index + len(marker):].strip()
+        return "【微信用户需求】\n" + truncate_middle(message, 2000)
 
     def compact_automation_entry_text(self, text: str, limit: int = AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT) -> str:
         return truncate_middle(str(text or "").strip(), limit)
@@ -14869,6 +14973,7 @@ class ChatPage(QWidget):
                 user_text = content.strip()
             if not user_text:
                 return ""
+            user_text = self.compact_wechat_prompt_for_history(user_text)
             prompt_limit = 2000 if detail == "full" else (900 if detail == "lean" else 500)
             return "【用户需求】\n" + self.compact_automation_entry_text(user_text, prompt_limit)
         if entry_type == "ai":
@@ -15477,9 +15582,11 @@ class ChatPage(QWidget):
 
     def switch_thread(self, thread_id: str):
         thread_id = safe_thread_id(thread_id)
-        if thread_id == self.thread_id or self.is_execution_running() or self.is_automation_busy():
+        if thread_id == self.thread_id or self.is_execution_running() or self.is_automation_request_running():
             return
         self.stop_automation_preview(remove_bubble=True)
+        if self.automation_loop_active:
+            self.stop_automation_loop("", ensure_manual_entry=False)
         self.thread_id = thread_id
         save_last_thread_id(self.project_root, self.thread_id)
         self.sidebar.set_active_thread(thread_id)
@@ -15541,7 +15648,7 @@ class ChatPage(QWidget):
         if entry_type == "prompt":
             if self.automation_enabled:
                 full_prompt = str(entry.get("content", ""))
-                display_text = self.prompt_bubble_display_text(full_prompt)
+                display_text = str(entry.get("context_content") or "").strip() or self.prompt_bubble_display_text(full_prompt)
                 if display_text.strip():
                     bubble = ChatBubble(
                         "user",
