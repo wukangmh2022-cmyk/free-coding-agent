@@ -5112,7 +5112,8 @@ class SidebarResizeHandle(QFrame):
         self.set_grip_visible(False)
 
     def install_toggle_button(self, button: QToolButton):
-        self._layout.insertWidget(0, button, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        self._layout.insertSpacing(0, 18)
+        self._layout.insertWidget(1, button, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
 
     def set_grip_visible(self, visible: bool):
         self.grip.setFixedHeight(72 if visible else 0)
@@ -10803,6 +10804,7 @@ class ChatPage(QWidget):
                 color: {COLORS['accent_dark']};
                 font-size: 20px;
                 font-weight: 800;
+                padding-top: 3px;
             }}
             QToolButton:hover {{
                 background: {COLORS['accent_light']};
