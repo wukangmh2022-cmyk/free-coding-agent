@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QLineEdit, QTreeWidget, QTreeWidgetItem,
     QMenu, QToolButton, QStyle, QPlainTextEdit, QTextBrowser, QStackedWidget,
     QGridLayout, QSizePolicy, QGraphicsOpacityEffect, QAbstractItemView,
-    QSpacerItem, QWidgetAction, QAbstractButton, QDialog, QCheckBox
+    QSpacerItem, QWidgetAction, QAbstractButton, QDialog, QCheckBox, QComboBox
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, Property, QObject
 from PySide6.QtGui import QFont, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QKeySequence, QTextDocument, QImage
@@ -3544,16 +3544,9 @@ def parse_wechat_builtin_command(text: str) -> Dict[str, str]:
         return {"action": "thinking", "mode": "off"}
     if compact in {"/stop", "停止", "暂停", "中断", "停止当前任务", "暂停当前任务", "停止输出", "停止执行"}:
         return {"action": "stop"}
-    if (
-        compact in {"/threads", "/conversations", "/ls", "会话列表", "对话列表", "列出会话", "列出对话", "显示会话", "显示对话"}
-        or ("会话" in compact and any(word in compact for word in ("列表", "列出", "显示", "查看", "有哪些")))
-        or ("对话" in compact and any(word in compact for word in ("列表", "列出", "显示", "查看", "有哪些")))
-    ):
+    if compact in {"/threads", "/conversations", "/ls", "会话列表", "对话列表", "列出会话", "列出对话", "显示会话", "显示对话"}:
         return {"action": "threads"}
-    if (
-        compact in {"文件列表", "文件树", "目录树", "显示文件", "显示文件夹", "显示目录", "列出文件", "列出目录", "有哪些文件", "项目文件"}
-        or (("文件" in compact or "文件夹" in compact or "目录" in compact) and any(word in compact for word in ("列表", "列出", "显示", "查看", "有哪些", "多少", "数量", "树")))
-    ):
+    if compact in {"/files", "/tree", "文件列表", "文件树", "目录树", "显示文件", "显示文件夹", "显示目录", "列出文件", "列出目录", "有哪些文件", "项目文件"}:
         return {"action": "project_tree"}
     if compact in {"/schedule", "/schedules"}:
         return {"action": "schedules"}
@@ -7359,6 +7352,39 @@ def wechat_strip_markdown_code(text: str, keep_summary: bool = False) -> str:
     return text.strip()
 
 
+def strip_inline_heredoc_for_wechat(text: str) -> str:
+    lines = str(text or "").splitlines()
+    cleaned: List[str] = []
+    skipping_until = ""
+    heredoc_re = re.compile(r"<<\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+    for line in lines:
+        stripped = line.strip()
+        if skipping_until:
+            if stripped == skipping_until:
+                skipping_until = ""
+            continue
+        match = heredoc_re.search(line)
+        if match:
+            skipping_until = match.group(1)
+            if not cleaned or cleaned[-1] != "... 已省略文件写入命令和正文 ...":
+                cleaned.append("... 已省略文件写入命令和正文 ...")
+            continue
+        if re.match(r"^\s*(?:<!DOCTYPE\s+html|<html\b|<svg\b|<head\b|<body\b|<style\b|<script\b)", line, re.I):
+            cleaned.append("... 已省略文件正文 ...")
+            break
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
+def sanitize_wechat_visible_text(text: str, *, keep_code_summary: bool = False, limit: int = 1200) -> str:
+    content = mask_low_value_context_markers_for_display(str(text or ""))
+    content = wechat_strip_markdown_code(content, keep_summary=keep_code_summary)
+    content = strip_inline_heredoc_for_wechat(content)
+    content = strip_automation_done_marker(content)
+    content = re.sub(r"\n{3,}", "\n\n", content).strip()
+    return text_within_utf8_budget(content, limit)
+
+
 def extract_wechat_send_file_targets(text: str) -> List[str]:
     targets: List[str] = []
     for line in str(text or "").splitlines():
@@ -7445,9 +7471,9 @@ def wechat_history_reply(entries: List[Dict[str, object]], silent: bool = True) 
         if not content:
             continue
         if entry_type in {"result", "terminal_result"}:
-            result_parts.append(text_within_utf8_budget(mask_low_value_context_markers_for_display(content), 2500))
+            result_parts.append(sanitize_wechat_visible_text(content, keep_code_summary=False, limit=1600))
         elif entry_type == "ai":
-            conclusion_parts.append(wechat_strip_markdown_code(content, keep_summary=not silent))
+            conclusion_parts.append(sanitize_wechat_visible_text(content, keep_code_summary=not silent, limit=1200))
     parts: List[str] = []
     if result_parts:
         parts.append("执行结果：\n" + result_parts[-1])
@@ -10757,6 +10783,7 @@ class ChatPage(QWidget):
         self.automation_preview_retired_workers: List[AutomationPreviewWorker] = []
         self.automation_preview_serial = 0
         self.automation_preview_bubble: Optional[QFrame] = None
+        self.automation_preview_thread_id = ""
         self.automation_preview_started_at = 0.0
         self.automation_preview_pending_text = ""
         self.automation_preview_last_rendered_text = ""
@@ -12987,66 +13014,98 @@ class ChatPage(QWidget):
         form_layout = QVBoxLayout(form)
         form_layout.setContentsMargins(12, 10, 12, 10)
         form_layout.setSpacing(8)
-        form_title = QLabel("新增每日计划")
+        form_title = QLabel("新增计划")
         form_title.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900; border: none;")
         form_layout.addWidget(form_title)
         title_input = QLineEdit()
         title_input.setPlaceholderText("计划名称")
         prompt_input = QTextEdit()
-        prompt_input.setPlaceholderText("每天到点后要让智能体做什么")
+        prompt_input.setPlaceholderText("到点后真正要让智能体做什么")
         prompt_input.setFixedHeight(72)
-        time_row = QHBoxLayout()
-        hour_input = QLineEdit()
-        hour_input.setPlaceholderText("小时")
-        minute_input = QLineEdit()
-        minute_input.setPlaceholderText("分钟")
-        for editor in (title_input, hour_input, minute_input):
+        run_at_input = QLineEdit()
+        run_at_input.setPlaceholderText("首次触发时间，例如 2026-05-01 18:00:00")
+        default_run_at = (datetime.now() + timedelta(hours=1)).replace(second=0, microsecond=0)
+        run_at_input.setText(default_run_at.strftime("%Y-%m-%d %H:%M:%S"))
+        repeat_row = QHBoxLayout()
+        repeat_value_input = QLineEdit()
+        repeat_value_input.setPlaceholderText("重复间隔")
+        repeat_unit_input = QComboBox()
+        repeat_unit_input.addItem("不重复", 0)
+        repeat_unit_input.addItem("分钟", 60)
+        repeat_unit_input.addItem("小时", 3600)
+        repeat_unit_input.addItem("天", 86400)
+        repeat_unit_input.addItem("周", 604800)
+        repeat_unit_input.setCurrentIndex(3)
+        repeat_value_input.setText("1")
+        until_at_input = QLineEdit()
+        until_at_input.setPlaceholderText("可选截止时间，例如 2026-05-02 18:00:00")
+        for editor in (title_input, run_at_input, repeat_value_input, repeat_unit_input, until_at_input):
             editor.setFixedHeight(34)
-        for editor in (title_input, hour_input, minute_input, prompt_input):
+        editor_style = f"background: {COLORS['surface']}; color: {COLORS['text']}; border: 1px solid {COLORS['border']}; border-radius: 9px; padding: 7px 10px; font-size: 12px; font-weight: 800;"
+        for editor in (title_input, run_at_input, repeat_value_input, until_at_input, prompt_input):
             editor.setStyleSheet(f"background: {COLORS['surface']}; color: {COLORS['text']}; border: 1px solid {COLORS['border']}; border-radius: 9px; padding: 7px 10px; font-size: 12px; font-weight: 800;")
-        time_row.addWidget(hour_input)
-        time_row.addWidget(minute_input)
+        repeat_unit_input.setStyleSheet(editor_style)
+        repeat_row.addWidget(repeat_value_input, 1)
+        repeat_row.addWidget(repeat_unit_input, 1)
         form_layout.addWidget(title_input)
-        form_layout.addLayout(time_row)
+        form_layout.addWidget(run_at_input)
+        form_layout.addLayout(repeat_row)
+        form_layout.addWidget(until_at_input)
         form_layout.addWidget(prompt_input)
         add_btn = QPushButton("新增计划", cursor=Qt.CursorShape.PointingHandCursor)
         add_btn.setFixedHeight(36)
         add_btn.setStyleSheet(button_style(primary=True))
 
         def add_schedule():
-            try:
-                hour = int(hour_input.text().strip())
-                minute = int(minute_input.text().strip() or "0")
-            except ValueError:
-                styled_warning(dialog, "定时计划", "时间必须是数字。")
+            run_at = format_schedule_datetime(run_at_input.text().strip())
+            if not run_at:
+                styled_warning(dialog, "定时计划", "首次触发时间格式不正确。请使用 2026-05-01 18:00:00。")
                 return
             prompt = prompt_input.toPlainText().strip()
             if not prompt:
                 styled_warning(dialog, "定时计划", "请填写计划内容。")
                 return
+            repeat_seconds = 0
+            unit_seconds = int(repeat_unit_input.currentData() or 0)
+            if unit_seconds:
+                try:
+                    repeat_value = int(repeat_value_input.text().strip() or "0")
+                except ValueError:
+                    styled_warning(dialog, "定时计划", "重复间隔必须是数字。")
+                    return
+                if repeat_value <= 0:
+                    styled_warning(dialog, "定时计划", "重复间隔必须大于 0，或选择“不重复”。")
+                    return
+                repeat_seconds = repeat_value * unit_seconds
+            until_at_raw = until_at_input.text().strip()
+            until_at = format_schedule_datetime(until_at_raw) if until_at_raw else ""
+            if until_at_raw and not until_at:
+                styled_warning(dialog, "定时计划", "截止时间格式不正确。请使用 2026-05-02 18:00:00。")
+                return
+            schedule_spec: Dict[str, object] = {"run_at": run_at}
+            if repeat_seconds:
+                schedule_spec["repeat_every_seconds"] = repeat_seconds
+            if until_at:
+                schedule_spec["until_at"] = until_at
             try:
                 add_btn.setEnabled(False)
                 add_btn.setText("新增中...")
-                self.create_schedule_plain(
-                    title=title_input.text().strip() or prompt[:36],
-                    user_request=prompt,
-                    hour=hour,
-                    minute=minute,
-                    on_done=lambda _item, error: (
-                        add_btn.setEnabled(True),
-                        add_btn.setText("新增计划"),
-                        None if error else title_input.clear(),
-                        None if error else hour_input.clear(),
-                        None if error else minute_input.clear(),
-                        None if error else prompt_input.clear(),
-                        styled_warning(dialog, "定时计划", error) if error else refresh_list(),
-                    ),
+                create_workspace_schedule_from_spec(
+                    self.project_root,
+                    title_input.text().strip() or prompt[:36],
+                    prompt,
+                    schedule_spec,
                 )
+                title_input.clear()
+                prompt_input.clear()
+                until_at_input.clear()
+                refresh_list()
             except Exception as exc:
-                add_btn.setEnabled(True)
-                add_btn.setText("新增计划")
                 styled_warning(dialog, "定时计划", str(exc))
                 return
+            finally:
+                add_btn.setEnabled(True)
+                add_btn.setText("新增计划")
 
         add_btn.clicked.connect(add_schedule)
         form_layout.addWidget(add_btn)
@@ -14488,6 +14547,7 @@ class ChatPage(QWidget):
         self.automation_preview_last_rendered_text = ""
         self.automation_preview_last_chars = 0
         self.automation_preview_dots = 0
+        self.automation_preview_thread_id = self.thread_id
         self.automation_preview_bubble = self.create_automation_preview_bubble()
         worker = AutomationPreviewWorker(self.automation_manager, self.effective_automation_model(), self.thread_id, serial)
         self.automation_preview_worker = worker
@@ -14515,6 +14575,7 @@ class ChatPage(QWidget):
         self.automation_preview_pending_text = ""
         self.automation_preview_last_rendered_text = ""
         self.automation_preview_last_chars = 0
+        self.automation_preview_thread_id = ""
         if remove_bubble and self.automation_preview_bubble is not None:
             bubble = self.automation_preview_bubble
             self.automation_preview_bubble = None
@@ -14614,6 +14675,8 @@ class ChatPage(QWidget):
         bubble = self.automation_preview_bubble
         if bubble is None:
             return
+        if self.automation_preview_thread_id and self.automation_preview_thread_id != self.thread_id:
+            return
         text = self.automation_preview_pending_text
         if not text or text == self.automation_preview_last_rendered_text:
             return
@@ -14633,6 +14696,8 @@ class ChatPage(QWidget):
     def update_automation_preview(self, serial: int, preview: dict):
         started = time.perf_counter()
         if serial != self.automation_preview_serial:
+            return
+        if self.automation_preview_thread_id and self.automation_preview_thread_id != self.thread_id:
             return
         bubble = self.automation_preview_bubble
         if bubble is None:
@@ -15414,6 +15479,7 @@ class ChatPage(QWidget):
         thread_id = safe_thread_id(thread_id)
         if thread_id == self.thread_id or self.is_execution_running() or self.is_automation_busy():
             return
+        self.stop_automation_preview(remove_bubble=True)
         self.thread_id = thread_id
         save_last_thread_id(self.project_root, self.thread_id)
         self.sidebar.set_active_thread(thread_id)
@@ -15566,6 +15632,12 @@ class ChatPage(QWidget):
             self.history_save_timer.stop()
         if clear_workspace_history(self.project_root, self.thread_id):
             self.history_entries = []
+            self.stop_automation_preview(remove_bubble=True)
+            self.automation_active_messages = []
+            self.automation_active_model = ""
+            self.pending_provider_io = None
+            self.cmd_outputs = []
+            self.wechat_active_start_index = 0
             self.clear_chat_widgets()
             if self.automation_enabled:
                 self.show_automation_composer(focus=False)
