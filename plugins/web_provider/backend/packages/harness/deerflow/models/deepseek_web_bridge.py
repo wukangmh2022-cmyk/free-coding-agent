@@ -1885,19 +1885,26 @@ class DeepSeekWebBridge:
 
     def close(self) -> None:
         with self._lock:
-            if self._context is not None:
-                self._context.close()
-            if self._playwright is not None:
-                self._playwright.stop()
-            self._context = None
-            self._page = None
-            self._actual_headless = None
-            self._browser_type = None
-            self._playwright = None
-            self._clear_session_runtime_state()
-            self._active_session_state_path = None
-            self._active_sticky_marker = None
-            self._prepared_new_chat = False
+            try:
+                if self._context is not None:
+                    self._context.close()
+            except Exception:
+                logger.debug("Failed to close DeepSeek browser context.", exc_info=True)
+            try:
+                if self._playwright is not None:
+                    self._playwright.stop()
+            except Exception:
+                logger.debug("Failed to stop DeepSeek Playwright runtime.", exc_info=True)
+            finally:
+                self._context = None
+                self._page = None
+                self._actual_headless = None
+                self._browser_type = None
+                self._playwright = None
+                self._clear_session_runtime_state()
+                self._active_session_state_path = None
+                self._active_sticky_marker = None
+                self._prepared_new_chat = False
 
     def _clear_session_runtime_state(self) -> None:
         self._sticky_initialized = False
@@ -2084,11 +2091,23 @@ class DeepSeekWebBridge:
             if self._context is not None:
                 self.close()
 
+            if self._playwright is not None:
+                try:
+                    self._playwright.stop()
+                except Exception:
+                    logger.debug("Failed to stop stale DeepSeek Playwright runtime before restart.", exc_info=True)
+                finally:
+                    self._playwright = None
+                    self._browser_type = None
+                    self._actual_headless = None
+                    self._page = None
+
             profile_dir = str(Path(self.user_data_dir).expanduser().resolve())
             Path(profile_dir).mkdir(parents=True, exist_ok=True)
 
-            self._playwright = sync_playwright().start()
-            self._browser_type = self._playwright.chromium
+            playwright = sync_playwright().start()
+            self._playwright = playwright
+            self._browser_type = playwright.chromium
             launch_options: dict[str, Any] = {
                 "user_data_dir": profile_dir,
                 "headless": requested_headless,
@@ -2096,20 +2115,34 @@ class DeepSeekWebBridge:
             }
             if self.browser_channel:
                 launch_options["channel"] = self.browser_channel
-            self._context = self._browser_type.launch_persistent_context(
-                **launch_options,
-            )
             try:
-                parsed_url = urlparse(self.url)
-                if parsed_url.scheme and parsed_url.netloc:
-                    self._context.grant_permissions(
-                        ["clipboard-read", "clipboard-write"],
-                        origin=f"{parsed_url.scheme}://{parsed_url.netloc}",
-                    )
+                self._context = self._browser_type.launch_persistent_context(
+                    **launch_options,
+                )
+                try:
+                    parsed_url = urlparse(self.url)
+                    if parsed_url.scheme and parsed_url.netloc:
+                        self._context.grant_permissions(
+                            ["clipboard-read", "clipboard-write"],
+                            origin=f"{parsed_url.scheme}://{parsed_url.netloc}",
+                        )
+                except Exception:
+                    logger.debug("Failed to grant DeepSeek clipboard permissions.", exc_info=True)
+                self._actual_headless = requested_headless
+                return self._context
             except Exception:
-                logger.debug("Failed to grant DeepSeek clipboard permissions.", exc_info=True)
-            self._actual_headless = requested_headless
-            return self._context
+                try:
+                    playwright.stop()
+                except Exception:
+                    logger.debug("Failed to stop DeepSeek Playwright runtime after launch failure.", exc_info=True)
+                finally:
+                    self._playwright = None
+                    self._browser_type = None
+                    self._context = None
+                    self._page = None
+                    self._actual_headless = None
+                    self._prepared_new_chat = False
+                raise
 
     def ensure_page(self, *, visible: bool = False) -> Page:
         context = self.ensure_context(headless=False if visible else self.headless)

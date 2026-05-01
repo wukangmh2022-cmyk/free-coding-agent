@@ -53,7 +53,7 @@ except ImportError:
 
 PROMPT_BUBBLE_MARKER = "<!-- agent_qt_user_prompt:"
 AUTOMATION_DONE_MARKER = "AGENT_DONE"
-COMPLETION_LINE_RE = re.compile(r"^\s*(?:FINAL\s*:|AGENT_DONE\b|AGENT_QT_DONE\b)", re.I)
+COMPLETION_LINE_RE = re.compile(r"^\s*(?:AGENT_DONE\b|AGENT_QT_DONE\b)", re.I)
 AGENT_HOME_DIR = os.path.expanduser(os.environ.get("AGENT_QT_HOME", "~/.agent_qt"))
 _AGENT_RUNTIME_PYTHON: Optional[str] = None
 _AGENT_RUNTIME_ERROR = ""
@@ -351,6 +351,29 @@ def set_wechat_bridge_settings(payload: Dict[str, object]):
             current[key] = payload[key]
     settings["wechat_bridge"] = current
     save_app_settings(settings)
+
+
+def remember_wechat_reply_target(to_user: str, context_token: str):
+    to_user = str(to_user or "").strip()
+    context_token = str(context_token or "").strip()
+    if not to_user or not context_token:
+        return
+    settings = load_app_settings()
+    settings["wechat_last_reply_target"] = {
+        "to_user": to_user,
+        "context_token": context_token,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_app_settings(settings)
+
+
+def last_wechat_reply_target() -> Dict[str, str]:
+    raw = load_app_settings().get("wechat_last_reply_target")
+    payload = dict(raw) if isinstance(raw, dict) else {}
+    return {
+        "to_user": str(payload.get("to_user") or "").strip(),
+        "context_token": str(payload.get("context_token") or "").strip(),
+    }
 
 
 def parse_boolish(value: object, default: bool = False) -> bool:
@@ -898,9 +921,10 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 自然问答或展示代码时，正常使用 Markdown fenced 代码块即可。
 - 需要本地执行时，只输出一个 Markdown fenced `{command_block_lang}` 命令块；命令块前后不要写解释、计划或总结。
 - 命令块只写当前平台命令，不写 JSON/tool_calls，不拆成多个命令块。{command_rules}
-- 命令块内只能写真实要执行的 shell 代码；不要把执行结果、文件变更摘要、结论、`AGENT_DONE`、`AGENT_WECHAT_*` 触发器或任何聊天正文写进命令块。
-- 替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。不要把替换符当作待办、摘要、计划、说明或普通正文输出；命令块未引用的替换符没有意义。
-- 命令块保持短小；不要在命令块内直接嵌入超过 10 行的文件正文。
+- 命令块内只能写真实要执行的 shell 代码，或 Agent Qt 终端扩展指令；不要把执行结果、文件变更摘要、结论、`AGENT_DONE` 或任何聊天正文写进命令块。
+- 【占位符协议】：替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。不要把替换符当作待办、摘要、计划、说明或普通正文输出；命令块未引用的替换符没有意义。
+- 替换符语言必须和后续文件内容代码块语言一致；写 HTML 就用 `<!-- HTML block 1 -->` 并提供 ```html 代码块，写 SVG 就用 `<!-- SVG block 1 -->` 并提供 ```svg 代码块。不要用 `Game block`、`File block` 这类泛化名称。
+- 命令块保持短小；不要在命令块内直接嵌入超过 10 行的文件正文，如果要写入超过 10 行的文件内容时，必须拆分为终端指令里使用占位符协议 + 后续md格式的fenced 代码块。
 - 代码块首行可用本语言注释写摘要，供界面折叠展示：如 `# <desc 写入配置>`、`// <desc 前端逻辑>`、`/* <desc 样式> */`、`<!-- <desc SVG 图像> -->`；没有也可以，界面会自动截断首行生成摘要。
 - 不要在非写文件场景使用替换符；不要把替换符写进文件内容代码块；输出了替换符就必须在同一回复提供对应 fenced 文件内容代码块。
 - 工作区根目录：{project_root}。创建/修改用户项目文件时只能写到这里；不要写到 Agent Qt 缓存目录。
@@ -908,8 +932,11 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 常驻命令会自动进入后台终端，不要加 `&`/`nohup`，不要自己写 pid 文件。启动常驻命令后本轮结束，下一轮从执行结果里的 `Terminal processes:` 摘要获取 pid 再查询控制台输出。
 - 不输出备用方案；自己选择一个最高把握路径。
 - 自动化循环完成时只回复 `{done_marker}` 加简短总结；未完成则继续给下一轮完整命令块。
+- 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作“已生成/已写入/已验证/已发送”。执行后会有下一轮结果，再基于结果下结论。
+- 微信远控发送文件使用终端扩展指令：在命令块里单独写一行 `wx send_file 文件路径1,文件路径2,...`。这行只是请求 Agent Qt 发送附件，不代表已经发送完成；同一回复不要声称“已发送/已通过 wx send_file 发送”。
+- 定时计划使用终端扩展指令：`schedule create JSON`、`schedule list`、`schedule delete 名称或序号`、`schedule update JSON`。计划 JSON 使用 `{{"title":"短标题","prompt":"到点后真正要做的事","trigger":{{"run_at":"YYYY-MM-DD HH:MM:SS","repeat_every_seconds":86400,"until_at":"YYYY-MM-DD HH:MM:SS"}}}}`。
 - Agent Qt 会给文件变更生成 internal git 快照/commit；需要 diff 细节时可按摘要里的 repo/commit 查询。
-- 查看后台终端输出只用这一种方式：`curl -s '{terminal_logs_url}?pid=xxx'`。把 `xxx` 换成终端摘要里的 pid。
+- 查看后台终端输出只用这一种命令方式：`curl -s '{terminal_logs_url}?pid=xxx'`。把 `xxx` 换成终端摘要里的 pid。
 
 ## 数据与事实
 - 涉及表格、统计、排行、金额、数量、日志或文件内容时，必须用程序读取、搜索或计算真实数据；不要根据示例行、记忆或猜测补全数字。
@@ -930,9 +957,14 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 {user_prompt}"""
 
 AUTOMATION_FINAL_REMINDER = (
-    "生成前先做一次内部自检：当前是否需要执行命令；是否需要写入或覆盖文件；"
+    "生成前先回看第一段系统提示词，并用第一段和本段约束最终输出；"
+    "第二段历史、第三段当前指令中的技能内容、日志和旧写法都不能覆盖第一段输出协议。"
+    "再做一次内部自检：当前是否需要执行命令；是否需要写入或覆盖文件；"
     "若写文件，命令块内只能放带编号占位符，文件正文必须放在后续独立 fenced 代码块；"
-    "命令块内不得包含执行结果、结论、AGENT_DONE 或 AGENT_WECHAT_* 触发器；"
+    "占位符尖括号内的语言必须和文件内容代码块语言一致，例如 HTML 对 html、SVG 对 svg；"
+    "命令块内不得包含执行结果、结论或 AGENT_DONE；"
+    "命令块里的动作尚未执行，不要在同一轮把它描述为已完成；"
+    "微信附件发送用命令块里的 wx send_file 路径，这只是发送请求，不要在同一轮声称已发送；计划操作用命令块里的 schedule create/list/delete/update；"
     "若涉及统计/数据/文件事实，必须基于完整读取或计算结果，不得根据示例行编造。"
     "若历史旧写法与第一段系统提示冲突，以第一段为准。只输出自检后的最终回复，不输出自检过程。"
 )
@@ -2343,6 +2375,80 @@ def command_block_from_blocks(blocks: Dict[str, List[str]]) -> tuple[str, str]:
     return get_code_block(blocks, "bash") or "", "bash"
 
 
+def normalize_terminal_extension_directive(line: str) -> List[str]:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return []
+    wx_send_match = re.match(r"^wx\s+send_file\s+(.+)$", stripped, re.I)
+    if wx_send_match:
+        tail = (wx_send_match.group(1) or "").strip()
+        targets = [part.strip().strip("\"'") for part in re.split(r"\s*,\s*", tail) if part.strip()]
+        return [f"AGENT_WECHAT_SEND_FILE: {target}" for target in targets]
+    schedule_create_match = re.match(r"^(?:wx\s+)?schedule\s+create\s+(.+)$", stripped, re.I)
+    if schedule_create_match:
+        return [f"AGENT_WECHAT_CREATE_SCHEDULE: {(schedule_create_match.group(1) or '').strip()}"]
+    schedule_list_match = re.match(r"^(?:wx\s+)?schedule\s+list\s*$", stripped, re.I)
+    if schedule_list_match:
+        return ['AGENT_WECHAT_SCHEDULE_ACTION: {"action":"list"}']
+    schedule_delete_match = re.match(r"^(?:wx\s+)?schedule\s+(?:delete|remove|del)\s+(.+)$", stripped, re.I)
+    if schedule_delete_match:
+        target = (schedule_delete_match.group(1) or "").strip()
+        return [f"AGENT_WECHAT_SCHEDULE_ACTION: {json.dumps({'action': 'delete', 'target': target}, ensure_ascii=False, separators=(',', ':'))}"]
+    schedule_update_match = re.match(r"^(?:wx\s+)?schedule\s+update\s+(.+)$", stripped, re.I)
+    if schedule_update_match:
+        payload_text = (schedule_update_match.group(1) or "").strip()
+        try:
+            payload = json.loads(payload_text)
+            if isinstance(payload, dict) and not payload.get("action"):
+                payload["action"] = "update"
+            return [f"AGENT_WECHAT_SCHEDULE_ACTION: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"]
+        except Exception:
+            return [f"AGENT_WECHAT_SCHEDULE_ACTION: {payload_text}"]
+    send_match = re.match(r"^(AGENT_WECHAT_SEND_FILE)(?:\s*[:：]\s*|\s+)(.+)$", stripped, re.I)
+    if send_match:
+        tail = (send_match.group(2) or "").strip()
+        targets = [part.strip().strip("\"'") for part in re.split(r"\s*,\s*", tail) if part.strip()]
+        return [f"AGENT_WECHAT_SEND_FILE: {target}" for target in targets]
+    for name in ("AGENT_WECHAT_CREATE_SCHEDULE", "AGENT_WECHAT_SCHEDULE_ACTION"):
+        match = re.match(rf"^({name})(?:\s*[:：]\s*|\s+)(.+)$", stripped, re.I)
+        if match:
+            return [f"{name}: {(match.group(2) or '').strip()}"]
+    return []
+
+
+def strip_terminal_extension_directives_from_command(command_text: str) -> tuple[str, List[str]]:
+    kept_lines: List[str] = []
+    directives: List[str] = []
+    for line in str(command_text or "").splitlines():
+        normalized = normalize_terminal_extension_directive(line)
+        if normalized:
+            directives.extend(normalized)
+            continue
+        kept_lines.append(line)
+    return "\n".join(kept_lines).strip(), directives
+
+
+def terminal_extension_directives_from_text(text: str) -> List[str]:
+    blocks = scan_all_code_blocks(str(text or ""))
+    command_text, _command_lang = command_block_from_blocks(blocks)
+    if not command_text:
+        return []
+    _cleaned, directives = strip_terminal_extension_directives_from_command(command_text)
+    return directives
+
+
+def strip_terminal_extension_directives_from_text(text: str) -> str:
+    source = str(text or "")
+    blocks = scan_all_code_blocks(source)
+    command_text, _command_lang = command_block_from_blocks(blocks)
+    if not command_text:
+        return source
+    cleaned, directives = strip_terminal_extension_directives_from_command(command_text)
+    if not directives:
+        return source
+    return source.replace(command_text, cleaned, 1).strip()
+
+
 def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
     """提取当前平台命令块并替换占位符。"""
     command_text, command_lang = command_block_from_blocks(blocks)
@@ -2350,9 +2456,11 @@ def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
         return []
     if not command_text:
         return []
+    command_text, _terminal_extensions = strip_terminal_extension_directives_from_command(command_text)
     reject_internal_context_in_command_block(command_text)
     reject_unfenced_file_placeholder_payload(text, blocks, referenced_placeholder_keys(command_text))
     command_text = resolve_all_placeholders(command_text, blocks)
+    command_text, _terminal_extensions = strip_terminal_extension_directives_from_command(command_text)
     reject_internal_context_in_command_block(command_text)
     if command_lang == "powershell":
         return [POWERSHELL_COMMAND_PREFIX + command_text.strip()] if command_text.strip() else []
@@ -2361,7 +2469,7 @@ def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
 
 
 def reject_internal_context_in_command_block(command_text: str):
-    """拒绝把执行结果/微信触发器等聊天协议误塞进 shell 块。"""
+    """拒绝把执行结果/终端扩展指令等聊天协议误塞进 shell 块。"""
     text = str(command_text or "")
     internal_markers = (
         "【本地执行结果和文件变更】",
@@ -2371,20 +2479,14 @@ def reject_internal_context_in_command_block(command_text: str):
         "文件变更：",
         "===== 执行结果 =====",
         "===== AI 输出 =====",
-        "AGENT_WECHAT_SEND_FILE:",
-        "AGENT_WECHAT_SEND_FILE：",
-        "AGENT_WECHAT_CREATE_SCHEDULE:",
-        "AGENT_WECHAT_CREATE_SCHEDULE：",
-        "AGENT_WECHAT_SCHEDULE_ACTION:",
-        "AGENT_WECHAT_SCHEDULE_ACTION：",
         "AGENT_DONE",
         "AGENT_QT_DONE",
     )
     for marker in internal_markers:
         if marker in text:
             raise ValueError(
-                "命令块混入了执行结果、结论或微信触发器。"
-                "请只在命令块内写真实 shell 命令；完成结论和 AGENT_WECHAT_* 行必须放在命令块外。"
+                "命令块混入了执行结果、结论或终端扩展指令。"
+                "请只在命令块内写真实 shell 命令；微信发送文件请单独写 wx send_file 路径，不能 echo/printf。"
             )
 
 def is_long_running(cmd: str) -> bool:
@@ -3248,23 +3350,61 @@ AUTOMATION_CONTEXT_PROVIDER_PAYLOAD_BYTES = env_int("AGENT_QT_AUTOMATION_PROVIDE
 CHAT_HISTORY_INITIAL_RENDER_ENTRIES = env_int("AGENT_QT_HISTORY_INITIAL_RENDER_ENTRIES", 40, minimum=10)
 
 
-def is_automation_done_response(text: str) -> bool:
+def iter_non_fenced_lines(text: str):
+    in_fence = False
+    fence_marker = ""
     for line in str(text or "").splitlines():
-        if not line.strip():
+        stripped = line.lstrip()
+        fence_match = re.match(r"(```+|~~~+)", stripped)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker[:3]
+            elif marker.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
             continue
-        return bool(COMPLETION_LINE_RE.match(line))
+        if not in_fence:
+            yield line
+
+
+def is_automation_done_response(text: str) -> bool:
+    for line in iter_non_fenced_lines(text):
+        if COMPLETION_LINE_RE.match(line):
+            return True
     return False
 
 
 def strip_automation_done_marker(text: str) -> str:
-    content = str(text or "").strip()
-    if not content:
+    raw = str(text or "")
+    if not raw.strip():
         return ""
     marker_pattern = rf"(?:{re.escape(AUTOMATION_DONE_MARKER)}|AGENT_QT_DONE)"
-    pattern = rf"(?im)^\s*{marker_pattern}\s*:?\s*$"
-    content = re.sub(pattern, "", content).strip()
-    content = re.sub(rf"(?i)\b{marker_pattern}\b\s*:?", "", content).strip()
-    return content
+    marker_re = re.compile(rf"(?i)^\s*{marker_pattern}\b\s*:?\s*")
+    lines: List[str] = []
+    in_fence = False
+    fence_marker = ""
+    for line in raw.splitlines():
+        stripped = line.lstrip()
+        fence_match = re.match(r"(```+|~~~+)", stripped)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker[:3]
+            elif marker.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+            lines.append(line)
+            continue
+        if not in_fence and marker_re.match(line):
+            remainder = marker_re.sub("", line, count=1).strip(" \t:-：")
+            if remainder:
+                lines.append(remainder)
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def looks_like_automation_context_payload(text: str) -> bool:
@@ -3491,9 +3631,9 @@ def build_automation_feedback_prompt(
     wechat_completion_note = ""
     if wechat_file_delivery:
         wechat_completion_note = (
-            "\n- 本轮来自微信且具备附件发送上下文。若用户目标是把文件发回微信，完成时不要只说“会自动发送”；"
-            f"第一行写 `{AUTOMATION_DONE_MARKER}` 加简短总结，随后单独写一行 `AGENT_WECHAT_SEND_FILE: 文件路径或文件名`。"
-            "没有 `AGENT_WECHAT_SEND_FILE` 行，程序不会发送附件。"
+            "\n- 本轮来自微信且具备附件发送上下文。若文件已经定位、生成或验证完成且需要发回微信，"
+            "下一步只输出一个命令块：`wx send_file 文件路径`。若没有其他本地命令，命令块里只写这一行；"
+            "不要同时写 AGENT_DONE，也不要声称文件已发送。"
         )
     return f"""你正在 Agent Qt 的自动化循环中，这是第 {round_number}/{max_rounds} 轮。
 
@@ -3509,9 +3649,11 @@ def build_automation_feedback_prompt(
 ```
 
 请判断下一步：
-- 已完成：只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。
-- 未完成：输出一个完整且短小的 ```{command_block_lang} 命令块；写入超过 10 行的文件内容时，必须用带编号替换符引用同一回复里的同语言 fenced 文件内容。
-- 命令块内只能写真实要执行的 shell 代码；不要把上一轮执行结果、文件变更、结论、`{AUTOMATION_DONE_MARKER}` 或 `AGENT_WECHAT_*` 触发器写进命令块。
+- 如果本轮仍在继续处理上面的“原始用户需求”，上一轮本地执行结果、错误提示和拒绝原因与用户需求同等重要；若它指出协议错误、命令错误、缺文件、测试失败或数据不可信，必须先针对该错误修正输出，不要重复上一轮被拒绝的写法。若用户已经发来新的不同需求，则优先执行最新用户需求。
+- 已完成：只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。若下一步还需要执行命令、写文件或发送附件，尚未完成，先输出对应命令块。
+- 未完成：输出一个完整且短小的 ```{command_block_lang} 命令块；如果要写入超过 10 行的文件内容时，必须拆分为占位符协议 + md格式的fenced 代码块。
+- 命令块内只能写真实要执行的 shell 代码，或 `wx send_file 路径`、`schedule create/list/delete/update`；不要把上一轮执行结果、文件变更、结论或 `{AUTOMATION_DONE_MARKER}` 写进命令块。
+- 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作已完成、已生成、已验证或已发送。
 - 涉及统计、表格、数据查找或文件事实时，必须完整读取/计算后再下结论；示例行只能用于判断结构，不能据此编造定量结论、模型结论或总体判断。
 - 后台安装/构建/拉取不要当作完成；启动常驻命令时不要加 `&`/`nohup`，等执行结果给出 `Terminal processes:` 摘要后，再使用 `curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'` 查询控制台输出。
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
@@ -3613,24 +3755,25 @@ def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True, schedu
         file_delivery_note = (
             "如果用户要求查看图片、PDF、表格或文档，先自主使用文件树、搜索、读取文件或必要命令定位/生成目标文件；"
             "只有探索后仍缺少关键条件、或存在多个同样合理候选时，才简短向微信用户追问。"
-            "如果已经确定需要把工作区文件作为微信附件发回用户，必须在最终结论末尾单独写一行 AGENT_WECHAT_SEND_FILE: 文件路径或文件名；"
-            "可写多行，程序会发送并隐藏这些内部行。不要只说“会自动回传/发送”，没有这行触发器就不会发送文件。"
+            "如果已经确定需要把工作区文件作为微信附件发回用户，在命令块中写 `wx send_file 文件路径`。"
+            "多个文件路径用英文逗号分隔；没有这行就不会发送文件。"
+            "`wx send_file` 只是发送请求，不代表已经发送完成；输出该命令时不要同时说已发送。"
         )
     env = runtime_environment()
     return (
         "【微信远控消息】\n"
         f"当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        "用户从手机微信发送以下需求。你负责理解自然语言并主动完成，程序只识别少量结构化触发器。\n"
-        "可用触发器：\n"
+        "用户从手机微信发送以下需求。你负责理解自然语言并主动完成；需要程序配合时，请使用下面的终端扩展指令。\n"
+        "可用终端扩展指令：\n"
         "- 要执行本地工作：输出一个完整且短小的 "
         f"```{env['command_block_lang']} 命令块。\n"
-        "- 要把工作区文件发回微信：先自主定位/生成文件，最终结论末尾必须写 AGENT_WECHAT_SEND_FILE: 文件路径或文件名；否则程序不会发送附件。\n"
-        "- 要创建时间计划：最终结论末尾单独写一行 AGENT_WECHAT_CREATE_SCHEDULE: 后接紧凑 JSON；程序会隐藏该行并创建计划。\n"
+        "- 要把工作区文件发回微信：先自主定位/生成文件；路径确定后输出一个命令块，在其中写 `wx send_file 文件路径`。多个路径用英文逗号分隔；写出这行后由程序发送，AI 不要在同一回复声称已发送。\n"
+        "- 要创建时间计划：输出一个命令块，在其中写 `schedule create JSON`。\n"
         "  JSON 结构：{\"title\":\"短标题\",\"prompt\":\"到点后真正要做的事，不要写帮我创建计划\",\"trigger\":{\"run_at\":\"YYYY-MM-DD HH:MM:SS\",\"repeat_every_seconds\":86400,\"until_at\":\"YYYY-MM-DD HH:MM:SS\"}}\n"
         "  `run_at` 是模型根据当前时间和用户表达算出的下一次具体触发时间；一次性计划省略 `repeat_every_seconds` 或设为 0。每日/每周/每隔几小时等循环计划也只输出下一次 `run_at`，并用秒数表达循环间隔，例如每天 86400、每周 604800、每 2 小时 7200。有截止范围时输出 `until_at`，例如“接下来 5 个小时每小时检查”就是下一小时触发、repeat 3600、until_at=当前时间+5小时。\n"
-        "  如果用户同时提出多个不同频率的周期任务，优先拆成多行 AGENT_WECHAT_CREATE_SCHEDULE，不要在单个计划里用脚本计数器模拟另一个周期。\n"
+        "  如果用户同时提出多个不同频率的周期任务，优先拆成多行 `schedule create JSON`，不要在单个计划里用脚本计数器模拟另一个周期。\n"
         "  如果无法确定时间、任务或触发参数，先做低成本探索，仍不确定再简短提问，不要输出半截 trigger。\n"
-        "- 要查看、删除或修改时间计划：最终结论末尾单独写一行 AGENT_WECHAT_SCHEDULE_ACTION: 后接紧凑 JSON。查看：{\"action\":\"list\"}；删除：{\"action\":\"delete\",\"target\":\"计划名称、序号或 id\"}；修改：{\"action\":\"update\",\"target\":\"计划名称、序号或 id\",\"trigger\":{\"run_at\":\"YYYY-MM-DD HH:MM:SS\",\"repeat_every_seconds\":3600,\"until_at\":\"YYYY-MM-DD HH:MM:SS\"},\"prompt\":\"可选的新计划内容\",\"title\":\"可选的新标题\"}。修改时只写需要变化的字段；如果目标不明确，先简短追问，不要猜。\n"
+        "- 要查看、删除或修改时间计划：输出命令块。查看写 `schedule list`；删除写 `schedule delete 计划名称、序号或 id`；修改写 `schedule update JSON`，JSON 结构：{\"target\":\"计划名称、序号或 id\",\"trigger\":{\"run_at\":\"YYYY-MM-DD HH:MM:SS\",\"repeat_every_seconds\":3600,\"until_at\":\"YYYY-MM-DD HH:MM:SS\"},\"prompt\":\"可选的新计划内容\",\"title\":\"可选的新标题\"}。修改时只写需要变化的字段；如果目标不明确，先简短追问，不要猜。\n"
         "- 要停止/切会话/列列表等控制动作：用户使用 slash/menu 指令时程序会直接处理；自然语言里提到时，你可以解释可用指令。\n"
         "如果用户目标不清楚，先做低成本探索；探索后仍缺少关键条件或候选无法判断时，再简短提问。最终给微信的回复会被压缩展示，所以结论要短。"
         f"{file_delivery_note}"
@@ -4332,7 +4475,7 @@ def create_workspace_schedule(root: str, title: str, prompt: str, hour: int, min
 def schedule_from_wechat_trigger_payload(root: str, payload: object, *, notify_user: str = "", notify_context_token: str = "") -> Dict[str, object]:
     if not isinstance(payload, dict):
         raise RuntimeError("计划触发器不是 JSON 对象。")
-    title = str(payload.get("title") or payload.get("name") or "微信计划").strip()[:80] or "微信计划"
+    title = str(payload.get("title") or payload.get("name") or "定时计划").strip()[:80] or "定时计划"
     prompt = str(payload.get("prompt") or payload.get("content") or "").strip()
     trigger = payload.get("trigger") or payload.get("schedule")
     if not isinstance(trigger, dict):
@@ -7458,12 +7601,18 @@ def extract_wechat_send_file_targets(text: str) -> List[str]:
     for line in str(text or "").splitlines():
         stripped = line.strip()
         upper = stripped.upper()
-        if not upper.startswith("AGENT_WECHAT_SEND_FILE:") and not upper.startswith("AGENT_WECHAT_SEND_FILE："):
-            continue
-        _, _, tail = stripped.partition(":" if ":" in stripped else "：")
-        target = tail.strip().strip("\"'")
-        if target and target not in targets:
-            targets.append(target)
+        if upper.startswith("AGENT_WECHAT_SEND_FILE:") or upper.startswith("AGENT_WECHAT_SEND_FILE："):
+            _, _, tail = stripped.partition(":" if ":" in stripped else "：")
+            candidates = [part.strip().strip("\"'") for part in re.split(r"\s*,\s*", tail) if part.strip()]
+        else:
+            candidates = [
+                directive.split(":", 1)[1].strip()
+                for directive in normalize_terminal_extension_directive(stripped)
+                if directive.upper().startswith("AGENT_WECHAT_SEND_FILE:")
+            ]
+        for target in candidates:
+            if target and target not in targets:
+                targets.append(target)
     return targets[:5]
 
 
@@ -7509,6 +7658,79 @@ def extract_wechat_schedule_action_payloads(text: str) -> tuple[List[Dict[str, o
     return payloads[:5], errors[:3]
 
 
+def collect_schedule_extension_payloads(text: str) -> tuple[List[Dict[str, object]], List[Dict[str, object]], List[str]]:
+    payloads, errors = extract_wechat_schedule_trigger_payloads(text)
+    actions, action_errors = extract_wechat_schedule_action_payloads(text)
+    return payloads, actions, [*errors, *action_errors]
+
+
+def apply_schedule_extension_payloads(
+    root: str,
+    schedule_payloads: List[Dict[str, object]],
+    schedule_actions: List[Dict[str, object]],
+    *,
+    notify_user: str = "",
+    notify_context_token: str = "",
+) -> tuple[List[str], List[str], List[str]]:
+    created_schedules: List[str] = []
+    schedule_action_replies: List[str] = []
+    schedule_errors: List[str] = []
+    for payload in schedule_payloads[:3]:
+        try:
+            schedule_item = schedule_from_wechat_trigger_payload(
+                root,
+                payload,
+                notify_user=notify_user,
+                notify_context_token=notify_context_token,
+            )
+            created_schedules.append(f"{schedule_item.get('title')}（{format_schedule_time(schedule_item)}）")
+        except Exception as exc:
+            schedule_errors.append(str(exc))
+    for payload in schedule_actions[:5]:
+        action = str(payload.get("action") or "").strip().lower()
+        if action == "list":
+            schedule_action_replies.append(schedules_summary_text(load_workspace_schedules(root)))
+            continue
+        if action == "delete":
+            target = str(payload.get("target") or payload.get("id") or payload.get("title") or "").strip()
+            if not target:
+                schedule_errors.append("删除计划缺少 target。")
+                continue
+            if delete_workspace_schedule(root, target):
+                schedule_action_replies.append(f"已删除计划：{target}")
+            else:
+                schedule_errors.append(f"未找到计划：{target}")
+            continue
+        if action == "update":
+            target = str(payload.get("target") or payload.get("id") or payload.get("title") or "").strip()
+            if not target:
+                schedule_errors.append("修改计划缺少 target。")
+                continue
+            try:
+                updated = update_workspace_schedule_from_action(root, target, payload)
+                schedule_action_replies.append(f"已修改计划：{updated.get('title')}（{format_schedule_time(updated)}）")
+            except Exception as exc:
+                schedule_errors.append(str(exc))
+            continue
+        schedule_errors.append(f"未知计划动作：{action or '空'}")
+    return created_schedules, schedule_action_replies, schedule_errors
+
+
+def schedule_extension_reply(
+    created_schedules: List[str],
+    schedule_action_replies: List[str],
+    schedule_errors: List[str],
+) -> str:
+    parts: List[str] = []
+    if created_schedules:
+        parts.append("已创建计划：" + "、".join(created_schedules))
+    if schedule_action_replies:
+        parts.extend(schedule_action_replies)
+    if schedule_errors:
+        parts.append("有计划操作未完成：" + "；".join(schedule_errors[:3]))
+    return "\n\n".join(part for part in parts if part).strip()
+
+
 def strip_wechat_send_file_markers(text: str) -> str:
     lines = []
     for line in str(text or "").splitlines():
@@ -7523,8 +7745,54 @@ def strip_wechat_send_file_markers(text: str) -> str:
             or upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION：")
         ):
             continue
+        if normalize_terminal_extension_directive(stripped):
+            continue
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+def echoed_wechat_trigger_lines(text: str) -> List[str]:
+    """Recover legacy WeChat control lines that were incorrectly wrapped in a pure echo shell block."""
+    blocks = scan_all_code_blocks(str(text or ""))
+    command_text, _command_lang = command_block_from_blocks(blocks)
+    if not command_text:
+        return []
+    triggers: List[str] = []
+    saw_effective_line = False
+    for raw_line in command_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        saw_effective_line = True
+        match = re.match(r"^(?:echo|printf(?:\s+%s(?:\\n)?)?)\s+(.+?)\s*$", line)
+        if not match:
+            return []
+        payload = match.group(1).strip()
+        payload = payload.strip("\"'")
+        upper = payload.upper()
+        if not (
+            upper.startswith("AGENT_WECHAT_SEND_FILE:")
+            or upper.startswith("AGENT_WECHAT_SEND_FILE：")
+            or upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE:")
+            or upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE：")
+            or upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION:")
+            or upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION：")
+        ):
+            return []
+        triggers.append(payload)
+    return triggers if saw_effective_line else []
+
+
+def wechat_trigger_summary(trigger_lines: List[str]) -> str:
+    file_targets = extract_wechat_send_file_targets("\n".join(trigger_lines))
+    if file_targets:
+        names = [os.path.basename(target) or target for target in file_targets]
+        return "已准备发送文件：" + "、".join(names[:3])
+    if any("AGENT_WECHAT_CREATE_SCHEDULE" in line.upper() for line in trigger_lines):
+        return "已准备创建定时计划。"
+    if any("AGENT_WECHAT_SCHEDULE_ACTION" in line.upper() for line in trigger_lines):
+        return "已准备处理定时计划。"
+    return "已处理微信请求。"
 
 
 def wechat_history_reply(entries: List[Dict[str, object]], silent: bool = True) -> str:
@@ -9905,6 +10173,7 @@ class ThreadCard(QFrame):
         self.setObjectName("threadCard")
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedHeight(50)
+        self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setup_ui()
         self.apply_style()
@@ -9915,12 +10184,16 @@ class ThreadCard(QFrame):
         layout.setSpacing(8)
         title = QLabel(str(self.thread.get("title", "会话")))
         title.setStyleSheet("background: transparent; border: none; font-size: 12px; font-weight: 900;")
-        title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        title.setMinimumWidth(0)
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        title.setWordWrap(False)
+        title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         layout.addWidget(title)
         self.title_edit = QLineEdit(str(self.thread.get("title", "会话")))
         self.title_edit.setMaxLength(80)
         self.title_edit.setVisible(False)
-        self.title_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.title_edit.setMinimumWidth(0)
+        self.title_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.title_edit.editingFinished.connect(self.commit_title_edit)
         self.title_edit.installEventFilter(self)
         self.title_edit.setStyleSheet(f"""
@@ -10234,6 +10507,8 @@ class Sidebar(QFrame):
         add_row.addWidget(self.add_thread_btn)
         threads_layout.addLayout(add_row)
         self.thread_list = QWidget()
+        self.thread_list.setMinimumWidth(0)
+        self.thread_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.thread_list_layout = QVBoxLayout(self.thread_list)
         self.thread_list_layout.setContentsMargins(0, 0, 0, 0)
         self.thread_list_layout.setSpacing(8)
@@ -11459,34 +11734,9 @@ class ChatPage(QWidget):
             return
 
     def freeze_user_chat_scroll_value(self, state: Dict[str, object]):
-        if not bool(state.get("user_controlled")):
-            return
-        try:
-            frozen_value = int(state.get("value", 0))
-        except (TypeError, ValueError):
-            frozen_value = 0
-
-        def restore_frozen_value():
-            if not getattr(self, "chat_scroll_user_controlled", False):
-                return
-            if not hasattr(self, "scroll_area"):
-                return
-            try:
-                bar = self.scroll_area.verticalScrollBar()
-            except RuntimeError:
-                return
-            value = max(0, min(frozen_value, bar.maximum()))
-            if bar.value() == value:
-                return
-            self.chat_scroll_programmatic = True
-            try:
-                bar.setValue(value)
-            finally:
-                QTimer.singleShot(0, self.clear_programmatic_chat_scroll)
-
-        restore_frozen_value()
-        for delay in (0, 30, 90, 180, 300, 600):
-            QTimer.singleShot(delay, restore_frozen_value)
+        # Respect manual scrolling completely. Trying to "freeze" the outer
+        # scrollbar during code-block height changes causes visible tugging.
+        return
 
     def stabilize_chat_scroll_after_update(self, state: Dict[str, object]):
         if bool(state.get("user_controlled")):
@@ -11737,6 +11987,7 @@ class ChatPage(QWidget):
         silent = parse_boolish(payload.get("silent"), bool(settings.get("silent", True)))
         to_user = str(payload.get("to_user") or payload.get("user") or payload.get("thread_id") or "").strip()
         context_token = str(payload.get("context_token") or "").strip()
+        remember_wechat_reply_target(to_user, context_token)
         allow_file_delivery = bool(wechat_bridge_enabled_setting() and to_user and context_token)
         self.wechat_active_request_id = request_id
         self.wechat_active_start_index = len(self.history_entries)
@@ -11780,14 +12031,25 @@ class ChatPage(QWidget):
             for entry in entries:
                 if not isinstance(entry, dict):
                     continue
-                entry_text = str(entry.get("content") or entry.get("context_content") or "")
-                requested_files.extend(extract_wechat_send_file_targets(entry_text))
-                payloads, errors = extract_wechat_schedule_trigger_payloads(entry_text)
-                schedule_payloads.extend(payloads)
-                schedule_errors.extend(errors)
-                actions, action_errors = extract_wechat_schedule_action_payloads(entry_text)
-                schedule_actions.extend(actions)
-                schedule_errors.extend(action_errors)
+                entry_texts = [
+                    str(entry.get("content") or ""),
+                    str(entry.get("context_content") or ""),
+                ]
+                seen_entry_texts: set[str] = set()
+                unique_entry_texts: List[str] = []
+                for entry_text in entry_texts:
+                    if not entry_text or entry_text in seen_entry_texts:
+                        continue
+                    seen_entry_texts.add(entry_text)
+                    unique_entry_texts.append(entry_text)
+                    requested_files.extend(extract_wechat_send_file_targets(entry_text))
+                    payloads, errors = extract_wechat_schedule_trigger_payloads(entry_text)
+                    schedule_payloads.extend(payloads)
+                    schedule_errors.extend(errors)
+                    actions, action_errors = extract_wechat_schedule_action_payloads(entry_text)
+                    schedule_actions.extend(actions)
+                    schedule_errors.extend(action_errors)
+                entry_text = "\n".join(unique_entry_texts)
                 if (
                     "AGENT_WECHAT_CREATE_SCHEDULE" in entry_text
                     or "AGENT_WECHAT_SCHEDULE_ACTION" in entry_text
@@ -11811,45 +12073,20 @@ class ChatPage(QWidget):
         failed_files: List[str] = []
         created_schedules: List[str] = []
         schedule_action_replies: List[str] = []
+        if self.project_root:
+            notify_user = to_user if allow_file_delivery else ""
+            notify_context_token = context_token if allow_file_delivery else ""
+            created, action_replies, errors = apply_schedule_extension_payloads(
+                self.project_root,
+                schedule_payloads,
+                schedule_actions,
+                notify_user=notify_user,
+                notify_context_token=notify_context_token,
+            )
+            created_schedules.extend(created)
+            schedule_action_replies.extend(action_replies)
+            schedule_errors.extend(errors)
         if allow_file_delivery and self.project_root:
-            for payload in schedule_payloads[:3]:
-                try:
-                    schedule_item = schedule_from_wechat_trigger_payload(
-                        self.project_root,
-                        payload,
-                        notify_user=to_user,
-                        notify_context_token=context_token,
-                    )
-                    created_schedules.append(f"{schedule_item.get('title')}（{format_schedule_time(schedule_item)}）")
-                except Exception as exc:
-                    schedule_errors.append(str(exc))
-            for payload in schedule_actions[:5]:
-                action = str(payload.get("action") or "").strip().lower()
-                if action == "list":
-                    schedule_action_replies.append(schedules_summary_text(load_workspace_schedules(self.project_root)))
-                    continue
-                if action == "delete":
-                    target = str(payload.get("target") or payload.get("id") or payload.get("title") or "").strip()
-                    if not target:
-                        schedule_errors.append("删除计划缺少 target。")
-                        continue
-                    if delete_workspace_schedule(self.project_root, target):
-                        schedule_action_replies.append(f"已删除计划：{target}")
-                    else:
-                        schedule_errors.append(f"未找到计划：{target}")
-                    continue
-                if action == "update":
-                    target = str(payload.get("target") or payload.get("id") or payload.get("title") or "").strip()
-                    if not target:
-                        schedule_errors.append("修改计划缺少 target。")
-                        continue
-                    try:
-                        updated = update_workspace_schedule_from_action(self.project_root, target, payload)
-                        schedule_action_replies.append(f"已修改计划：{updated.get('title')}（{format_schedule_time(updated)}）")
-                    except Exception as exc:
-                        schedule_errors.append(str(exc))
-                    continue
-                schedule_errors.append(f"未知计划动作：{action or '空'}")
             for target in requested_files[:3]:
                 path = resolve_project_file_target(self.project_root, target)
                 if not path:
@@ -14231,11 +14468,23 @@ class ChatPage(QWidget):
         prompt = str(schedule_item.get("prompt") or "").strip()
         last_success = str(schedule_item.get("last_success_note") or "").strip()
         wechat_note = ""
-        if bool(wechat_bridge_enabled_setting() and schedule_item.get("notify_wechat_enabled")):
+        has_wechat_notify_target = bool(
+            wechat_bridge_enabled_setting()
+            and (
+                schedule_item.get("notify_wechat_enabled")
+                or (
+                    last_wechat_reply_target().get("to_user")
+                    and last_wechat_reply_target().get("context_token")
+                )
+            )
+        )
+        if has_wechat_notify_target:
             wechat_note = (
-                "\n\n本计划完成后会通知微信用户。若本次生成了用户应直接查看的报告、图片、表格、文档等工作区文件，"
-                "请在最终结论末尾单独写一行 AGENT_WECHAT_SEND_FILE: 文件路径或文件名；可写多行。"
-                "只发送真正有交付价值的文件，不要发送临时脚本或中间缓存。"
+                "\n\n本计划完成后会通知微信用户。完成时用 AGENT_DONE 加一段面向用户的简短结论；"
+                "程序会把这段结论发到微信。若本次生成了用户应直接查看的报告、图片、表格、文档等工作区文件，"
+                "请在最终阶段用命令块单独写 `wx send_file 文件路径`。"
+                "多个文件用英文逗号分隔；只发送真正有交付价值的文件，不要发送临时脚本或中间缓存。"
+                "`wx send_file` 是发送请求，不代表已经发送完成；输出该命令时不要同时声称已发送。"
             )
         stable_note = (
             "\n\n上次成功执行摘要：\n"
@@ -14321,9 +14570,13 @@ class ChatPage(QWidget):
         self.switch_to_schedule_thread(schedule_item, run_key)
         self.active_schedule_id = schedule_id
         self.active_schedule_notify = {}
-        if bool(wechat_bridge_enabled_setting() and schedule_item.get("notify_wechat_enabled")):
+        if bool(wechat_bridge_enabled_setting()):
             to_user = str(schedule_item.get("notify_wechat_user") or "").strip()
             context_token = str(schedule_item.get("notify_wechat_context_token") or "").strip()
+            if not to_user or not context_token:
+                fallback_target = last_wechat_reply_target()
+                to_user = to_user or str(fallback_target.get("to_user") or "")
+                context_token = context_token or str(fallback_target.get("context_token") or "")
             if to_user and context_token:
                 self.active_schedule_notify = {
                     "to_user": to_user,
@@ -14375,6 +14628,10 @@ class ChatPage(QWidget):
         notify_info = dict(getattr(self, "active_schedule_notify", {}) or {})
         to_user = str(notify_info.get("to_user") or "").strip()
         context_token = str(notify_info.get("context_token") or "").strip()
+        if wechat_bridge_enabled_setting() and (not to_user or not context_token):
+            fallback_target = last_wechat_reply_target()
+            to_user = to_user or str(fallback_target.get("to_user") or "")
+            context_token = context_token or str(fallback_target.get("context_token") or "")
         if not wechat_bridge_enabled_setting() or not to_user or not context_token:
             return
         title = str(notify_info.get("title") or "定时计划").strip()
@@ -14493,15 +14750,15 @@ class ChatPage(QWidget):
             )
             context_worker.requestInterruption()
             if context_worker.wait(2500):
-                context_worker.deleteLater()
+                pass
             else:
                 self.automation_manager.stop_provider_process()
                 if context_worker.wait(2500):
-                    context_worker.deleteLater()
+                    pass
                 else:
                     context_worker.terminate()
                     if context_worker.wait(1200):
-                        context_worker.deleteLater()
+                        pass
                     else:
                         context_worker.finished.connect(context_worker.deleteLater)
             if self.automation_context_worker is context_worker:
@@ -14511,15 +14768,15 @@ class ChatPage(QWidget):
         if worker is not None:
             worker.requestInterruption()
             if worker.wait(2500):
-                worker.deleteLater()
+                pass
             else:
                 self.automation_manager.stop_provider_process()
                 if worker.wait(2500):
-                    worker.deleteLater()
+                    pass
                 else:
                     worker.terminate()
                     if worker.wait(1200):
-                        worker.deleteLater()
+                        pass
                     else:
                         worker.finished.connect(worker.deleteLater)
             if self.automation_worker is worker:
@@ -14907,7 +15164,6 @@ class ChatPage(QWidget):
             return ""
         high_signal: List[str] = []
         high_signal_patterns = (
-            "FINAL:",
             AUTOMATION_DONE_MARKER,
             "Files changed:",
             "文件变更：",
@@ -15248,6 +15504,7 @@ class ChatPage(QWidget):
             thread_id=self.thread_id,
         )
         self.automation_context_worker = context_worker
+        context_worker.finished.connect(context_worker.deleteLater)
         self.update_automation_composer_state()
 
         def start_chat_worker(messages: List[Dict[str, str]]):
@@ -15259,6 +15516,7 @@ class ChatPage(QWidget):
                 self.thread_id,
             )
             self.automation_worker = worker
+            worker.finished.connect(worker.deleteLater)
             self.automation_active_messages = copy.deepcopy(messages)
             self.automation_active_model = provider_model
             self.update_automation_composer_state()
@@ -15266,7 +15524,6 @@ class ChatPage(QWidget):
 
             def on_finished(text: str, error: str):
                 if request_serial != self.automation_request_serial or self.automation_worker is not worker:
-                    worker.deleteLater()
                     return
                 self.automation_worker = None
                 self.update_automation_composer_state()
@@ -15305,13 +15562,16 @@ class ChatPage(QWidget):
                     self.automation_active_model = ""
                     self.stop_automation_preview(remove_bubble=True)
                     quiet_message = quiet_automation_error_message(error)
+                    was_wechat_request = bool(self.wechat_active_request_id)
                     self.stop_automation_loop(
                         quiet_message or "自动化循环已暂停。",
                         ensure_manual_entry=True,
                     )
                     if "网页登录还没有准备好" in error:
                         self.add_status_bubble("需要先完成网页登录。请使用设置里的“打开网页登录”，登录后重新发送。")
-                    if (not quiet_message) or developer_error_details_enabled():
+                    if was_wechat_request:
+                        self.add_status_bubble("微信远控请求失败，已把错误返回到微信，不弹出阻塞窗口。")
+                    elif (not quiet_message) or developer_error_details_enabled():
                         styled_warning(self, "AI 自动化失败", self.automation_manager.error_with_log_hint(error))
                 else:
                     provider_io = {
@@ -15326,8 +15586,6 @@ class ChatPage(QWidget):
                     self.automation_active_model = ""
                     preview_bubble = self.finalize_automation_preview_bubble(text)
                     self.handle_ai_response_text(text, existing_bubble=preview_bubble, provider_io=provider_io)
-                worker.deleteLater()
-
             worker.finished_signal.connect(on_finished)
             worker.start()
 
@@ -15336,23 +15594,23 @@ class ChatPage(QWidget):
 
         def on_context_finished(serial: int, messages: List[Dict[str, str]], error: str, provider_compaction: str):
             if serial != self.automation_request_serial or self.automation_context_worker is not context_worker:
-                context_worker.deleteLater()
                 return
             self.automation_context_worker = None
             self.last_automation_provider_compaction = provider_compaction or "none"
             self.last_automation_history_compacted = provider_compaction not in {"", "none"}
             self.update_automation_composer_state()
             if error:
+                was_wechat_request = bool(self.wechat_active_request_id)
                 self.stop_automation_loop("上下文压缩失败，自动化循环已暂停。", ensure_manual_entry=True)
                 if copy_btn is not None:
                     copy_btn.setEnabled(True)
                     copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
-                if developer_error_details_enabled():
+                if was_wechat_request:
+                    self.add_status_bubble("微信远控上下文压缩失败，已把错误返回到微信，不弹出阻塞窗口。")
+                elif developer_error_details_enabled():
                     styled_warning(self, "上下文压缩失败", self.automation_manager.error_with_log_hint(error))
-                context_worker.deleteLater()
                 return
             start_chat_worker(messages)
-            context_worker.deleteLater()
 
         context_worker.status_signal.connect(on_context_status)
         context_worker.finished_signal.connect(on_context_finished)
@@ -15512,7 +15770,6 @@ class ChatPage(QWidget):
         worker = HistorySaveWorker(self.project_root, self.thread_id, entries, generation)
         self.history_save_worker = worker
         worker.finished_signal.connect(self.on_history_save_finished)
-        worker.finished.connect(worker.deleteLater)
         worker.start()
         if wait:
             worker.wait(3000)
@@ -15522,7 +15779,7 @@ class ChatPage(QWidget):
 
     def on_history_save_finished(self, generation: int, ok: bool, tmp_path: str):
         worker = self.history_save_worker
-        if worker is not None and not worker.isRunning():
+        if worker is not None and generation == self.history_save_generation:
             self.history_save_worker = None
         current_generation = generation == self.history_save_generation
         if ok and current_generation and self.project_root:
@@ -15920,6 +16177,65 @@ class ChatPage(QWidget):
             return
         done_response = self.automation_loop_active and is_automation_done_response(text)
         display_text = strip_automation_done_marker(text) if done_response else text
+        wechat_triggers: List[str] = []
+        wechat_trigger_context_text = ""
+        done_context_text = ""
+        terminal_extension_triggers: List[str] = []
+        if self.automation_loop_active:
+            terminal_extension_triggers = terminal_extension_directives_from_text(display_text)
+        if self.automation_loop_active and self.wechat_active_request_id:
+            if terminal_extension_triggers:
+                wechat_triggers = terminal_extension_triggers
+                stripped_display_text = strip_terminal_extension_directives_from_text(display_text)
+                blocks_after_strip = scan_all_code_blocks(stripped_display_text)
+                command_after_strip, _command_lang = command_block_from_blocks(blocks_after_strip)
+                has_real_command = bool((command_after_strip or "").strip())
+                display_text = stripped_display_text if has_real_command else wechat_trigger_summary(wechat_triggers)
+                if not has_real_command:
+                    done_response = True
+            else:
+                wechat_triggers = echoed_wechat_trigger_lines(display_text)
+            if wechat_triggers:
+                wechat_trigger_context_text = (
+                    wechat_trigger_summary(wechat_triggers)
+                    + "\n\n"
+                    + "\n".join(wechat_triggers)
+                ).strip()
+                done_context_text = wechat_trigger_context_text
+                if not terminal_extension_triggers:
+                    display_text = wechat_trigger_summary(wechat_triggers)
+                    done_response = True
+        elif self.automation_loop_active and terminal_extension_triggers:
+            stripped_display_text = strip_terminal_extension_directives_from_text(display_text)
+            blocks_after_strip = scan_all_code_blocks(stripped_display_text)
+            command_after_strip, _command_lang = command_block_from_blocks(blocks_after_strip)
+            has_real_command = bool((command_after_strip or "").strip())
+            schedule_payloads, schedule_actions, schedule_errors = collect_schedule_extension_payloads(
+                "\n".join(terminal_extension_triggers)
+            )
+            file_targets = extract_wechat_send_file_targets("\n".join(terminal_extension_triggers))
+            has_schedule_directive = bool(schedule_payloads or schedule_actions or schedule_errors)
+            if has_schedule_directive and not has_real_command:
+                created: List[str] = []
+                action_replies: List[str] = []
+                errors: List[str] = list(schedule_errors)
+                if self.project_root:
+                    c, a, e = apply_schedule_extension_payloads(
+                        self.project_root,
+                        schedule_payloads,
+                        schedule_actions,
+                    )
+                    created.extend(c)
+                    action_replies.extend(a)
+                    errors.extend(e)
+                else:
+                    errors.append("未设置工作区，无法处理定时计划。")
+                display_text = schedule_extension_reply(created, action_replies, errors) or "已处理定时计划。"
+                done_response = True
+            elif file_targets and not has_real_command and getattr(self, "active_schedule_notify", None):
+                display_text = wechat_trigger_summary(terminal_extension_triggers)
+                done_context_text = (display_text + "\n\n" + "\n".join(terminal_extension_triggers)).strip()
+                done_response = True
         if done_response and not display_text:
             self.finish_active_schedule_success("任务已执行完成。")
             self.stop_automation_loop("自动化执行完成。", ensure_manual_entry=True)
@@ -15953,6 +16269,8 @@ class ChatPage(QWidget):
             "type": "ai",
             "content": display_text,
         }
+        if wechat_trigger_context_text:
+            history_entry["context_content"] = wechat_trigger_context_text
         if isinstance(provider_io, dict):
             history_entry["provider_io"] = copy.deepcopy(provider_io)
         self.append_history(history_entry)
@@ -15960,7 +16278,7 @@ class ChatPage(QWidget):
         QApplication.processEvents()
 
         if done_response:
-            self.finish_active_schedule_success(display_text)
+            self.finish_active_schedule_success(done_context_text or display_text)
             self.stop_automation_loop("", ensure_manual_entry=True)
             self.scroll_to_bottom()
             return
@@ -15969,16 +16287,26 @@ class ChatPage(QWidget):
         try:
             commands = extract_bash_commands(display_text, blocks)
         except ValueError as exc:
-            if self.automation_loop_active:
-                self.stop_automation_loop(str(exc), ensure_manual_entry=True)
+            rejection_text = f"⚠️ {exc}"
             warning_bubble = ChatBubble(
                 "system",
-                f"⚠️ {exc}",
+                rejection_text,
                 parent=self.chat_container,
                 scrollable=False,
                 max_content_height=130,
             )
             self.add_chat_widget(warning_bubble, animate=True)
+            if self.automation_loop_active:
+                context_content = build_execution_context_content(
+                    f"Local execution rejected:\n{rejection_text}",
+                    [],
+                )
+                self.append_history({
+                    "type": "result",
+                    "content": rejection_text,
+                    "context_content": context_content,
+                })
+                self.request_next_automation_step(context_content)
             self.scroll_to_bottom()
             return
         
