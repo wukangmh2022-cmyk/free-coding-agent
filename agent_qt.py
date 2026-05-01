@@ -11555,7 +11555,7 @@ class ChatPage(QWidget):
                     raise RuntimeError(f"没有找到文件：{target}")
                 if not to_user or not context_token:
                     raise RuntimeError("当前通道缺少微信回复上下文，无法直接发送附件。")
-                self.wechat_connector._send_file(to_user, path, context_token, f"已发送文件：{os.path.basename(path)}")
+                self.wechat_connector._send_file(to_user, path, context_token)
                 reply = f"已发送文件：{os.path.relpath(path, self.project_root)}"
                 self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": reply, "text": reply, "path": path})
                 return
@@ -11758,7 +11758,7 @@ class ChatPage(QWidget):
                     failed_files.append(target)
                     continue
                 try:
-                    self.wechat_connector._send_file(to_user, path, context_token, f"已发送文件：{os.path.basename(path)}")
+                    self.wechat_connector._send_file(to_user, path, context_token)
                     sent_files.append(os.path.relpath(path, self.project_root))
                 except Exception as exc:
                     failed_files.append(f"{target}（{exc}）")
@@ -11768,8 +11768,6 @@ class ChatPage(QWidget):
             reply = (reply + "\n\n" + "\n\n".join(schedule_action_replies)).strip()
         if schedule_errors:
             reply = (reply + "\n\n有计划操作未完成：" + "；".join(schedule_errors[:3])).strip()
-        if sent_files:
-            reply = (reply + "\n\n已发送文件：" + "、".join(sent_files)).strip()
         if failed_files:
             reply = (reply + "\n\n有文件未能发送：" + "、".join(failed_files)).strip()
         self.wechat_bridge.finish_request(request_id, {
@@ -14250,7 +14248,7 @@ class ChatPage(QWidget):
                     failed_files.append(target)
                     continue
                 try:
-                    self.wechat_connector._send_file(to_user, path, context_token, f"已发送文件：{os.path.basename(path)}")
+                    self.wechat_connector._send_file(to_user, path, context_token)
                     sent_files.append(os.path.relpath(path, self.project_root))
                 except Exception as file_exc:
                     failed_files.append(f"{target}（{file_exc}）")
