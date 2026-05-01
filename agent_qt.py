@@ -3543,7 +3543,8 @@ def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True, schedu
         file_delivery_note = (
             "如果用户要求查看图片、PDF、表格或文档，先自主使用文件树、搜索、读取文件或必要命令定位/生成目标文件；"
             "只有探索后仍缺少关键条件、或存在多个同样合理候选时，才简短向微信用户追问。"
-            "如果已经确定需要把工作区文件作为微信附件发回用户，请在最终结论末尾单独写一行 AGENT_WECHAT_SEND_FILE: 文件路径或文件名；可写多行，程序会发送并隐藏这些内部行。"
+            "如果已经确定需要把工作区文件作为微信附件发回用户，必须在最终结论末尾单独写一行 AGENT_WECHAT_SEND_FILE: 文件路径或文件名；"
+            "可写多行，程序会发送并隐藏这些内部行。不要只说“会自动回传/发送”，没有这行触发器就不会发送文件。"
         )
     env = runtime_environment()
     return (
@@ -3553,7 +3554,7 @@ def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True, schedu
         "可用触发器：\n"
         "- 要执行本地工作：输出一个完整且短小的 "
         f"```{env['command_block_lang']} 命令块。\n"
-        "- 要把工作区文件发回微信：先自主定位/生成文件，最终结论末尾写 AGENT_WECHAT_SEND_FILE: 文件路径或文件名。\n"
+        "- 要把工作区文件发回微信：先自主定位/生成文件，最终结论末尾必须写 AGENT_WECHAT_SEND_FILE: 文件路径或文件名；否则程序不会发送附件。\n"
         "- 要创建时间计划：最终结论末尾单独写一行 AGENT_WECHAT_CREATE_SCHEDULE: 后接紧凑 JSON；程序会隐藏该行并创建计划。\n"
         "  JSON 结构：{\"title\":\"短标题\",\"prompt\":\"到点后真正要做的事，不要写帮我创建计划\",\"trigger\":{\"run_at\":\"YYYY-MM-DD HH:MM:SS\",\"repeat_every_seconds\":86400,\"until_at\":\"YYYY-MM-DD HH:MM:SS\"}}\n"
         "  `run_at` 是模型根据当前时间和用户表达算出的下一次具体触发时间；一次性计划省略 `repeat_every_seconds` 或设为 0。每日/每周/每隔几小时等循环计划也只输出下一次 `run_at`，并用秒数表达循环间隔，例如每天 86400、每周 604800、每 2 小时 7200。有截止范围时输出 `until_at`，例如“接下来 5 个小时每小时检查”就是下一小时触发、repeat 3600、until_at=当前时间+5小时。\n"
@@ -5112,7 +5113,7 @@ class SidebarResizeHandle(QFrame):
         self.set_grip_visible(False)
 
     def install_toggle_button(self, button: QToolButton):
-        self._layout.insertSpacing(0, 18)
+        self._layout.insertSpacing(0, 8)
         self._layout.insertWidget(1, button, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
 
     def set_grip_visible(self, visible: bool):
