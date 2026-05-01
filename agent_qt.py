@@ -3026,6 +3026,27 @@ def strip_low_value_context_blocks(text: str) -> str:
     return LOW_VALUE_CONTEXT_BLOCK_RE.sub("[低密度工具输出已省略；如需细节请读取具体文件或重新运行命令]", str(text or ""))
 
 
+def mask_low_value_context_markers_for_display(text: str) -> str:
+    lines: List[str] = []
+    current_kind = "low_value"
+    for line in str(text or "").splitlines(keepends=True):
+        body = line[:-1] if line.endswith("\n") else line
+        newline = "\n" if line.endswith("\n") else ""
+        stripped = body.strip()
+        leading = len(body) - len(body.lstrip())
+        trailing = len(body) - len(body.rstrip())
+        if stripped.startswith(LOW_VALUE_CONTEXT_START):
+            match = re.search(r"\bkind=([A-Za-z0-9_-]+)", stripped)
+            current_kind = match.group(1) if match else "low_value"
+            lines.append((" " * leading) + f"<<< {current_kind} >>>" + (" " * trailing) + newline)
+        elif stripped == LOW_VALUE_CONTEXT_END:
+            lines.append((" " * leading) + f"<<< /{current_kind or 'low_value'} >>>" + (" " * trailing) + newline)
+            current_kind = "low_value"
+        else:
+            lines.append(line)
+    return "".join(lines)
+
+
 def diff_hunk_headers(diff_text: str, limit: int = 24) -> List[str]:
     headers = []
     for line in str(diff_text or "").splitlines():
@@ -7424,7 +7445,7 @@ def wechat_history_reply(entries: List[Dict[str, object]], silent: bool = True) 
         if not content:
             continue
         if entry_type in {"result", "terminal_result"}:
-            result_parts.append(text_within_utf8_budget(content, 2500))
+            result_parts.append(text_within_utf8_budget(mask_low_value_context_markers_for_display(content), 2500))
         elif entry_type == "ai":
             conclusion_parts.append(wechat_strip_markdown_code(content, keep_summary=not silent))
     parts: List[str] = []
@@ -8005,14 +8026,18 @@ class WeChatConnector(QObject):
             token=token,
             timeout=20,
         )
-        upload_param = str(upload_info.get("upload_param") or "")
-        if not upload_param:
+        upload_full_url = str(upload_info.get("upload_full_url") or upload_info.get("full_url") or "").strip()
+        upload_param = str(upload_info.get("upload_param") or upload_info.get("encrypted_query_param") or "").strip()
+        if upload_full_url:
+            upload_url = upload_full_url
+        elif upload_param:
+            upload_url = (
+                f"{cdn_base}/upload?"
+                f"encrypted_query_param={urllib.parse.quote(upload_param)}&"
+                f"filekey={urllib.parse.quote(filekey)}"
+            )
+        else:
             raise RuntimeError(f"微信没有返回上传地址：{upload_info}")
-        upload_url = (
-            f"{cdn_base}/upload?"
-            f"encrypted_query_param={urllib.parse.quote(upload_param)}&"
-            f"filekey={urllib.parse.quote(filekey)}"
-        )
         req = urllib.request.Request(
             upload_url,
             data=ciphertext,
@@ -8022,11 +8047,31 @@ class WeChatConnector(QObject):
         with urllib.request.urlopen(req, timeout=60) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"微信 CDN 上传失败：HTTP {resp.status}")
-            download_param = resp.headers.get("x-encrypted-param", "")
+            response_body = resp.read()
+            download_param = (
+                resp.headers.get("x-encrypted-param", "")
+                or resp.headers.get("X-Encrypted-Param", "")
+                or resp.headers.get("x-encrypt-param", "")
+            )
+        if not download_param and response_body:
+            body_text = response_body.decode("utf-8", errors="replace").strip()
+            try:
+                body_json = json.loads(body_text)
+                if isinstance(body_json, dict):
+                    download_param = str(
+                        body_json.get("encrypt_query_param")
+                        or body_json.get("encrypted_query_param")
+                        or body_json.get("download_param")
+                        or body_json.get("download_url")
+                        or ""
+                    ).strip()
+            except Exception:
+                download_param = body_text
         if not download_param:
             raise RuntimeError("微信 CDN 上传响应缺少 x-encrypted-param。")
         return {
             "download_param": download_param,
+            "aes_key": aes_key.hex(),
             "aes_key_b64": base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii"),
             "plain_size": len(data),
             "cipher_size": len(ciphertext),
@@ -8192,7 +8237,7 @@ class WeChatConnector(QObject):
             "encrypt_type": 1,
         }
         if item_type == 2:
-            item = {"type": item_type, "image_item": {"media": media, "mid_size": int(uploaded["cipher_size"])}}
+            item = {"type": item_type, "image_item": {"media": media, "aeskey": uploaded["aes_key_b64"], "mid_size": int(uploaded["cipher_size"])}}
         elif item_type == 5:
             item = {"type": item_type, "video_item": {"media": media, "video_size": int(uploaded["cipher_size"])}}
         else:
@@ -9337,7 +9382,7 @@ class ChatBubble(QFrame):
 class ExecutionLogPanel(QFrame):
     def __init__(self, content: str = "", parent=None, max_content_height: int = 210, title: str = ""):
         super().__init__(parent)
-        self.content = content
+        self.content = mask_low_value_context_markers_for_display(content)
         self.max_content_height = max_content_height
         self.setObjectName("executionLogPanel")
         self.setStyleSheet("QFrame#executionLogPanel { background: transparent; border: none; margin: 0; }")
@@ -9363,7 +9408,7 @@ class ExecutionLogPanel(QFrame):
 
         self.editor = QPlainTextEdit()
         self.editor.setReadOnly(True)
-        self.editor.setPlainText(content)
+        self.editor.setPlainText(self.content)
         self.editor.setMaximumBlockCount(20000)
         self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -9420,8 +9465,8 @@ class ExecutionLogPanel(QFrame):
         self.adjust_content_height()
 
     def update_content(self, text: str):
-        self.content = text
-        self.editor.setPlainText(text)
+        self.content = mask_low_value_context_markers_for_display(text)
+        self.editor.setPlainText(self.content)
         self.adjust_content_height()
 
     def refresh_visual_settings(self):
