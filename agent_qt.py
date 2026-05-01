@@ -3416,11 +3416,26 @@ def quiet_automation_error_message(error: str) -> str:
     return ""
 
 
-def build_automation_feedback_prompt(project_root: str, goal: str, execution_log: str, round_number: int, max_rounds: int) -> str:
+def build_automation_feedback_prompt(
+    project_root: str,
+    goal: str,
+    execution_log: str,
+    round_number: int,
+    max_rounds: int,
+    *,
+    wechat_file_delivery: bool = False,
+) -> str:
     goal_text = goal.strip() or "用户没有填写一句话需求，请根据前文、执行日志和当前项目状态继续判断。"
     clipped_log = truncate_middle(execution_log.strip(), AUTOMATION_FEEDBACK_CHAR_LIMIT)
     env = runtime_environment()
     command_block_lang = env["command_block_lang"]
+    wechat_completion_note = ""
+    if wechat_file_delivery:
+        wechat_completion_note = (
+            "\n- 本轮来自微信且具备附件发送上下文。若用户目标是把文件发回微信，完成时不要只说“会自动发送”；"
+            f"第一行写 `{AUTOMATION_DONE_MARKER}` 加简短总结，随后单独写一行 `AGENT_WECHAT_SEND_FILE: 文件路径或文件名`。"
+            "没有 `AGENT_WECHAT_SEND_FILE` 行，程序不会发送附件。"
+        )
     return f"""你正在 Agent Qt 的自动化循环中，这是第 {round_number}/{max_rounds} 轮。
 
 原始用户需求：
@@ -3439,6 +3454,7 @@ def build_automation_feedback_prompt(project_root: str, goal: str, execution_log
 - 未完成：输出一个完整且短小的 ```{command_block_lang} 命令块；写入超过 10 行的文件内容时，必须用带编号替换符引用同一回复里的同语言 fenced 文件内容。
 - 后台安装/构建/拉取不要当作完成；启动常驻命令时不要加 `&`/`nohup`，等执行结果给出 `Terminal processes:` 摘要后，再使用 `curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'` 查询控制台输出。
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
+{wechat_completion_note}
 """
 
 WECHAT_COMMAND_MENU_TEXT = """你可以这样说：
@@ -15955,6 +15971,11 @@ class ChatPage(QWidget):
             log_with_changes,
             self.automation_loop_round,
             self.automation_loop_max_rounds,
+            wechat_file_delivery=bool(
+                self.wechat_active_request_id
+                and self.wechat_active_to_user
+                and self.wechat_active_context_token
+            ),
         )
         self.start_automation_worker(
             prompt,
