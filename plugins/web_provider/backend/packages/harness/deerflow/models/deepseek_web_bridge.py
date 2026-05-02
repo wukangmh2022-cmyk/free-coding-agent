@@ -125,6 +125,16 @@ DEFAULT_CONTINUE_GENERATION_SELECTORS = (
     '[aria-label*="Continue generating" i]',
     '[aria-label*="Continue" i]',
 )
+DEFAULT_STOP_GENERATION_SELECTORS = (
+    'button:has-text("停止生成")',
+    '[role="button"]:has-text("停止生成")',
+    '[aria-label*="停止生成"]',
+    '[title*="停止生成"]',
+    'button:has-text("Stop generating")',
+    '[role="button"]:has-text("Stop generating")',
+    '[aria-label*="Stop generating" i]',
+    '[title*="Stop generating" i]',
+)
 THINKING_TOGGLE_TOKENS: tuple[tuple[str, int], ...] = (
     ("深度思考", 240),
     ("deepthink", 220),
@@ -190,7 +200,7 @@ PROMPT_REPLAY_HINTS = (
     "available tools (openai tools schema)",
     "no tools are available for this request",
     "plain bash agent 模式",
-    "runner 会执行你返回的单个 fenced bash 代码块",
+    "runner 会执行你返回的 fenced bash 终端命令块",
     "conversation:\n\n[user]",
     "new conversation events since the previous request",
 )
@@ -276,8 +286,8 @@ STRICT_JSON_FORMAT_PROMPT = (
 
 PLAIN_BASH_FORMAT_PROMPT = (
     "【非常重要：这是 plain bash agent 模式，不要使用 JSON 工具协议】\n"
-    "你正在配合一个外部 runner。runner 会执行你返回的单个 fenced bash 代码块，并把输出发回给你。\n"
-    "需要操作文件、运行测试、读取目录时，只返回一个 ```bash 代码块。不要返回 JSON、结构化工具调用字段、XML 或解释性前后缀。\n"
+    "你正在配合一个外部 runner。runner 会执行你返回的 fenced bash 终端命令块，并把输出发回给你。\n"
+    "需要操作文件、运行测试、读取目录时，回复里必须包含一个 ```bash 终端命令块；命令块外可以保留必要说明，写文件占位符时可以继续提供后续文件内容 fenced 代码块。不要返回 JSON、结构化工具调用字段或 XML。\n"
     "如果你预估本轮最终回复会超过约 4 万字符，不要一次性输出全部内容；先交付可执行的当前批次，剩余内容在末尾用 ```plaintext 的 TODO 简短列出，等待下一轮继续。\n"
     "任务完成时，先用 bash 验证产物和测试，再输出 FINAL: 加简短总结。\n"
 )
@@ -791,6 +801,15 @@ UI_ARTIFACT_LINES = {
     "复制",
     "下载",
     "运行",
+    "修改",
+    "深度思考",
+    "智能搜索",
+    "停止生成",
+    "stop generating",
+    "本回答由 AI 生成，内容仅供参考，请仔细甄别。",
+    "本回答由AI生成，内容仅供参考，请仔细甄别。",
+    "内容由 AI 生成，请仔细甄别",
+    "内容由AI生成，请仔细甄别",
 }
 
 MARKDOWN_LANGUAGE_LINES = {
@@ -835,6 +854,27 @@ def strip_deepseek_empty_text_tail(text: str) -> str:
     return result
 
 
+def strip_deepseek_disclaimer_tail(text: str) -> str:
+    """Drop DeepSeek Web's safety disclaimer when it is copied with the answer."""
+    result = (text or "").strip()
+    if not result:
+        return ""
+    patterns = (
+        r"(?m)(?:\n|^)\s*本回答由\s*AI\s*生成[，,]\s*内容仅供参考[，,]\s*请仔细甄别[。.]?\s*$",
+        r"(?m)(?:\n|^)\s*内容由\s*AI\s*生成[，,]\s*仅供参考[，,]\s*请仔细甄别[。.]?\s*$",
+        r"(?m)(?:\n|^)\s*内容由\s*AI\s*生成[，,]\s*请仔细甄别[。.]?\s*$",
+    )
+    changed = True
+    while changed and result:
+        changed = False
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "\n", result).strip()
+            if cleaned != result:
+                result = cleaned
+                changed = True
+    return result
+
+
 def clean_plain_visible_assistant_text(text: str) -> str:
     """Remove DeepSeek Web button labels from rendered plain-text fallback."""
     if not text:
@@ -866,6 +906,7 @@ def clean_plain_visible_assistant_text(text: str) -> str:
 
     result = "\n".join(cleaned)
     result = re.sub(r"\n{4,}", "\n\n\n", result).strip()
+    result = strip_deepseek_disclaimer_tail(result)
     return strip_deepseek_empty_text_tail(result)
 
 
@@ -1204,10 +1245,58 @@ def is_suspicious_short_fragment(text: str) -> bool:
     return True
 
 
+def has_unclosed_shell_quote(text: str) -> bool:
+    single_open = False
+    double_open = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and not single_open:
+            escaped = True
+            continue
+        if ch == "'" and not double_open:
+            single_open = not single_open
+            continue
+        if ch == '"' and not single_open:
+            double_open = not double_open
+    return single_open or double_open
+
+
+def has_unclosed_shell_compound(text: str) -> bool:
+    tokens = re.findall(r"(?m)(?:^|[;&|]\s*)\b(if|for|while|until|case)\b|\b(fi|done|esac)\b", text)
+    stack: list[str] = []
+    closes = {"fi": "if", "done": {"for", "while", "until"}, "esac": "case"}
+    for opener, closer in tokens:
+        if opener:
+            stack.append(opener)
+            continue
+        if closer == "done":
+            for index in range(len(stack) - 1, -1, -1):
+                if stack[index] in closes[closer]:
+                    del stack[index]
+                    break
+            continue
+        expected = closes.get(closer)
+        if isinstance(expected, str) and expected in stack:
+            stack.remove(expected)
+    return bool(stack)
+
+
 def is_suspicious_incomplete_command_text(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
+    fenced_blocks = re.findall(r"(?ms)^```([A-Za-z0-9_+-]*)\s*\n(.*?)\n```", stripped)
+    shell_candidates = [
+        block.strip()
+        for lang, block in fenced_blocks
+        if lang.lower().strip() in {"bash", "sh", "shell", "zsh"}
+    ] or [stripped]
+    for shell_text in shell_candidates:
+        if has_unclosed_shell_quote(shell_text) or has_unclosed_shell_compound(shell_text):
+            return True
     heredoc_markers = re.findall(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_-]*)['\"]?", stripped)
     if heredoc_markers:
         lines = [line.strip() for line in stripped.splitlines()]
@@ -1236,12 +1325,26 @@ def is_transient_thinking_text(text: str) -> bool:
     head = stripped[:160].lower()
     if head.startswith(("thinking…", "thinking...", "thinking", "思考中", "正在思考")):
         return True
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if lines and all(line.lower() in UI_ARTIFACT_LINES for line in lines):
+        return True
     try:
         extract_json_object(stripped)
         return False
     except Exception:
         pass
     return False
+
+
+def plain_text_ready_for_copy(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if is_transient_thinking_text(stripped) or is_suspicious_short_fragment(stripped):
+        return False
+    if is_suspicious_incomplete_command_text(stripped) or is_likely_truncated_plain_text(stripped):
+        return False
+    return True
 
 
 def _append_transport_payload_candidates(candidates: list[str], value: Any) -> None:
@@ -1802,7 +1905,7 @@ class DeepSeekWebBridge:
         headless: bool = False,
         page_load_timeout_ms: int = 30_000,
         response_timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
-        stable_poll_interval_ms: int = 1200,
+        stable_poll_interval_ms: int = 200,
         stable_rounds: int = 3,
         input_selectors: tuple[str, ...] = DEFAULT_INPUT_SELECTORS,
         send_selectors: tuple[str, ...] = DEFAULT_SEND_SELECTORS,
@@ -1882,6 +1985,8 @@ class DeepSeekWebBridge:
             "updated_at": 0.0,
         }
         self._lock = threading.RLock()
+        self._profile_lock_handle = None
+        self._profile_lock_path: Path | None = None
 
     def close(self) -> None:
         with self._lock:
@@ -1901,10 +2006,66 @@ class DeepSeekWebBridge:
                 self._actual_headless = None
                 self._browser_type = None
                 self._playwright = None
+                self._release_profile_lock()
                 self._clear_session_runtime_state()
                 self._active_session_state_path = None
                 self._active_sticky_marker = None
                 self._prepared_new_chat = False
+
+    def _acquire_profile_lock(self, profile_dir: str, *, timeout_s: float = 20.0) -> None:
+        if self._profile_lock_handle is not None:
+            return
+        lock_path = Path(profile_dir).parent / (Path(profile_dir).name + ".agent_qt.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+", encoding="utf-8")
+        deadline = time.monotonic() + max(0.5, float(timeout_s))
+        if os.name == "posix":
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        handle.close()
+                        raise RuntimeError(
+                            "DeepSeek 浏览器配置目录正在被另一个 provider 使用，请稍后重试或关闭旧的 Agent Qt。"
+                        )
+                    time.sleep(0.25)
+        else:
+            # Windows already relies on Chromium's own profile lock. Keep the
+            # handle open so this path stays symmetric with POSIX.
+            pass
+        self._profile_lock_handle = handle
+        self._profile_lock_path = lock_path
+
+    def _release_profile_lock(self) -> None:
+        handle = self._profile_lock_handle
+        self._profile_lock_handle = None
+        self._profile_lock_path = None
+        if handle is None:
+            return
+        try:
+            if os.name == "posix":
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            logger.debug("Failed to unlock DeepSeek profile lock.", exc_info=True)
+        try:
+            handle.close()
+        except Exception:
+            logger.debug("Failed to close DeepSeek profile lock handle.", exc_info=True)
+
+    @staticmethod
+    def _is_chromium_profile_singleton_error(exc: BaseException) -> bool:
+        text = str(exc)
+        return (
+            "ProcessSingleton" in text
+            or "SingletonLock" in text
+            or "profile directory" in text and "already in use" in text
+        )
 
     def _clear_session_runtime_state(self) -> None:
         self._sticky_initialized = False
@@ -2101,10 +2262,12 @@ class DeepSeekWebBridge:
                     self._browser_type = None
                     self._actual_headless = None
                     self._page = None
+                    self._release_profile_lock()
 
             profile_dir = str(Path(self.user_data_dir).expanduser().resolve())
             Path(profile_dir).mkdir(parents=True, exist_ok=True)
 
+            self._acquire_profile_lock(profile_dir)
             playwright = sync_playwright().start()
             self._playwright = playwright
             self._browser_type = playwright.chromium
@@ -2130,7 +2293,7 @@ class DeepSeekWebBridge:
                     logger.debug("Failed to grant DeepSeek clipboard permissions.", exc_info=True)
                 self._actual_headless = requested_headless
                 return self._context
-            except Exception:
+            except Exception as exc:
                 try:
                     playwright.stop()
                 except Exception:
@@ -2142,6 +2305,12 @@ class DeepSeekWebBridge:
                     self._page = None
                     self._actual_headless = None
                     self._prepared_new_chat = False
+                    self._release_profile_lock()
+                if self._is_chromium_profile_singleton_error(exc):
+                    raise RuntimeError(
+                        "DeepSeek 浏览器 profile 正在被另一个 Chromium/provider 占用。"
+                        "请关闭旧的 Agent Qt 或等待旧 provider 退出后重试。"
+                    ) from exc
                 raise
 
     def ensure_page(self, *, visible: bool = False) -> Page:
@@ -2222,6 +2391,14 @@ class DeepSeekWebBridge:
             return False
         if stripped in prompt:
             return True
+        if len(stripped) >= 400 and len(prompt) >= 400:
+            compact_stripped = re.sub(r"\s+", "", stripped)
+            compact_prompt = re.sub(r"\s+", "", prompt)
+            if compact_stripped and compact_stripped in compact_prompt:
+                return True
+            sample = compact_stripped[:600]
+            if len(sample) >= 200 and sample in compact_prompt:
+                return True
         try:
             encoded = json.dumps(stripped, ensure_ascii=False)
         except Exception:
@@ -3697,7 +3874,11 @@ class DeepSeekWebBridge:
                     else:
                         copy_probe_started = time.perf_counter()
                         copy_probe_budget_ms = self.copy_probe_max_ms
-                        if output_protocol == "plain" and is_likely_truncated_plain_text(response_text):
+                        if output_protocol == "plain":
+                            # Final plain-bash execution should come from DeepSeek's
+                            # own copy action whenever possible. DOM text is useful
+                            # for streaming/progress, but the copy button represents
+                            # the page's finalized answer.
                             copy_probe_budget_ms = max(copy_probe_budget_ms * 3, 4500)
                         if trace is not None:
                             trace.mark("copy_probe_started")
@@ -4011,7 +4192,7 @@ class DeepSeekWebBridge:
 
             text = choose_best_assistant_text(texts)
             text = clean_plain_visible_assistant_text(text)
-            if text and not self._is_active_request_echo_text(text):
+            if text and not is_prompt_replay_text(text) and not self._is_active_request_echo_text(text):
                 candidates.append({"index": index, "text": text})
 
         return candidates
@@ -4312,6 +4493,111 @@ class DeepSeekWebBridge:
             return []
         return result if isinstance(result, list) else []
 
+    def inspect_bottom_message_copy_candidates(self, page: Page, *, limit: int = 18) -> list[dict[str, Any]]:
+        """Find bottom action-bar copy buttons for assistant messages.
+
+        DeepSeek renders a message-level copy button below the assistant answer.
+        Code blocks have their own "复制/下载" controls, and user bubbles have a
+        nearby "修改" control. For final plain-bash capture, prefer the bottom
+        message-level copy button and let hover text confirm the exact action.
+        """
+        try:
+            result = page.evaluate(
+                """(limit) => {
+                    for (const node of document.querySelectorAll('[data-deerflow-bottom-copy-id],[data-deerflow-bottom-action-id]')) {
+                        node.removeAttribute('data-deerflow-bottom-copy-id');
+                        node.removeAttribute('data-deerflow-bottom-action-id');
+                    }
+                    const buttonSelector = 'button,[role="button"],div[role="button"]';
+                    const isVisible = (node) => {
+                        if (!(node instanceof HTMLElement)) return false;
+                        const style = window.getComputedStyle(node);
+                        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
+                        const rect = node.getBoundingClientRect();
+                        return !!rect.width && !!rect.height;
+                    };
+                    const textOf = (node) => String((node && (node.innerText || node.textContent)) || '').trim();
+                    const labelFor = (node) => [
+                        node.getAttribute('aria-label') || '',
+                        node.getAttribute('title') || '',
+                        textOf(node),
+                    ].join(' ').trim();
+                    const groups = [];
+                    const seenParents = new Set();
+                    const badText = /(下载|download|修改|edit|深度思考|智能搜索|停止生成|stop generating|请输入|发送消息)/i;
+                    for (const parent of document.querySelectorAll('div,section,footer')) {
+                        if (!(parent instanceof HTMLElement) || !isVisible(parent) || seenParents.has(parent)) continue;
+                        const buttonNodes = Array.from(parent.children)
+                            .filter((child) => child instanceof HTMLElement && child.matches(buttonSelector) && isVisible(child));
+                        if (buttonNodes.length !== 5) continue;
+                        seenParents.add(parent);
+                        const orderedButtons = buttonNodes
+                            .map((button) => {
+                                const rect = button.getBoundingClientRect();
+                                return { button, rect, label: labelFor(button) };
+	                            })
+	                            .sort((a, b) => a.rect.left - b.rect.left);
+	                        if (orderedButtons.length !== 5) continue;
+	                        const groupText = orderedButtons.map((item) => item.label).join('\\n');
+	                        const parentText = textOf(parent);
+	                        if (badText.test(groupText) || badText.test(parentText)) continue;
+	                        const firstRect = orderedButtons[0].rect;
+	                        const lastRect = orderedButtons[orderedButtons.length - 1].rect;
+	                        if (Math.abs(firstRect.top - lastRect.top) > 10) continue;
+	                        if (lastRect.left - firstRect.left < 120) continue;
+	                        const parentRect = parent.getBoundingClientRect();
+	                        groups.push({
+	                            parent,
+	                            firstButton: orderedButtons[0].button,
+	                            buttonCount: orderedButtons.length,
+	                            groupText,
+	                            parentText,
+	                            top: firstRect.top,
+	                            left: firstRect.left,
+	                            parentClass: String(parent.className || ''),
+	                            parentRect,
+	                        });
+	                    }
+                    groups.sort((a, b) => {
+                        if (Math.abs(a.top - b.top) > 4) return b.top - a.top;
+                        return a.left - b.left;
+                    });
+                    const out = [];
+	                    let probeId = 0;
+	                    for (const item of groups) {
+	                        const probe = String(probeId);
+	                        item.parent.dataset.deerflowBottomActionId = probe;
+	                        item.firstButton.dataset.deerflowBottomCopyId = probe;
+	                        const rect = item.firstButton.getBoundingClientRect();
+	                        out.push({
+	                            probeId: probe,
+	                            label: labelFor(item.firstButton),
+	                            siblingText: item.groupText.slice(0, 220),
+	                            parentText: item.parentText.slice(0, 220),
+	                            parentClass: item.parentClass.slice(0, 160),
+	                            top: Math.round(rect.top),
+	                            left: Math.round(rect.left),
+	                            width: Math.round(rect.width),
+	                            height: Math.round(rect.height),
+	                            parentTop: Math.round(item.parentRect.top),
+	                            parentLeft: Math.round(item.parentRect.left),
+	                            parentWidth: Math.round(item.parentRect.width),
+	                            parentHeight: Math.round(item.parentRect.height),
+	                            actionBarButtonCount: item.buttonCount,
+	                            source: 'assistant_message_action_bar',
+	                        });
+                        probeId += 1;
+                        if (out.length >= limit) break;
+                    }
+                    return out;
+                }""",
+                limit,
+            )
+        except Exception:
+            logger.debug("Failed to inspect DeepSeek bottom message copy candidates.", exc_info=True)
+            return []
+        return result if isinstance(result, list) else []
+
     def read_hover_texts_near_candidate(self, page: Page, probe_id: str) -> list[str]:
         try:
             locator = page.locator(f'[data-deerflow-probe-id="{probe_id}"]').first
@@ -4361,6 +4647,116 @@ class DeepSeekWebBridge:
             return []
         return [item.strip() for item in result if isinstance(item, str) and item.strip()] if isinstance(result, list) else []
 
+    def read_hover_texts_near_bottom_candidate(self, page: Page, probe_id: str) -> list[str]:
+        try:
+            locator = page.locator(f'[data-deerflow-bottom-copy-id="{probe_id}"]').first
+            locator.hover(timeout=1500)
+            page.wait_for_timeout(max(40, COPY_TOOLTIP_WAIT_MS))
+            result = page.evaluate(
+                """(probeId) => {
+                    const button = document.querySelector(`[data-deerflow-bottom-copy-id="${probeId}"]`);
+                    if (!(button instanceof HTMLElement)) return [];
+                    const rect = button.getBoundingClientRect();
+                    const centerX = rect.left + rect.width / 2;
+                    const centerY = rect.top + rect.height / 2;
+                    const out = [];
+                    for (const node of document.body.querySelectorAll('*')) {
+                        if (!(node instanceof HTMLElement) || node === button || node.contains(button)) continue;
+                        const style = window.getComputedStyle(node);
+                        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue;
+                        const text = (node.innerText || node.textContent || '').trim();
+                        if (!text || text.length > 80) continue;
+                        const nodeRect = node.getBoundingClientRect();
+                        if (!nodeRect.width || !nodeRect.height) continue;
+                        const nodeCenterX = nodeRect.left + nodeRect.width / 2;
+                        const nodeCenterY = nodeRect.top + nodeRect.height / 2;
+                        const distance = Math.abs(nodeCenterX - centerX) + Math.abs(nodeCenterY - centerY);
+                        if (distance > 220) continue;
+                        out.push({ text, distance });
+                    }
+                    out.sort((a, b) => a.distance - b.distance);
+                    return out.map((item) => item.text).slice(0, 8);
+                }""",
+                probe_id,
+            )
+        except Exception:
+            logger.debug("Failed to read DeepSeek hover texts for bottom copy candidate.", exc_info=True)
+            return []
+        return [item.strip() for item in result if isinstance(item, str) and item.strip()] if isinstance(result, list) else []
+
+    def read_bottom_action_row_tooltips(self, page: Page, probe_id: str) -> list[str]:
+        """Read DeepSeek assistant action-row tooltips in visual order.
+
+        The finished assistant message action row exposes empty button labels in
+        the DOM. Its semantics are only rendered as hover tooltips, currently in
+        this order: 复制 / 重新生成 / 喜欢 / 不喜欢 / 分享.
+        """
+        tips: list[str] = []
+        selector = f'[data-deerflow-bottom-action-id="{probe_id}"]'
+        try:
+            count = page.locator(
+                f'{selector} > button, {selector} > [role="button"], {selector} > div[role="button"]'
+            ).count()
+        except Exception:
+            return tips
+        for index in range(min(count, 5)):
+            try:
+                locator = page.locator(
+                    f'{selector} > button, {selector} > [role="button"], {selector} > div[role="button"]'
+                ).nth(index)
+                locator.hover(timeout=1500)
+                page.wait_for_timeout(max(40, COPY_TOOLTIP_WAIT_MS))
+                result = page.evaluate(
+                    """({ probeId, index }) => {
+                        const parent = document.querySelector(`[data-deerflow-bottom-action-id="${probeId}"]`);
+                        if (!(parent instanceof HTMLElement)) return "";
+                        const buttonSelector = 'button,[role="button"],div[role="button"]';
+                        const buttons = Array.from(parent.children)
+                            .filter((child) => child instanceof HTMLElement && child.matches(buttonSelector));
+                        const button = buttons[index];
+                        if (!(button instanceof HTMLElement)) return "";
+                        const rect = button.getBoundingClientRect();
+                        const centerX = rect.left + rect.width / 2;
+                        const centerY = rect.top + rect.height / 2;
+                        const out = [];
+                        for (const node of document.body.querySelectorAll('*')) {
+                            if (!(node instanceof HTMLElement) || node === button || button.contains(node) || parent.contains(node)) continue;
+                            const style = window.getComputedStyle(node);
+                            if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue;
+                            const text = String((node.innerText || node.textContent) || '').trim();
+                            if (!text || text.length > 80) continue;
+                            const nodeRect = node.getBoundingClientRect();
+                            if (!nodeRect.width || !nodeRect.height) continue;
+                            const nodeCenterX = nodeRect.left + nodeRect.width / 2;
+                            const nodeCenterY = nodeRect.top + nodeRect.height / 2;
+                            const distance = Math.abs(nodeCenterX - centerX) + Math.abs(nodeCenterY - centerY);
+                            if (distance > 90) continue;
+                            out.push({ text, distance });
+                        }
+                        out.sort((a, b) => a.distance - b.distance);
+                        return out.length ? out[0].text : "";
+                    }""",
+                    {"probeId": probe_id, "index": index},
+                )
+                tips.append(str(result or "").strip())
+            except Exception:
+                logger.debug("Failed to read DeepSeek action-row tooltip index=%d.", index, exc_info=True)
+                tips.append("")
+        return tips
+
+    @staticmethod
+    def is_deepseek_assistant_action_tooltip_sequence(tooltips: list[str]) -> bool:
+        normalized = [str(item or "").strip().lower() for item in tooltips[:5]]
+        if len(normalized) < 5:
+            return False
+        return (
+            ("复制" in normalized[0] or "copy" in normalized[0])
+            and ("重新生成" in normalized[1] or "重新回答" in normalized[1] or "regenerate" in normalized[1] or "retry" in normalized[1])
+            and (("喜欢" in normalized[2] or "like" in normalized[2]) and "不喜欢" not in normalized[2] and "dislike" not in normalized[2])
+            and ("不喜欢" in normalized[3] or "dislike" in normalized[3])
+            and ("分享" in normalized[4] or "share" in normalized[4])
+        )
+
     def try_copy_last_assistant_text(
         self,
         page: Page,
@@ -4383,6 +4779,16 @@ class DeepSeekWebBridge:
                 return
             page.wait_for_timeout(min(default_ms, remaining_ms))
 
+        def read_copied_text_fast(max_wait_ms: int = 200) -> str:
+            deadline_local = time.perf_counter() + (max(0, max_wait_ms) / 1000.0)
+            while True:
+                copied_text = self.read_latest_copy_capture(page) or self.read_system_clipboard_text(page)
+                if copied_text:
+                    return copied_text
+                if time.perf_counter() >= deadline_local or timed_out():
+                    return ""
+                wait_with_budget(40)
+
         try:
             page.evaluate(COPY_CAPTURE_INIT_SCRIPT)
         except Exception:
@@ -4393,6 +4799,64 @@ class DeepSeekWebBridge:
         self.reset_copy_capture(page)
         attempts: list[dict[str, Any]] = []
         hover_payload_candidates: list[dict[str, Any]] = []
+        if plain_protocol:
+            for candidate in self.inspect_bottom_message_copy_candidates(page, limit=18):
+                if timed_out():
+                    break
+                probe_id = candidate.get("probeId")
+                if not isinstance(probe_id, str):
+                    continue
+                hover_texts = self.read_bottom_action_row_tooltips(page, probe_id)
+                label = str(candidate.get("label") or "").strip()
+                sibling_text = str(candidate.get("siblingText") or "").strip()
+                attempts.append(
+                    {
+                        "assistantKind": "bottom_message",
+                        "probeId": probe_id,
+                        "label": label,
+                        "top": candidate.get("top"),
+                        "left": candidate.get("left"),
+                        "source": candidate.get("source"),
+                        "hoverTexts": hover_texts,
+                        "siblingText": sibling_text[:120],
+                    }
+                )
+                if not self.is_deepseek_assistant_action_tooltip_sequence(hover_texts):
+                    logger.warning(
+                        "DeepSeek bottom action row rejected probe_id=%s hover_texts=%s",
+                        probe_id,
+                        hover_texts,
+                    )
+                    continue
+                try:
+                    copy_started = time.perf_counter()
+                    button = page.locator(f'[data-deerflow-bottom-copy-id="{probe_id}"]').first
+                    button.click(timeout=1500)
+                except Exception:
+                    logger.debug("Failed to click DeepSeek bottom message copy candidate.", exc_info=True)
+                    continue
+                copied = read_copied_text_fast()
+                copied = clean_plain_visible_assistant_text((copied or "").strip())
+                if not copied:
+                    continue
+                if is_prompt_replay_text(copied):
+                    logger.warning(
+                        "DeepSeek bottom copy capture rejected prompt replay probe_id=%s copied_chars=%d",
+                        probe_id,
+                        len(copied),
+                    )
+                    continue
+                if not self._matches_current_request_response_candidate(copied):
+                    continue
+                logger.warning(
+                    "DeepSeek bottom copy capture succeeded probe_id=%s copied_chars=%d copy_read_ms=%d hover_texts=%s",
+                    probe_id,
+                    len(copied),
+                    int((time.perf_counter() - copy_started) * 1000),
+                    hover_texts,
+                )
+                return copied
+
         locator = self.assistant_locator(page)
         assistant_candidates: list[dict[str, Any]] = []
         locator_seen = False
@@ -4404,7 +4868,11 @@ class DeepSeekWebBridge:
             assistant_text = assistant_candidate.get("text", "")
             if isinstance(assistant_text, str) and assistant_text.strip():
                 locator_seen = True
-            if isinstance(assistant_text, str) and is_transient_thinking_text(assistant_text):
+            if isinstance(assistant_text, str) and (
+                is_prompt_replay_text(assistant_text)
+                or self._is_active_request_echo_text(assistant_text)
+                or is_transient_thinking_text(assistant_text)
+            ):
                 continue
             assistant_candidates.append(
                 {
@@ -4547,11 +5015,10 @@ class DeepSeekWebBridge:
                 try:
                     button = page.locator(f'[data-deerflow-probe-id="{probe_id}"]').first
                     button.click(timeout=1500)
-                    wait_with_budget(600)
                 except Exception:
                     logger.debug("Failed to click DeepSeek copy candidate.", exc_info=True)
                     continue
-                copied = self.read_latest_copy_capture(page) or self.read_system_clipboard_text(page)
+                copied = read_copied_text_fast()
                 if copied:
                     if plain_protocol:
                         copied = copied.strip()
@@ -4573,7 +5040,23 @@ class DeepSeekWebBridge:
                             copied = copied_payload["text"]
                         elif not looks_like_assistant_payload_candidate(copied) or is_schema_example_payload_text(copied):
                             continue
+                    if is_prompt_replay_text(copied):
+                        logger.warning(
+                            "DeepSeek copy capture rejected prompt replay assistant_kind=%s assistant_index=%s probe_id=%s copied_chars=%d",
+                            assistant_candidate.get("kind"),
+                            assistant_candidate.get("index"),
+                            probe_id,
+                            len(copied),
+                        )
+                        continue
                     if self._is_active_request_echo_text(copied):
+                        logger.warning(
+                            "DeepSeek copy capture rejected active prompt echo assistant_kind=%s assistant_index=%s probe_id=%s copied_chars=%d",
+                            assistant_candidate.get("kind"),
+                            assistant_candidate.get("index"),
+                            probe_id,
+                            len(copied),
+                        )
                         continue
                     if not self._matches_current_request_response_candidate(copied):
                         continue
@@ -5419,6 +5902,81 @@ class DeepSeekWebBridge:
                 continue
         return False
 
+    def has_stop_generation_button(self, page: Page) -> bool:
+        for selector in DEFAULT_STOP_GENERATION_SELECTORS:
+            locator = page.locator(selector).last
+            try:
+                if locator.count() == 0:
+                    continue
+                if locator.is_visible(timeout=120) and locator.is_enabled(timeout=120):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _controls_have_copy_action(controls: list[dict[str, Any]]) -> bool:
+        for item in controls:
+            if not isinstance(item, dict):
+                continue
+            text = " ".join(
+                str(item.get(key) or "")
+                for key in ("text", "aria", "title")
+            ).strip().lower()
+            if "复制" in text or "copy" in text:
+                return True
+        return False
+
+    def has_assistant_message_action_copy(self, page: Page) -> bool:
+        return bool(self.inspect_bottom_message_copy_candidates(page, limit=1))
+
+    def plain_generation_status(self, page: Page) -> dict[str, Any]:
+        has_stop = self.has_stop_generation_button(page)
+        has_continue = self.has_continue_generation_button(page)
+        controls: list[dict[str, Any]] = []
+        try:
+            raw_controls = page.evaluate(
+                """() => {
+                    const isVisible = (node) => {
+                        if (!(node instanceof HTMLElement)) return false;
+                        const style = window.getComputedStyle(node);
+                        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
+                        const rect = node.getBoundingClientRect();
+                        return !!rect.width && !!rect.height;
+                    };
+                    return Array.from(document.querySelectorAll('button,[role="button"]'))
+                        .filter((node) => node instanceof HTMLElement && isVisible(node))
+                        .slice(-12)
+                        .map((node) => ({
+                            text: String(node.innerText || node.textContent || '').trim().slice(0, 80),
+                            aria: String(node.getAttribute('aria-label') || '').slice(0, 80),
+                            title: String(node.getAttribute('title') || '').slice(0, 80),
+                            disabled: Boolean(node.disabled) || node.getAttribute('aria-disabled') === 'true',
+                        }));
+                }"""
+            )
+            if isinstance(raw_controls, list):
+                controls = [item for item in raw_controls if isinstance(item, dict)]
+        except Exception:
+            controls = []
+        return {
+            "has_stop": has_stop,
+            "has_continue": has_continue,
+            "has_copy": self.has_assistant_message_action_copy(page),
+            "controls": controls,
+        }
+
+    def is_plain_generation_complete(self, page: Page) -> bool:
+        # In plain-bash mode the clipboard copy is authoritative, but only after
+        # DeepSeek has finished rendering. Copying while "stop generating" is
+        # visible commonly returns prompt replay or UI chrome instead of output.
+        status = self.plain_generation_status(page)
+        return (
+            bool(status.get("has_copy"))
+            and not bool(status.get("has_stop"))
+            and not bool(status.get("has_continue"))
+        )
+
     def click_continue_generation_if_present(self, page: Page, *, trace: DeepSeekTrace | None = None) -> bool:
         """Click DeepSeek's continuation button when a long answer is truncated.
 
@@ -5547,6 +6105,8 @@ class DeepSeekWebBridge:
         short_fragment_extra_wait_rounds = 0
         incomplete_command_extra_wait_rounds = 0
         best_seen_text = ""
+        best_seen_empty_rounds = 0
+        best_seen_empty_copy_retry_done = False
         continue_clicks = 0
         stable_copy_text = ""
         stable_copy_seen = 0
@@ -5699,6 +6259,46 @@ class DeepSeekWebBridge:
                 and not is_suppressed_assistant_payload_text(current)
             ):
                 best_seen_text = current
+            if (
+                best_seen_text
+                and len(best_seen_text.strip()) >= 40
+                and not current
+                and not transport_text
+            ):
+                best_seen_empty_rounds += 1
+            else:
+                best_seen_empty_rounds = 0
+            if best_seen_empty_rounds >= max(self.stable_rounds * 8, 16):
+                copied = ""
+                if not best_seen_empty_copy_retry_done and self.can_submit_next_turn(page):
+                    copied = self.try_copy_last_assistant_text(
+                        page,
+                        max_total_ms=max(self.copy_probe_max_ms, 1200),
+                        plain_protocol=plain_protocol,
+                    )
+                    best_seen_empty_copy_retry_done = True
+                candidate = copied or best_seen_text
+                if candidate and self._matches_current_request_response_candidate(candidate):
+                    if plain_protocol and is_likely_truncated_plain_text(candidate):
+                        logger.warning(
+                            "DeepSeek wait_for_response refused likely truncated best-seen text after assistant DOM disappeared best_chars=%d copied_chars=%d empty_rounds=%d",
+                            len(best_seen_text),
+                            len(copied),
+                            best_seen_empty_rounds,
+                        )
+                        page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
+                        continue
+                    if trace is not None:
+                        trace.set("response_chars", len(candidate))
+                        trace.set("response_ready_reason", "best_seen_after_dom_disappeared")
+                        trace.mark("response_stable")
+                    logger.warning(
+                        "DeepSeek wait_for_response returning best seen text after assistant DOM disappeared best_chars=%d copied_chars=%d empty_rounds=%d",
+                        len(best_seen_text),
+                        len(copied),
+                        best_seen_empty_rounds,
+                    )
+                    return candidate
             if has_advanced and current and is_transient_thinking_text(current):
                 generation_busy_seen = True
                 now = time.time()
@@ -5773,7 +6373,7 @@ class DeepSeekWebBridge:
                 if has_advanced:
                     if try_continue_generation("assistant_advanced"):
                         continue
-                if has_advanced and self.can_submit_next_turn(page):
+                if has_advanced and (not plain_protocol or self.is_plain_generation_complete(page)) and (plain_protocol or self.can_submit_next_turn(page)):
                     copied = self.try_copy_last_assistant_text(page, plain_protocol=plain_protocol)
                     if copied and (not plain_protocol or not is_likely_truncated_plain_text(copied)) and self._matches_current_request_response_candidate(copied):
                         if trace is not None:
@@ -5882,10 +6482,25 @@ class DeepSeekWebBridge:
             if has_advanced and current and stable_seen >= self.stable_rounds:
                 if try_continue_generation("stable_text"):
                     continue
+                plain_generation_status = self.plain_generation_status(page) if plain_protocol else {}
+                plain_generation_complete = (
+                    bool(plain_generation_status.get("has_copy"))
+                    and not bool(plain_generation_status.get("has_stop"))
+                    and not bool(plain_generation_status.get("has_continue"))
+                ) if plain_protocol else True
+                if plain_protocol and not plain_generation_complete:
+                    logger.warning(
+                        "DeepSeek wait_for_response postponing plain stable text while generation controls are busy chars=%d stable_seen=%d status=%s",
+                        len(current),
+                        stable_seen,
+                        json.dumps(plain_generation_status, ensure_ascii=False)[:1200],
+                    )
+                    page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
+                    continue
                 if (
                     plain_protocol
                     and has_agent_qt_completion_line(current)
-                    and self.can_submit_next_turn(page)
+                    and plain_generation_complete
                     and self._matches_current_request_response_candidate(current)
                 ):
                     if trace is not None:
@@ -5899,13 +6514,33 @@ class DeepSeekWebBridge:
                     return current
                 if (
                     plain_protocol
-                    and self.can_submit_next_turn(page)
-                    and not self.has_continue_generation_button(page)
+                    and plain_generation_complete
                     and not is_suspicious_short_fragment(current)
                     and not is_suspicious_incomplete_command_text(current)
                     and not is_likely_truncated_plain_text(current)
                     and self._matches_current_request_response_candidate(current)
                 ):
+                    copied = self.try_copy_last_assistant_text(
+                        page,
+                        max_total_ms=max(self.copy_probe_max_ms * 3, 4500),
+                        plain_protocol=plain_protocol,
+                    )
+                    if copied and not is_suspicious_incomplete_command_text(copied) and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
+                        if trace is not None:
+                            trace.set("response_chars", len(copied))
+                            trace.set("response_ready_reason", "copy_button_plain_terminal_stable")
+                            trace.mark("response_stable")
+                        logger.warning(
+                            "DeepSeek wait_for_response returning terminal stable plain copy chars=%d stable_seen=%d",
+                            len(copied),
+                            stable_seen,
+                        )
+                        return copied
+                    logger.warning(
+                        "DeepSeek wait_for_response plain copy probe failed on terminal stable DOM; using DOM fallback chars=%d copied_chars=%d",
+                        len(current),
+                        len(copied),
+                    )
                     if trace is not None:
                         trace.set("response_chars", len(current))
                         trace.set("response_ready_reason", "plain_terminal_stable_dom")
@@ -5924,7 +6559,7 @@ class DeepSeekWebBridge:
                     logger.warning("DeepSeek wait_for_response suppressing stable placeholder payload.")
                     return '{"content":"","tool_calls":[]}'
                 if is_suspicious_short_fragment(current):
-                    if self.can_submit_next_turn(page) and not short_fragment_copy_retry_done:
+                    if (not plain_protocol or plain_generation_complete) and self.can_submit_next_turn(page) and not short_fragment_copy_retry_done:
                         copied = self.try_copy_last_assistant_text(
                             page,
                             max_total_ms=max(self.copy_probe_max_ms * 3, 1200),
@@ -5953,7 +6588,7 @@ class DeepSeekWebBridge:
                         continue
                 if is_suspicious_incomplete_command_text(current):
                     copied = ""
-                    if self.can_submit_next_turn(page):
+                    if self.can_submit_next_turn(page) and (not plain_protocol or plain_generation_complete):
                         copied = self.try_copy_last_assistant_text(
                             page,
                             max_total_ms=max(self.copy_probe_max_ms * 3, 1500),
@@ -5990,25 +6625,62 @@ class DeepSeekWebBridge:
                     if not self.can_submit_next_turn(page) and stable_seen < tool_payload_stable_rounds:
                         page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
                         continue
+                if plain_protocol and is_likely_truncated_plain_text(current):
+                    copied = ""
+                    if plain_generation_complete:
+                        copied = self.try_copy_last_assistant_text(
+                            page,
+                            max_total_ms=max(self.copy_probe_max_ms * 3, 4500),
+                            plain_protocol=plain_protocol,
+                        )
+                    if copied and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
+                        if trace is not None:
+                            trace.set("response_chars", len(copied))
+                            trace.set("response_ready_reason", "copy_button_truncated_stable_retry")
+                            trace.mark("response_stable")
+                        logger.warning(
+                            "DeepSeek wait_for_response recovered likely truncated stable DOM text via copy retry current_chars=%d copied_chars=%d",
+                            len(current),
+                            len(copied),
+                        )
+                        return copied
+                    logger.warning(
+                        "DeepSeek wait_for_response postponing likely truncated plain text chars=%d copied_chars=%d",
+                        len(current),
+                        len(copied),
+                    )
+                    page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
+                    continue
                 if trace is not None:
                     trace.set("response_chars", len(current))
                     trace.set("response_ready_reason", "stable_text")
                     trace.mark("response_stable")
-                if plain_protocol and is_likely_truncated_plain_text(current):
-                    if self.can_submit_next_turn(page) and not self.has_continue_generation_button(page):
-                        logger.warning(
-                            "DeepSeek wait_for_response accepting stable plain DOM text despite truncation heuristic; final copy probe may replace it chars=%d",
-                            len(current),
-                        )
-                    else:
-                        logger.warning(
-                            "DeepSeek wait_for_response postponing likely truncated plain text chars=%d",
-                            len(current),
-                        )
-                        page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
-                        continue
                 if self._matches_current_request_response_candidate(current):
                     return current
+            if plain_protocol and has_advanced and current:
+                plain_generation_status = self.plain_generation_status(page)
+                plain_generation_complete = (
+                    bool(plain_generation_status.get("has_copy"))
+                    and not bool(plain_generation_status.get("has_stop"))
+                    and not bool(plain_generation_status.get("has_continue"))
+                )
+                if plain_generation_complete and plain_text_ready_for_copy(current):
+                    copied = self.try_copy_last_assistant_text(
+                        page,
+                        max_total_ms=max(self.copy_probe_max_ms, 1500),
+                        plain_protocol=plain_protocol,
+                    )
+                    if copied and not is_suspicious_incomplete_command_text(copied) and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
+                        if trace is not None:
+                            trace.set("response_chars", len(copied))
+                            trace.set("response_ready_reason", "copy_button_plain_ready")
+                            trace.mark("response_stable")
+                        logger.warning(
+                            "DeepSeek wait_for_response returning ready plain copy chars=%d stable_seen=%d",
+                            len(copied),
+                            stable_seen,
+                        )
+                        return copied
             page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
 
         if best_seen_text and len(best_seen_text.strip()) >= 200:

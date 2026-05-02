@@ -51,10 +51,46 @@ def _looks_like_prompt_replay_text(text: str) -> bool:
         "no tools are available for this request",
         "conversation:\n\n[user]",
         "new conversation events since the previous request",
-        "runner 会执行你返回的单个 fenced bash 代码块",
+        "runner 会执行你返回的 fenced bash 终端命令块",
         "available tools (openai tools schema)",
     )
     return sum(1 for hint in hints if hint in lowered) >= 2
+
+
+def _looks_like_web_busy_text(text: str) -> bool:
+    raw_content = str(text or "").strip()
+    content = raw_content.lower()
+    if not content:
+        return False
+    if len(raw_content) > 100:
+        return False
+    markers = (
+        "有消息正在生成，请稍后再试",
+        "message is being generated",
+        "response is being generated",
+        "please try again later",
+    )
+    return any(marker in content for marker in markers)
+
+
+def raise_if_web_busy_payload(payload: dict[str, Any], request_id: str, route: str) -> None:
+    text = "\n".join(
+        str(payload.get(key) or "")
+        for key in ("content", "raw_text")
+        if isinstance(payload.get(key), str)
+    )
+    if _looks_like_web_busy_text(text):
+        logger.warning("provider[%s] %s DeepSeek web session busy; returning HTTP 429.", request_id, route)
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "web_session_busy",
+                    "message": "DeepSeek Web 当前会话仍有消息正在生成，请稍后再试。",
+                }
+            },
+        )
 
 
 DEFAULT_URL = os.environ.get("DEEPSEEK_WEB_URL", "https://chat.deepseek.com/")
@@ -1108,7 +1144,7 @@ async def run_on_bridge_slot(
 
 
 def close_bridges() -> None:
-    for pool in _bridge_pools.values():
+    for pool in list(_bridge_pools.values()):
         pool.close()
     _bridge_pools.clear()
 
@@ -1133,6 +1169,12 @@ async def prewarm_default_bridge_pool() -> None:
         )
     except Exception:
         logger.warning("DeepSeek bridge pool startup prewarm scheduling failed", exc_info=True)
+
+
+@app.on_event("shutdown")
+async def shutdown_bridge_pools() -> None:
+    logger.warning("DeepSeek provider shutting down; closing bridge pools.")
+    close_bridges()
 
 
 class ChatMessage(BaseModel):
@@ -2808,6 +2850,7 @@ async def responses(request: ResponsesRequest):
         payload.get("protocol_retry_count", 0),
     )
 
+    raise_if_web_busy_payload(payload, request_id, "/v1/responses")
     payload, web_search_items, search_results = await resolve_provider_web_search(
         payload=payload,
         pool=pool,
@@ -2913,6 +2956,7 @@ async def chat_completions(request: ChatCompletionRequest):
         payload.get("protocol_retry_count", 0),
     )
 
+    raise_if_web_busy_payload(payload, request_id, "/v1/chat/completions")
     payload = apply_text_tool_call_fallback(payload, request_tools)
     payload = validate_tool_calls_against_schemas(payload, request_tools)
     if request_output_protocol == "plain" and _looks_like_prompt_replay_text(str(payload.get("content") or "")):
@@ -3027,6 +3071,7 @@ async def anthropic_messages(request: AnthropicMessageRequest):
         logger.exception("provider[%s] /v1/messages bridge.call failed", request_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    raise_if_web_busy_payload(payload, request_id, "/v1/messages")
     payload = apply_text_tool_call_fallback(payload, request_tools)
     payload = validate_tool_calls_against_schemas(payload, request_tools)
     message, tool_calls, _ = build_openai_assistant_message(payload)

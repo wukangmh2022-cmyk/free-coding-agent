@@ -79,6 +79,20 @@ def subprocess_no_window_kwargs(extra_creationflags: int = 0) -> Dict[str, objec
     return {"creationflags": flags} if flags else {}
 
 
+def process_alive(pid: int) -> bool:
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def app_settings_path() -> str:
     return os.path.join(AGENT_HOME_DIR, "settings.json")
 
@@ -919,11 +933,23 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 
 ## 输出协议
 - 自然问答或展示代码时，正常使用 Markdown fenced 代码块即可。
-- 需要本地执行时，只输出一个 Markdown fenced `{command_block_lang}` 命令块；命令块前后不要写解释、计划或总结。
-- 命令块只写当前平台命令，不写 JSON/tool_calls，不拆成多个命令块。{command_rules}
+- 需要本地执行时，回复里必须包含一个 Markdown fenced `{command_block_lang}` 终端命令块；命令块前后可以保留必要的简短说明、计划或总结。
+- 终端命令只写当前平台命令，不写 JSON/tool_calls；需要写文件占位符时可以继续提供后续文件内容 fenced 代码块。{command_rules}
 - 命令块内只能写真实要执行的 shell 代码，或 Agent Qt 终端扩展指令；不要把执行结果、文件变更摘要、结论、`AGENT_DONE` 或任何聊天正文写进命令块。
 - 【占位符协议】：替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。不要把替换符当作待办、摘要、计划、说明或普通正文输出；命令块未引用的替换符没有意义。
 - 替换符语言必须和后续文件内容代码块语言一致；写 HTML 就用 `<!-- HTML block 1 -->` 并提供 ```html 代码块，写 SVG 就用 `<!-- SVG block 1 -->` 并提供 ```svg 代码块。不要用 `Game block`、`File block` 这类泛化名称。
+- 占位符正例：命令块只放 shell 和占位符，真实文件内容放在后续同编号同语言 fenced 代码块里：
+  ```bash
+  cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'
+  <!-- Python block 1 -->
+  PYEOF
+  python /Users/pippo/Desktop/my-project/hello.py
+  ```
+  ```python
+  # <desc 打印问候>
+  print("hello from file")
+  ```
+  说明：`<!-- Python block 1 -->` 不会写进文件；真正写入的是后面的第 1 个 `python` 代码块内容。
 - 命令块保持短小；不要在命令块内直接嵌入超过 10 行的文件正文，如果要写入超过 10 行的文件内容时，必须拆分为终端指令里使用占位符协议 + 后续md格式的fenced 代码块。
 - 代码块首行可用本语言注释写摘要，供界面折叠展示：如 `# <desc 写入配置>`、`// <desc 前端逻辑>`、`/* <desc 样式> */`、`<!-- <desc SVG 图像> -->`；没有也可以，界面会自动截断首行生成摘要。
 - 不要在非写文件场景使用替换符；不要把替换符写进文件内容代码块；输出了替换符就必须在同一回复提供对应 fenced 文件内容代码块。
@@ -933,7 +959,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 不输出备用方案；自己选择一个最高把握路径。
 - 自动化循环完成时只回复 `{done_marker}` 加简短总结；未完成则继续给下一轮完整命令块。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作“已生成/已写入/已验证/已发送”。执行后会有下一轮结果，再基于结果下结论。
-- 微信远控发送文件使用终端扩展指令：在命令块里单独写一行 `wx send_file 文件路径1,文件路径2,...`。这行只是请求 Agent Qt 发送附件，不代表已经发送完成；同一回复不要声称“已发送/已通过 wx send_file 发送”。
+- 微信远控发送文件使用终端扩展指令：在命令块里写 `wx send_file 文件路径1,文件路径2,...`。这只是请求 Agent Qt 发送附件，不代表已经发送完成；同一回复不要声称“已发送/已通过 wx send_file 发送”。
 - 定时计划使用终端扩展指令：`schedule create JSON`、`schedule list`、`schedule delete 名称或序号`、`schedule update JSON`。计划 JSON 使用 `{{"title":"短标题","prompt":"到点后真正要做的事","trigger":{{"run_at":"YYYY-MM-DD HH:MM:SS","repeat_every_seconds":86400,"until_at":"YYYY-MM-DD HH:MM:SS"}}}}`。
 - Agent Qt 会给文件变更生成 internal git 快照/commit；需要 diff 细节时可按摘要里的 repo/commit 查询。
 - 查看后台终端输出只用这一种命令方式：`curl -s '{terminal_logs_url}?pid=xxx'`。把 `xxx` 换成终端摘要里的 pid。
@@ -985,6 +1011,7 @@ COMMAND_BACKGROUND_TIMEOUT_SECONDS = env_int("AGENT_QT_COMMAND_BACKGROUND_TIMEOU
 PROVIDER_REQUEST_RETRY_ATTEMPTS = env_int("AGENT_QT_PROVIDER_REQUEST_RETRY_ATTEMPTS", 3, minimum=1)
 PROVIDER_TRANSIENT_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 SCHEDULE_MISSED_GRACE_SECONDS = env_int("AGENT_QT_SCHEDULE_MISSED_GRACE_SECONDS", 300, minimum=30)
+SCHEDULE_ACTIVE_RUN_TIMEOUT_SECONDS = env_int("AGENT_QT_SCHEDULE_ACTIVE_RUN_TIMEOUT_SECONDS", 900, minimum=60)
 
 FORBIDDEN = [
     "rm -rf /", "sudo rm", "sudo reboot", "shutdown",
@@ -1114,7 +1141,11 @@ def message_box_style() -> str:
 
 def compact_popup_menu_style() -> str:
     is_windows = platform.system() == "Windows"
-    menu_bg = COLORS["surface"] if is_windows else "rgba(238, 243, 252, 238)"
+    dark = app_theme_setting() == "dark"
+    menu_bg = COLORS["surface"] if is_windows else ("rgba(23, 29, 41, 242)" if dark else "rgba(238, 243, 252, 238)")
+    selected_bg = "rgba(124, 109, 255, 70)" if dark else "rgba(255, 255, 255, 120)"
+    checked_bg = "rgba(124, 109, 255, 92)" if dark else "rgba(255, 255, 255, 150)"
+    separator_bg = "rgba(236, 242, 255, 28)" if dark else "rgba(23, 32, 51, 28)"
     menu_radius = 0 if is_windows else 14
     item_radius = 0 if is_windows else 10
     return f"""
@@ -1136,11 +1167,11 @@ def compact_popup_menu_style() -> str:
             min-height: 18px;
         }}
         QMenu::item:selected {{
-            background: rgba(255, 255, 255, 120);
+            background: {selected_bg};
             color: {COLORS['text']};
         }}
         QMenu::item:checked {{
-            background: rgba(255, 255, 255, 150);
+            background: {checked_bg};
             color: {COLORS['text']};
         }}
         QMenu::item:disabled {{
@@ -1149,7 +1180,7 @@ def compact_popup_menu_style() -> str:
         }}
         QMenu::separator {{
             height: 1px;
-            background: rgba(23, 32, 51, 28);
+            background: {separator_bg};
             margin: 5px 8px;
         }}
         QMenu::indicator {{
@@ -1173,7 +1204,10 @@ def style_compact_popup_menu(menu: QMenu) -> QMenu:
 def style_skill_popup_menu(menu: QMenu) -> QMenu:
     is_windows = platform.system() == "Windows"
     menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, not is_windows)
-    menu_bg = COLORS["surface"] if is_windows else "rgba(238, 243, 252, 238)"
+    dark = app_theme_setting() == "dark"
+    menu_bg = COLORS["surface"] if is_windows else ("rgba(23, 29, 41, 242)" if dark else "rgba(238, 243, 252, 238)")
+    selected_bg = "rgba(124, 109, 255, 70)" if dark else "rgba(190, 222, 255, 225)"
+    separator_bg = "rgba(236, 242, 255, 24)" if dark else "rgba(23, 32, 51, 24)"
     menu_radius = 0 if is_windows else 14
     item_radius = 0 if is_windows else 9
     menu.setStyleSheet(f"""
@@ -1195,7 +1229,7 @@ def style_skill_popup_menu(menu: QMenu) -> QMenu:
             min-height: 16px;
         }}
         QMenu::item:selected {{
-            background: rgba(190, 222, 255, 225);
+            background: {selected_bg};
             color: {COLORS['text']};
         }}
         QMenu::item:checked {{
@@ -1208,7 +1242,7 @@ def style_skill_popup_menu(menu: QMenu) -> QMenu:
         }}
         QMenu::separator {{
             height: 1px;
-            background: rgba(23, 32, 51, 24);
+            background: {separator_bg};
             margin: 3px 7px;
         }}
         QMenu::indicator {{
@@ -1522,7 +1556,7 @@ class SettingsToggleRow(QWidget):
                 border-radius: 12px;
             }}
             QWidget:hover {{
-                background: #f8fbff;
+                background: {COLORS['surface_alt']};
             }}
             QLabel {{
                 background: transparent;
@@ -2179,6 +2213,36 @@ def strip_heredoc_bodies_for_detection(cmd: str) -> str:
         pending_tags.extend(find_heredoc_tags(raw_line))
     return "\n".join(visible_lines)
 
+def validate_shell_command_syntax(cmd: str) -> Optional[str]:
+    if platform.system() == "Windows" or is_powershell_command(cmd):
+        return None
+    command = strip_shell_command_marker(cmd).strip()
+    if not command:
+        return None
+    if has_unclosed_shell_quote(strip_heredoc_bodies_for_detection(command)):
+        return "命令块不完整：检测到未闭合的 shell 引号。"
+    script_path = write_temp_shell_script(command)
+    try:
+        shell = os.environ.get("SHELL") or "/bin/sh"
+        result = subprocess.run(
+            [shell, "-n", script_path],
+            cwd=os.getcwd(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            **subprocess_no_window_kwargs(),
+        )
+        if result.returncode == 0:
+            return None
+        detail = (result.stderr or result.stdout or "").strip()
+        detail = re.sub(rf"^{re.escape(script_path)}", "<command>", detail)
+        return "命令块 shell 语法不完整或无法解析：" + (detail or f"退出码 {result.returncode}")
+    except Exception as exc:
+        logger.debug("Shell syntax validation skipped.", exc_info=True)
+        return None if isinstance(exc, subprocess.TimeoutExpired) else f"命令块 shell 语法预检失败：{exc}"
+    finally:
+        remove_temp_script_later(script_path)
+
 def command_writes_agent_project_cache(cmd: str, project_root: str) -> bool:
     if not project_root:
         return False
@@ -2375,8 +2439,84 @@ def command_block_from_blocks(blocks: Dict[str, List[str]]) -> tuple[str, str]:
     return get_code_block(blocks, "bash") or "", "bash"
 
 
+def terminal_extension_payload_text(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
+        return text
+    try:
+        parts = shlex.split(text, posix=True)
+        if len(parts) == 1:
+            return parts[0].strip()
+    except ValueError:
+        pass
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        return text[1:-1].strip()
+    return text
+
+
+TERMINAL_EXTENSION_COMMAND_SPECS = (
+    {
+        "name": "wx send_file",
+        "prefix_re": re.compile(r"^(?:wx(?:\s+send_file)?|AGENT_WECHAT_SEND_FILE)(?:\s|[:：]|$)", re.I),
+        "complete_re": re.compile(r"^(?:wx\s+send_file\s+.+|AGENT_WECHAT_SEND_FILE(?:\s*[:：]\s*|\s+).+)$", re.I),
+        "internal_prefixes": ("AGENT_WECHAT_SEND_FILE",),
+        "usage": "`wx send_file 文件路径`",
+    },
+    {
+        "name": "schedule",
+        "prefix_re": re.compile(
+            r"^(?:(?:wx\s+)?schedule(?:\s|$)|AGENT_WECHAT_(?:CREATE_SCHEDULE|SCHEDULE_ACTION)(?:\s|[:：]|$))",
+            re.I,
+        ),
+        "complete_re": re.compile(
+            r"^(?:(?:wx\s+)?schedule\s+(?:list\b|create\s+.+|(?:delete|remove|del)\s+.+|update\s+.+)"
+            r"|AGENT_WECHAT_(?:CREATE_SCHEDULE|SCHEDULE_ACTION)(?:\s*[:：]\s*|\s+).+)$",
+            re.I,
+        ),
+        "internal_prefixes": ("AGENT_WECHAT_CREATE_SCHEDULE", "AGENT_WECHAT_SCHEDULE_ACTION"),
+        "usage": "`schedule create/list/delete/update ...`",
+    },
+)
+
+
+def strip_terminal_extension_shell_prefix(command_text: str) -> str:
+    stripped = str(command_text or "").strip()
+    shell_prefixed = re.match(r"^(?:bash|sh|zsh|shell)\s+(.+)$", stripped, re.I)
+    if shell_prefixed:
+        return (shell_prefixed.group(1) or "").strip()
+    return stripped
+
+
+def terminal_extension_usage_text() -> str:
+    usages = [str(spec.get("usage") or "").strip() for spec in TERMINAL_EXTENSION_COMMAND_SPECS]
+    return "；".join(usage for usage in usages if usage)
+
+
+def terminal_extension_internal_prefixes() -> tuple[str, ...]:
+    prefixes: List[str] = []
+    for spec in TERMINAL_EXTENSION_COMMAND_SPECS:
+        for prefix in spec.get("internal_prefixes") or ():
+            prefix_text = str(prefix or "").strip().upper()
+            if prefix_text and prefix_text not in prefixes:
+                prefixes.append(prefix_text)
+    return tuple(prefixes)
+
+
+def is_terminal_extension_internal_directive_line(line: str) -> bool:
+    upper = str(line or "").strip().upper()
+    return any(
+        upper.startswith(prefix + ":")
+        or upper.startswith(prefix + "：")
+        or upper == prefix
+        or upper.startswith(prefix + " ")
+        for prefix in terminal_extension_internal_prefixes()
+    )
+
+
 def normalize_terminal_extension_directive(line: str) -> List[str]:
-    stripped = str(line or "").strip()
+    stripped = strip_terminal_extension_shell_prefix(line)
     if not stripped:
         return []
     wx_send_match = re.match(r"^wx\s+send_file\s+(.+)$", stripped, re.I)
@@ -2386,7 +2526,7 @@ def normalize_terminal_extension_directive(line: str) -> List[str]:
         return [f"AGENT_WECHAT_SEND_FILE: {target}" for target in targets]
     schedule_create_match = re.match(r"^(?:wx\s+)?schedule\s+create\s+(.+)$", stripped, re.I)
     if schedule_create_match:
-        return [f"AGENT_WECHAT_CREATE_SCHEDULE: {(schedule_create_match.group(1) or '').strip()}"]
+        return [f"AGENT_WECHAT_CREATE_SCHEDULE: {terminal_extension_payload_text(schedule_create_match.group(1) or '')}"]
     schedule_list_match = re.match(r"^(?:wx\s+)?schedule\s+list\s*$", stripped, re.I)
     if schedule_list_match:
         return ['AGENT_WECHAT_SCHEDULE_ACTION: {"action":"list"}']
@@ -2396,7 +2536,7 @@ def normalize_terminal_extension_directive(line: str) -> List[str]:
         return [f"AGENT_WECHAT_SCHEDULE_ACTION: {json.dumps({'action': 'delete', 'target': target}, ensure_ascii=False, separators=(',', ':'))}"]
     schedule_update_match = re.match(r"^(?:wx\s+)?schedule\s+update\s+(.+)$", stripped, re.I)
     if schedule_update_match:
-        payload_text = (schedule_update_match.group(1) or "").strip()
+        payload_text = terminal_extension_payload_text(schedule_update_match.group(1) or "")
         try:
             payload = json.loads(payload_text)
             if isinstance(payload, dict) and not payload.get("action"):
@@ -2412,14 +2552,167 @@ def normalize_terminal_extension_directive(line: str) -> List[str]:
     for name in ("AGENT_WECHAT_CREATE_SCHEDULE", "AGENT_WECHAT_SCHEDULE_ACTION"):
         match = re.match(rf"^({name})(?:\s*[:：]\s*|\s+)(.+)$", stripped, re.I)
         if match:
-            return [f"{name}: {(match.group(2) or '').strip()}"]
+            return [f"{name}: {terminal_extension_payload_text(match.group(2) or '')}"]
     return []
 
 
-def strip_terminal_extension_directives_from_command(command_text: str) -> tuple[str, List[str]]:
+def looks_like_incomplete_terminal_extension_command(command_text: str) -> bool:
+    stripped = strip_terminal_extension_shell_prefix(command_text)
+    if not stripped:
+        return False
+    if normalize_terminal_extension_directive(stripped):
+        return False
+    normalized = re.sub(r"\s+", " ", stripped).strip()
+    for spec in TERMINAL_EXTENSION_COMMAND_SPECS:
+        prefix_re = spec.get("prefix_re")
+        complete_re = spec.get("complete_re")
+        if (
+            hasattr(prefix_re, "match")
+            and prefix_re.match(normalized)
+            and not (hasattr(complete_re, "match") and complete_re.match(normalized))
+        ):
+            return True
+    return False
+
+
+def split_shell_chain_segments(line: str) -> List[tuple[str, str]]:
+    """Split a simple shell chain on unquoted separators while keeping separators."""
+    text = str(line or "")
+    segments: List[tuple[str, str]] = []
+    start = 0
+    index = 0
+    single = False
+    double = False
+    escaped = False
+    while index < len(text):
+        ch = text[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            index += 1
+            continue
+        if ch == "'" and not double:
+            single = not single
+            index += 1
+            continue
+        if ch == '"' and not single:
+            double = not double
+            index += 1
+            continue
+        if not single and not double:
+            if text.startswith("&&", index):
+                segments.append((text[start:index].strip(), "&&"))
+                index += 2
+                start = index
+                continue
+            if text.startswith("||", index):
+                segments.append((text[start:index].strip(), "||"))
+                index += 2
+                start = index
+                continue
+            if ch == "|":
+                segments.append((text[start:index].strip(), "|"))
+                index += 1
+                start = index
+                continue
+            if ch == ";":
+                segments.append((text[start:index].strip(), ";"))
+                index += 1
+                start = index
+                continue
+            if ch == "&" and (index == 0 or text[index - 1] != ">") and (index + 1 >= len(text) or text[index + 1] != ">"):
+                segments.append((text[start:index].strip(), "&"))
+                index += 1
+                start = index
+                continue
+        index += 1
+    segments.append((text[start:].strip(), ""))
+    return [(segment, separator) for segment, separator in segments if segment or separator]
+
+
+def terminal_extension_placeholder_command(prev_separator: str, next_separator: str) -> str:
+    if prev_separator == "|":
+        return "cat >/dev/null"
+    if next_separator == "|":
+        return "printf ''"
+    return "true"
+
+
+def terminal_extension_command_display(directive: str) -> str:
+    return terminal_extension_command_for_log(directive)
+
+
+def terminal_extension_inline_warning_message(directives: List[str]) -> str:
+    commands = [terminal_extension_command_display(item) for item in directives if str(item or "").strip()]
+    command_text = "、".join(commands[:3]) if commands else "终端扩展指令"
+    if len(commands) > 3:
+        command_text += f" 等 {len(commands)} 条"
+    return (
+        "⚠️ Agent Qt 风险日志：已把高风险链式命令中的终端扩展指令替换为空操作占位。"
+        f"本次涉及：{command_text}。"
+        "这些扩展指令不支持和 ||、|、& 混写；这会丢失条件、管道或后台语义。"
+        "下一轮请避免把这些扩展指令放进高风险 shell 链。"
+    )
+
+
+def terminal_extension_inline_warning_command(command_lang: str, directives: List[str]) -> str:
+    message = terminal_extension_inline_warning_message(directives)
+    if command_lang == "powershell":
+        return "Write-Output " + json.dumps(message, ensure_ascii=False)
+    return "printf '%s\\n' " + shlex.quote(message)
+
+
+def terminal_extension_inline_rewrite_is_risky(prev_separator: str, next_separator: str) -> bool:
+    return prev_separator in {"||", "|", "&"} or next_separator in {"||", "|", "&"}
+
+
+def strip_inline_terminal_extension_directives_from_line(line: str) -> tuple[str, List[str], List[str]]:
+    segments = split_shell_chain_segments(line)
+    if len(segments) <= 1:
+        return str(line or ""), [], []
+    rebuilt: List[tuple[str, str]] = []
+    directives: List[str] = []
+    risky_directives: List[str] = []
+    for index, (segment, separator) in enumerate(segments):
+        normalized = normalize_terminal_extension_directive(segment)
+        if normalized:
+            directives.extend(normalized)
+            prev_separator = segments[index - 1][1] if index > 0 else ""
+            if terminal_extension_inline_rewrite_is_risky(prev_separator, separator):
+                risky_directives.extend(normalized)
+            segment = terminal_extension_placeholder_command(prev_separator, separator)
+        if segment:
+            rebuilt.append((segment, separator))
+    if not directives:
+        return str(line or ""), [], []
+    cleaned_parts: List[str] = []
+    for idx, (segment, separator) in enumerate(rebuilt):
+        cleaned_parts.append(segment)
+        if separator and idx < len(rebuilt) - 1:
+            cleaned_parts.append(separator)
+    return " ".join(cleaned_parts).strip(), directives, risky_directives
+
+
+def strip_terminal_extension_directives_from_command(
+    command_text: str,
+    *,
+    include_inline_warning: bool = False,
+    command_lang: str = "bash",
+) -> tuple[str, List[str]]:
     kept_lines: List[str] = []
     directives: List[str] = []
     for line in str(command_text or "").splitlines():
+        cleaned_line, inline_directives, risky_directives = strip_inline_terminal_extension_directives_from_line(line)
+        if inline_directives:
+            directives.extend(inline_directives)
+            if cleaned_line:
+                if include_inline_warning and risky_directives:
+                    kept_lines.append(terminal_extension_inline_warning_command(command_lang, risky_directives))
+                kept_lines.append(cleaned_line)
+            continue
         normalized = normalize_terminal_extension_directive(line)
         if normalized:
             directives.extend(normalized)
@@ -2457,15 +2750,42 @@ def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
     if not command_text:
         return []
     command_text, _terminal_extensions = strip_terminal_extension_directives_from_command(command_text)
+    if looks_like_incomplete_terminal_extension_command(command_text):
+        raise ValueError(
+            "检测到不完整的终端扩展指令。"
+            f"请使用完整格式：{terminal_extension_usage_text()}。"
+        )
     reject_internal_context_in_command_block(command_text)
     reject_unfenced_file_placeholder_payload(text, blocks, referenced_placeholder_keys(command_text))
     command_text = resolve_all_placeholders(command_text, blocks)
-    command_text, _terminal_extensions = strip_terminal_extension_directives_from_command(command_text)
+    command_text, _terminal_extensions = strip_terminal_extension_directives_from_command(
+        command_text,
+        include_inline_warning=True,
+        command_lang=command_lang,
+    )
+    if looks_like_incomplete_terminal_extension_command(command_text):
+        raise ValueError(
+            "检测到不完整的终端扩展指令。"
+            f"请使用完整格式：{terminal_extension_usage_text()}。"
+        )
     reject_internal_context_in_command_block(command_text)
     if command_lang == "powershell":
         return [POWERSHELL_COMMAND_PREFIX + command_text.strip()] if command_text.strip() else []
     command_text = command_text.strip()
     return [command_text] if command_text else []
+
+
+DEEPSEEK_DISCLAIMER_LINE_RE = re.compile(
+    r"^\s*(?:本回答由\s*AI\s*生成，内容仅供参考，请仔细甄别。?|内容由\s*AI\s*生成，仅供参考，请仔细甄别。?)\s*$",
+    re.I,
+)
+
+
+def strip_provider_ui_artifacts_from_command(cmd: str) -> str:
+    lines = str(cmd or "").splitlines()
+    while lines and DEEPSEEK_DISCLAIMER_LINE_RE.match(lines[-1].strip()):
+        lines.pop()
+    return "\n".join(lines).strip()
 
 
 def reject_internal_context_in_command_block(command_text: str):
@@ -2486,7 +2806,7 @@ def reject_internal_context_in_command_block(command_text: str):
         if marker in text:
             raise ValueError(
                 "命令块混入了执行结果、结论或终端扩展指令。"
-                "请只在命令块内写真实 shell 命令；微信发送文件请单独写 wx send_file 路径，不能 echo/printf。"
+                f"请只在命令块内写真实 shell 命令或完整终端扩展指令：{terminal_extension_usage_text()}。"
             )
 
 def is_long_running(cmd: str) -> bool:
@@ -3425,7 +3745,7 @@ def looks_like_automation_context_payload(text: str) -> bool:
     runner_hints = (
         "plain bash agent 模式",
         "backend llm for a local bash-only coding runner",
-        "runner 会执行你返回的单个 fenced bash 代码块",
+        "runner 会执行你返回的 fenced bash 终端命令块",
         "no tools are available for this request",
         "session marker: flowflow_system_prompt",
         "continue the existing plain bash agent session already initialized in this chat",
@@ -3607,6 +3927,11 @@ def looks_like_submit_idle_error(text: str) -> bool:
     )
 
 
+def looks_like_incomplete_plain_response(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip()).lower()
+    return normalized in {"text", "plaintext", "markdown"}
+
+
 def quiet_automation_error_message(error: str) -> str:
     if looks_like_timeout_error(error):
         return "响应超时，自动化任务已暂停。"
@@ -3623,16 +3948,18 @@ def build_automation_feedback_prompt(
     max_rounds: int,
     *,
     wechat_file_delivery: bool = False,
+    previous_ai_response: str = "",
 ) -> str:
     goal_text = goal.strip() or "用户没有填写一句话需求，请根据前文、执行日志和当前项目状态继续判断。"
     clipped_log = truncate_middle(execution_log.strip(), AUTOMATION_FEEDBACK_CHAR_LIMIT)
+    clipped_previous_ai = truncate_middle(str(previous_ai_response or "").strip(), 4000)
     env = runtime_environment()
     command_block_lang = env["command_block_lang"]
     wechat_completion_note = ""
     if wechat_file_delivery:
         wechat_completion_note = (
             "\n- 本轮来自微信且具备附件发送上下文。若文件已经定位、生成或验证完成且需要发回微信，"
-            "下一步只输出一个命令块：`wx send_file 文件路径`。若没有其他本地命令，命令块里只写这一行；"
+            "下一步输出包含 `wx send_file 文件路径` 的命令块；"
             "不要同时写 AGENT_DONE，也不要声称文件已发送。"
         )
     return f"""你正在 Agent Qt 的自动化循环中，这是第 {round_number}/{max_rounds} 轮。
@@ -3643,6 +3970,11 @@ def build_automation_feedback_prompt(
 项目根目录：
 {project_root}
 
+上一轮 AI 输出如下：
+```text
+{clipped_previous_ai or "（无）"}
+```
+
 上一轮本地执行结果如下：
 ```text
 {clipped_log}
@@ -3651,8 +3983,9 @@ def build_automation_feedback_prompt(
 请判断下一步：
 - 如果本轮仍在继续处理上面的“原始用户需求”，上一轮本地执行结果、错误提示和拒绝原因与用户需求同等重要；若它指出协议错误、命令错误、缺文件、测试失败或数据不可信，必须先针对该错误修正输出，不要重复上一轮被拒绝的写法。若用户已经发来新的不同需求，则优先执行最新用户需求。
 - 已完成：只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。若下一步还需要执行命令、写文件或发送附件，尚未完成，先输出对应命令块。
-- 未完成：输出一个完整且短小的 ```{command_block_lang} 命令块；如果要写入超过 10 行的文件内容时，必须拆分为占位符协议 + md格式的fenced 代码块。
+- 未完成：回复里必须包含一个完整且短小的 ```{command_block_lang} 终端命令块；如果要写入超过 10 行的文件内容时，必须拆分为占位符协议 + md格式的fenced 代码块。
 - 命令块内只能写真实要执行的 shell 代码，或 `wx send_file 路径`、`schedule create/list/delete/update`；不要把上一轮执行结果、文件变更、结论或 `{AUTOMATION_DONE_MARKER}` 写进命令块。
+- 如果执行结果提示“命令块不完整”“未闭合的 shell 引号”“unmatched quote”或 shell 语法不完整，优先判断为上一轮输出被截断；重新输出完整命令块即可。多行 `python -c "..."` 是支持的，不要仅因这类错误改写成单行脚本。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作已完成、已生成、已验证或已发送。
 - 涉及统计、表格、数据查找或文件事实时，必须完整读取/计算后再下结论；示例行只能用于判断结构，不能据此编造定量结论、模型结论或总体判断。
 - 后台安装/构建/拉取不要当作完成；启动常驻命令时不要加 `&`/`nohup`，等执行结果给出 `Terminal processes:` 摘要后，再使用 `curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'` 查询控制台输出。
@@ -3767,14 +4100,15 @@ def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True, schedu
         "可用终端扩展指令：\n"
         "- 要执行本地工作：输出一个完整且短小的 "
         f"```{env['command_block_lang']} 命令块。\n"
-        "- 要把工作区文件发回微信：先自主定位/生成文件；路径确定后输出一个命令块，在其中写 `wx send_file 文件路径`。多个路径用英文逗号分隔；写出这行后由程序发送，AI 不要在同一回复声称已发送。\n"
+        "- 要把工作区文件发回微信：先自主定位/生成文件；路径确定后输出一个命令块，使用 `wx send_file 文件路径`。多个路径用英文逗号分隔；写出该指令后由程序发送，AI 不要在同一回复声称已发送。\n"
         "- 要创建时间计划：输出一个命令块，在其中写 `schedule create JSON`。\n"
         "  JSON 结构：{\"title\":\"短标题\",\"prompt\":\"到点后真正要做的事，不要写帮我创建计划\",\"trigger\":{\"run_at\":\"YYYY-MM-DD HH:MM:SS\",\"repeat_every_seconds\":86400,\"until_at\":\"YYYY-MM-DD HH:MM:SS\"}}\n"
         "  `run_at` 是模型根据当前时间和用户表达算出的下一次具体触发时间；一次性计划省略 `repeat_every_seconds` 或设为 0。每日/每周/每隔几小时等循环计划也只输出下一次 `run_at`，并用秒数表达循环间隔，例如每天 86400、每周 604800、每 2 小时 7200。有截止范围时输出 `until_at`，例如“接下来 5 个小时每小时检查”就是下一小时触发、repeat 3600、until_at=当前时间+5小时。\n"
-        "  如果用户同时提出多个不同频率的周期任务，优先拆成多行 `schedule create JSON`，不要在单个计划里用脚本计数器模拟另一个周期。\n"
+        "  如果用户同时提出多个不同频率的周期任务，优先拆成多条 `schedule create JSON`，不要在单个计划里用脚本计数器模拟另一个周期。\n"
         "  如果无法确定时间、任务或触发参数，先做低成本探索，仍不确定再简短提问，不要输出半截 trigger。\n"
-        "- 要查看、删除或修改时间计划：输出命令块。查看写 `schedule list`；删除写 `schedule delete 计划名称、序号或 id`；修改写 `schedule update JSON`，JSON 结构：{\"target\":\"计划名称、序号或 id\",\"trigger\":{\"run_at\":\"YYYY-MM-DD HH:MM:SS\",\"repeat_every_seconds\":3600,\"until_at\":\"YYYY-MM-DD HH:MM:SS\"},\"prompt\":\"可选的新计划内容\",\"title\":\"可选的新标题\"}。修改时只写需要变化的字段；如果目标不明确，先简短追问，不要猜。\n"
+        "- 要查看、删除或修改时间计划：输出命令块。查看写 `schedule list`；删除写 `schedule delete 计划名称、序号或 id`；修改写 `schedule update JSON`，JSON 结构：{\"target\":\"计划名称、序号或 id\",\"enabled\":true,\"trigger\":{\"run_at\":\"YYYY-MM-DD HH:MM:SS\",\"repeat_every_seconds\":3600,\"until_at\":\"YYYY-MM-DD HH:MM:SS\"},\"prompt\":\"可选的新计划内容\",\"title\":\"可选的新标题\"}。`enabled:false` 表示暂停；`enabled:true` 且不带 `trigger` 表示开启并立即安排执行一次；如果只想恢复到未来某个时间，必须同时给 `trigger.run_at`。修改时只写需要变化的字段。如果目标不明确，先简短追问，不要猜。\n"
         "- 要停止/切会话/列列表等控制动作：用户使用 slash/menu 指令时程序会直接处理；自然语言里提到时，你可以解释可用指令。\n"
+        "- 如果用户只是问候、闲聊或普通问答，不需要本地命令、文件或计划，直接用简短自然语言回复；不要为了获取时间或构造问候去执行 echo/date。\n"
         "如果用户目标不清楚，先做低成本探索；探索后仍缺少关键条件或候选无法判断时，再简短提问。最终给微信的回复会被压缩展示，所以结论要短。"
         f"{file_delivery_note}"
         f"\n\n当前计划列表：\n{schedule_summary.strip() or '当前没有定时计划。'}"
@@ -4363,6 +4697,7 @@ def normalize_schedule(raw: object) -> Optional[Dict[str, object]]:
     title = str(raw.get("title") or raw.get("name") or "定时计划").strip() or "定时计划"
     prompt = str(raw.get("prompt") or raw.get("content") or "").strip()
     schedule = normalize_schedule_spec(dict(raw.get("schedule") or {}))
+    notify_thread_id = str(raw.get("notify_wechat_thread_id") or "").strip()
     if not schedule or not prompt:
         return None
     return {
@@ -4378,6 +4713,7 @@ def normalize_schedule(raw: object) -> Optional[Dict[str, object]]:
         "last_run_at": str(raw.get("last_run_at") or ""),
         "notify_wechat_user": str(raw.get("notify_wechat_user") or ""),
         "notify_wechat_context_token": str(raw.get("notify_wechat_context_token") or ""),
+        "notify_wechat_thread_id": safe_thread_id(notify_thread_id) if notify_thread_id else "",
         "notify_wechat_enabled": bool(raw.get("notify_wechat_enabled", False)),
         "last_success_note": str(raw.get("last_success_note") or ""),
         "expired_at": str(raw.get("expired_at") or ""),
@@ -4472,7 +4808,14 @@ def create_workspace_schedule(root: str, title: str, prompt: str, hour: int, min
     )
 
 
-def schedule_from_wechat_trigger_payload(root: str, payload: object, *, notify_user: str = "", notify_context_token: str = "") -> Dict[str, object]:
+def schedule_from_wechat_trigger_payload(
+    root: str,
+    payload: object,
+    *,
+    notify_user: str = "",
+    notify_context_token: str = "",
+    notify_thread_id: str = "",
+) -> Dict[str, object]:
     if not isinstance(payload, dict):
         raise RuntimeError("计划触发器不是 JSON 对象。")
     title = str(payload.get("title") or payload.get("name") or "定时计划").strip()[:80] or "定时计划"
@@ -4484,10 +4827,12 @@ def schedule_from_wechat_trigger_payload(root: str, payload: object, *, notify_u
         raise RuntimeError("计划缺少 prompt。")
     schedule_item = create_workspace_schedule_from_spec(root, title, prompt, trigger, bool(payload.get("enabled", True)))
     if notify_user and notify_context_token:
+        notify_thread_id = str(notify_thread_id or "").strip()
         update_workspace_schedule(root, str(schedule_item.get("id") or ""), {
             "notify_wechat_enabled": True,
             "notify_wechat_user": notify_user,
             "notify_wechat_context_token": notify_context_token,
+            "notify_wechat_thread_id": safe_thread_id(notify_thread_id) if notify_thread_id else "",
         })
         schedule_item = next(
             (
@@ -4568,7 +4913,10 @@ def update_workspace_schedule_from_action(root: str, target: str, payload: Dict[
     if str(payload.get("prompt") or "").strip():
         patch["prompt"] = str(payload.get("prompt") or "").strip()
     if "enabled" in payload:
-        patch["enabled"] = bool(payload.get("enabled"))
+        enabled = bool(payload.get("enabled"))
+        patch["enabled"] = enabled
+        if enabled:
+            patch["expired_at"] = ""
     trigger = payload.get("trigger") or payload.get("schedule")
     if isinstance(trigger, dict):
         merged_schedule = dict(current.get("schedule") or {})
@@ -4582,14 +4930,28 @@ def update_workspace_schedule_from_action(root: str, target: str, payload: Dict[
         patch["schedule"] = normalized_spec
         patch["schedule_text"] = format_schedule_spec(normalized_spec)
         patch["last_run_key"] = ""
+    elif "enabled" in payload and bool(payload.get("enabled")) and not bool(current.get("enabled", True)):
+        current_schedule = dict(current.get("schedule") or {})
+        current_schedule["run_at"] = datetime.now().isoformat(timespec="seconds")
+        normalized_spec = normalize_schedule_spec(current_schedule)
+        if not normalized_spec:
+            raise RuntimeError("计划触发器不完整，无法立即开启。")
+        patch["schedule"] = normalized_spec
+        patch["schedule_text"] = format_schedule_spec(normalized_spec)
+        patch["last_run_key"] = ""
+        patch["_schedule_action_note"] = "已安排立即执行"
     if not patch:
         raise RuntimeError("没有可更新的计划字段。")
+    action_note = str(patch.pop("_schedule_action_note", "") or "")
     if not update_workspace_schedule(root, resolved, patch):
         raise RuntimeError(f"修改计划失败：{target}")
-    return next(
+    updated = next(
         (item for item in load_workspace_schedules(root) if str(item.get("id") or "") == resolved),
         current,
     )
+    if action_note:
+        updated["_schedule_action_note"] = action_note
+    return updated
 
 
 def schedule_run_key(schedule_item: Dict[str, object], now: datetime) -> str:
@@ -4635,8 +4997,9 @@ def expire_workspace_schedule(root: str, schedule_id: str, when: Optional[dateti
     })
 
 
-def schedule_run_thread_id(schedule_id: str, run_key: str) -> str:
-    return safe_thread_id(f"schedule-{schedule_id}-{run_key}")
+def schedule_run_thread_id(schedule_id: str, run_key: str = "") -> str:
+    del run_key
+    return safe_thread_id(f"schedule-{schedule_id or 'schedule'}")
 
 
 def sanitize_schedule_user_request(text: str) -> str:
@@ -6378,6 +6741,11 @@ class ExecuteWorker(QThread):
                 outputs.append(f"[{i}] ⏹️ 已停止后续命令")
                 self.output_signal.emit(outputs[-1])
                 break
+            cmd = strip_provider_ui_artifacts_from_command(cmd)
+            if not cmd.strip():
+                outputs.append(f"[{i}] ⚠️ 跳过空命令")
+                self.output_signal.emit(outputs[-1])
+                continue
             display_cmd = command_for_log(cmd)
             target = plain_cd_target(cmd, cwd)
             if target is not None:
@@ -6402,6 +6770,15 @@ class ExecuteWorker(QThread):
                 continue
             if is_interactive_shell_command(cmd):
                 outputs.append(f"[{i}] ⚠️ 跳过交互式 Shell: {display_cmd}")
+                self.output_signal.emit(outputs[-1])
+                continue
+            syntax_error = validate_shell_command_syntax(cmd)
+            if syntax_error:
+                outputs.append(
+                    f"[{i}] ⛔ 命令块未执行: {display_cmd}\n"
+                    f"{syntax_error}\n"
+                    "请让 AI 重新输出一个完整的 ```bash 命令块；不要继续执行被截断的片段。"
+                )
                 self.output_signal.emit(outputs[-1])
                 continue
             if is_long_running(cmd):
@@ -7092,6 +7469,13 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
             return
         if pid <= 0:
             return
+        logger.warning("Stopping automation provider pid=%s", pid)
+        provider_pgid = 0
+        if platform.system() != "Windows":
+            try:
+                provider_pgid = os.getpgid(pid)
+            except OSError:
+                provider_pgid = 0
         try:
             if platform.system() == "Windows":
                 subprocess.run(
@@ -7107,11 +7491,25 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
             pass
         deadline = time.time() + 6
         while time.time() < deadline:
-            if not self.health():
+            if not process_alive(pid):
                 break
             time.sleep(0.2)
+        if platform.system() != "Windows" and provider_pgid > 0 and provider_pgid != os.getpgrp():
+            try:
+                # Uvicorn gets a graceful SIGTERM first; the process group is only
+                # a safety net for Playwright/Chrome children that outlive it.
+                os.killpg(provider_pgid, signal.SIGKILL if process_alive(pid) else signal.SIGTERM)
+            except Exception:
+                pass
         try:
-            os.remove(self.pid_file)
+            current_pid = 0
+            try:
+                with open(self.pid_file, "r", encoding="utf-8") as f:
+                    current_pid = int(f.read().strip() or "0")
+            except (OSError, ValueError):
+                current_pid = pid
+            if current_pid == pid:
+                os.remove(self.pid_file)
         except OSError:
             pass
 
@@ -7625,6 +8023,7 @@ def extract_wechat_schedule_trigger_payloads(text: str) -> tuple[List[Dict[str, 
         if not upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE:") and not upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE："):
             continue
         _, _, tail = stripped.partition(":" if ":" in stripped else "：")
+        tail = terminal_extension_payload_text(tail)
         try:
             payload = json.loads(tail.strip())
         except json.JSONDecodeError as exc:
@@ -7646,6 +8045,7 @@ def extract_wechat_schedule_action_payloads(text: str) -> tuple[List[Dict[str, o
         if not upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION:") and not upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION："):
             continue
         _, _, tail = stripped.partition(":" if ":" in stripped else "：")
+        tail = terminal_extension_payload_text(tail)
         try:
             payload = json.loads(tail.strip())
         except json.JSONDecodeError as exc:
@@ -7671,6 +8071,7 @@ def apply_schedule_extension_payloads(
     *,
     notify_user: str = "",
     notify_context_token: str = "",
+    notify_thread_id: str = "",
 ) -> tuple[List[str], List[str], List[str]]:
     created_schedules: List[str] = []
     schedule_action_replies: List[str] = []
@@ -7682,6 +8083,7 @@ def apply_schedule_extension_payloads(
                 payload,
                 notify_user=notify_user,
                 notify_context_token=notify_context_token,
+                notify_thread_id=notify_thread_id,
             )
             created_schedules.append(f"{schedule_item.get('title')}（{format_schedule_time(schedule_item)}）")
         except Exception as exc:
@@ -7708,7 +8110,9 @@ def apply_schedule_extension_payloads(
                 continue
             try:
                 updated = update_workspace_schedule_from_action(root, target, payload)
-                schedule_action_replies.append(f"已修改计划：{updated.get('title')}（{format_schedule_time(updated)}）")
+                note = str(updated.get("_schedule_action_note") or "").strip()
+                note_suffix = f"，{note}" if note else ""
+                schedule_action_replies.append(f"已修改计划：{updated.get('title')}（{format_schedule_time(updated)}）{note_suffix}")
             except Exception as exc:
                 schedule_errors.append(str(exc))
             continue
@@ -7731,19 +8135,51 @@ def schedule_extension_reply(
     return "\n\n".join(part for part in parts if part).strip()
 
 
+def terminal_extension_command_for_log(directive: str) -> str:
+    stripped = str(directive or "").strip()
+    upper = stripped.upper()
+    if upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE:") or upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE："):
+        _, _, tail = stripped.partition(":" if ":" in stripped else "：")
+        return "schedule create " + tail.strip()
+    if upper.startswith("AGENT_WECHAT_SEND_FILE:") or upper.startswith("AGENT_WECHAT_SEND_FILE："):
+        _, _, tail = stripped.partition(":" if ":" in stripped else "：")
+        return "wx send_file " + tail.strip()
+    if upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION:") or upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION："):
+        _, _, tail = stripped.partition(":" if ":" in stripped else "：")
+        try:
+            payload = json.loads(terminal_extension_payload_text(tail))
+        except Exception:
+            return "schedule action " + tail.strip()
+        if isinstance(payload, dict):
+            action = str(payload.get("action") or "").strip().lower()
+            if action == "list":
+                return "schedule list"
+            if action == "delete":
+                target = str(payload.get("target") or payload.get("id") or payload.get("title") or "").strip()
+                return "schedule delete " + target
+            if action == "update":
+                return "schedule update " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return "schedule action " + tail.strip()
+    return stripped
+
+
+def terminal_extension_execution_log(directives: List[str], output: str) -> str:
+    commands = [terminal_extension_command_for_log(item) for item in directives if str(item or "").strip()]
+    lines = ["Terminal extension execution:"]
+    if commands:
+        lines.append("Commands:")
+        lines.extend(f"$ {cmd}" for cmd in commands)
+    lines.append("")
+    lines.append("Output:")
+    lines.append(str(output or "").strip() or "扩展指令已处理，未返回额外输出。")
+    return "\n".join(lines).strip()
+
+
 def strip_wechat_send_file_markers(text: str) -> str:
     lines = []
     for line in str(text or "").splitlines():
         stripped = line.strip()
-        upper = stripped.upper()
-        if (
-            upper.startswith("AGENT_WECHAT_SEND_FILE:")
-            or upper.startswith("AGENT_WECHAT_SEND_FILE：")
-            or upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE:")
-            or upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE：")
-            or upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION:")
-            or upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION：")
-        ):
+        if is_terminal_extension_internal_directive_line(stripped):
             continue
         if normalize_terminal_extension_directive(stripped):
             continue
@@ -7769,15 +8205,7 @@ def echoed_wechat_trigger_lines(text: str) -> List[str]:
             return []
         payload = match.group(1).strip()
         payload = payload.strip("\"'")
-        upper = payload.upper()
-        if not (
-            upper.startswith("AGENT_WECHAT_SEND_FILE:")
-            or upper.startswith("AGENT_WECHAT_SEND_FILE：")
-            or upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE:")
-            or upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE：")
-            or upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION:")
-            or upper.startswith("AGENT_WECHAT_SCHEDULE_ACTION：")
-        ):
+        if not is_terminal_extension_internal_directive_line(payload):
             return []
         triggers.append(payload)
     return triggers if saw_effective_line else []
@@ -10234,8 +10662,10 @@ class ThreadCard(QFrame):
 
     def apply_style(self):
         bg = COLORS["accent_light"] if self.active else COLORS["surface"]
-        border = "#d8d0ff" if self.active else COLORS["border"]
+        border = COLORS["accent"] if self.active else COLORS["border"]
         color = COLORS["accent_dark"] if self.active else COLORS["text"]
+        hover_bg = COLORS["accent_light"] if self.active else COLORS["surface_alt"]
+        hover_border = COLORS["accent"] if self.active else COLORS["border_strong"]
         self.setStyleSheet(f"""
             QFrame#threadCard {{
                 background: {bg};
@@ -10243,11 +10673,37 @@ class ThreadCard(QFrame):
                 border-radius: 12px;
             }}
             QFrame#threadCard:hover {{
-                background: {COLORS['surface_alt'] if not self.active else '#e7ddff'};
-                border-color: #d8d0ff;
+                background: {hover_bg};
+                border-color: {hover_border};
             }}
         """)
         self.title_label.setStyleSheet(f"background: transparent; border: none; color: {color}; font-size: 12px; font-weight: 900;")
+        self.title_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: {COLORS['surface']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['accent']};
+                border-radius: 8px;
+                padding: 4px 6px;
+                font-size: 12px;
+                font-weight: 900;
+            }}
+        """)
+        self.delete_btn.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {COLORS['muted']};
+                border: none;
+                border-radius: 8px;
+                font-size: 17px;
+                font-weight: 900;
+                padding-bottom: 1px;
+            }}
+            QToolButton:hover {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text']};
+            }}
+        """)
         self.delete_btn.setVisible(self.deletable and self.active and not self._editing_title)
 
     def begin_title_edit(self):
@@ -10341,6 +10797,7 @@ class SkillCard(QFrame):
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
         title = QLabel(str(self.skill.get("name") or self.skill_id or "skill"))
+        self.title_label = title
         title.setStyleSheet(f"background: transparent; border: none; color: {COLORS['text']}; font-size: 12px; font-weight: 900;")
         title.setWordWrap(True)
         title.setMaximumHeight(34)
@@ -10371,10 +10828,16 @@ class SkillCard(QFrame):
         description = str(self.skill.get("description") or "").strip()
         if description:
             desc = QLabel(description)
+            self.desc_label = desc
             desc.setWordWrap(True)
             desc.setMaximumHeight(48)
             desc.setStyleSheet(f"background: transparent; border: none; color: {COLORS['text_secondary']}; font-size: 11px;")
             layout.addWidget(desc)
+        else:
+            self.desc_label = None
+        self.apply_style()
+
+    def apply_style(self):
         self.setStyleSheet(f"""
             QFrame#skillCard {{
                 background: {COLORS['surface']};
@@ -10383,9 +10846,12 @@ class SkillCard(QFrame):
             }}
             QFrame#skillCard:hover {{
                 background: {COLORS['surface_alt']};
-                border-color: #d8d0ff;
+                border-color: {COLORS['accent']};
             }}
         """)
+        self.title_label.setStyleSheet(f"background: transparent; border: none; color: {COLORS['text']}; font-size: 12px; font-weight: 900;")
+        if self.desc_label is not None:
+            self.desc_label.setStyleSheet(f"background: transparent; border: none; color: {COLORS['text_secondary']}; font-size: 11px;")
 
     def enterEvent(self, event):
         super().enterEvent(event)
@@ -10483,6 +10949,7 @@ class Sidebar(QFrame):
         threads_layout.setSpacing(8)
         add_row = QHBoxLayout()
         label = QLabel("会话")
+        self.thread_section_label = label
         label.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900; background: transparent; border: none;")
         add_row.addWidget(label)
         add_row.addStretch()
@@ -10528,6 +10995,7 @@ class Sidebar(QFrame):
         skills_layout.setContentsMargins(0, 0, 0, 0)
         skills_layout.setSpacing(8)
         skill_label = QLabel("技能")
+        self.skill_section_label = skill_label
         skill_label.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900; background: transparent; border: none;")
         skills_layout.addWidget(skill_label)
         self.skill_list = QWidget()
@@ -10596,6 +11064,64 @@ class Sidebar(QFrame):
             }}
         """
 
+    def apply_theme_style(self):
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['sidebar_bg']};
+                border: none;
+            }}
+        """)
+        self.root_label.setStyleSheet(f"""
+            QLabel {{
+                background: {COLORS['surface']};
+                color: {COLORS['text_secondary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+                padding: 10px 12px;
+                font-size: 12px;
+            }}
+        """)
+        for label in (getattr(self, "thread_section_label", None), getattr(self, "skill_section_label", None)):
+            if label is not None:
+                label.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900; background: transparent; border: none;")
+        self.add_thread_btn.setStyleSheet(f"""
+            QToolButton {{
+                background: {COLORS['accent']};
+                color: white;
+                border: none;
+                border-radius: 10px;
+                font-size: 18px;
+                font-weight: 900;
+            }}
+            QToolButton:hover {{
+                background: {COLORS['accent_dark']};
+            }}
+        """)
+        self.bottom_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['surface']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+                padding: 10px 12px;
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{
+                background: {COLORS['accent_light']};
+                color: {COLORS['accent_dark']};
+                border-color: {COLORS['accent']};
+            }}
+        """)
+        self.thread_scroll.setStyleSheet(self.sidebar_list_scroll_style())
+        self.skill_scroll.setStyleSheet(self.sidebar_list_scroll_style())
+        self.apply_tree_style()
+        self.set_tab(self._active_tab)
+        for card in self.thread_cards.values():
+            card.apply_style()
+        for card in self.skill_cards.values():
+            card.apply_style()
+
     def create_nav_button(self, text: str) -> QPushButton:
         btn = QPushButton(text, cursor=Qt.PointingHandCursor)
         btn.setFixedHeight(30)
@@ -10605,9 +11131,9 @@ class Sidebar(QFrame):
     def nav_button_style(self, active: bool) -> str:
         return f"""
             QPushButton {{
-                background: {'#ebe6ff' if active else 'transparent'};
+                background: {COLORS['accent_light'] if active else 'transparent'};
                 color: {COLORS['accent_dark'] if active else COLORS['text']};
-                border: 1px solid {'#d8d0ff' if active else 'transparent'};
+                border: 1px solid {COLORS['accent'] if active else 'transparent'};
                 border-radius: 9px;
                 padding: 4px 6px;
                 font-size: 12px;
@@ -10638,15 +11164,7 @@ class Sidebar(QFrame):
         else:
             self.bottom_btn.clicked.connect(lambda: self.refresh_tree(self._root_path))
 
-    def setup_tree(self):
-        self.tree.setHeaderHidden(True)
-        self.tree.setRootIsDecorated(False)
-        self.tree.setIndentation(22)
-        self.tree.setAnimated(True)
-        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.tree.setAllColumnsShowFocus(False)
-        self.tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    def apply_tree_style(self):
         self.tree.setStyleSheet(f"""
             QTreeWidget {{
                 background: {COLORS['surface']};
@@ -10669,9 +11187,9 @@ class Sidebar(QFrame):
             QTreeWidget::item:selected,
             QTreeWidget::item:selected:active,
             QTreeWidget::item:selected:!active {{
-                background: #ebe6ff;
+                background: {COLORS['accent_light']};
                 color: {COLORS['accent_dark']};
-                border: 1px solid #d8d0ff;
+                border: 1px solid {COLORS['accent']};
             }}
             QTreeWidget::branch,
             QTreeView::branch {{
@@ -10713,6 +11231,17 @@ class Sidebar(QFrame):
                 height: 0;
             }}
         """)
+
+    def setup_tree(self):
+        self.tree.setHeaderHidden(True)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setIndentation(22)
+        self.tree.setAnimated(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tree.setAllColumnsShowFocus(False)
+        self.tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.apply_tree_style()
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
         self.tree.itemClicked.connect(self.on_item_click)
@@ -11102,6 +11631,11 @@ class ChatPage(QWidget):
         self.history_entries: List[Dict[str, object]] = []
         self.result_bubble: Optional[ExecutionLogPanel] = None
         self.worker: Optional[ExecuteWorker] = None
+        self.worker_thread_id = ""
+        self.thread_run_states: Dict[str, Dict[str, object]] = {}
+        self.thread_execution_workers: Dict[str, ExecuteWorker] = {}
+        self.thread_execution_outputs: Dict[str, List[str]] = {}
+        self.thread_execution_bubbles: Dict[str, ExecutionLogPanel] = {}
         self.automation_manager = AutomationProviderManager()
         self.wechat_bridge = WeChatBridge(self)
         self.wechat_bridge.request_signal.connect(self.handle_wechat_bridge_request)
@@ -11121,6 +11655,8 @@ class ChatPage(QWidget):
         self.automation_context_mode = automation_context_mode_setting()
         self.automation_context_worker: Optional[AutomationContextBuildWorker] = None
         self.automation_worker: Optional[AutomationChatWorker] = None
+        self.thread_automation_context_workers: Dict[str, AutomationContextBuildWorker] = {}
+        self.thread_automation_workers: Dict[str, AutomationChatWorker] = {}
         self.automation_request_serial = 0
         self.automation_preview_worker: Optional[AutomationPreviewWorker] = None
         self.automation_preview_retired_workers: List[AutomationPreviewWorker] = []
@@ -11142,6 +11678,7 @@ class ChatPage(QWidget):
         self.history_save_timer.setSingleShot(True)
         self.history_save_timer.timeout.connect(self.flush_history_save)
         self.history_save_worker: Optional[HistorySaveWorker] = None
+        self.history_save_workers: List[HistorySaveWorker] = []
         self.history_save_dirty = False
         self.history_save_generation = 0
         self.pending_provider_io: Optional[Dict[str, object]] = None
@@ -11159,6 +11696,8 @@ class ChatPage(QWidget):
         self.automation_loop_goal = ""
         self.active_schedule_id = ""
         self.active_schedule_notify: Dict[str, str] = {}
+        self.active_schedule_started_at = 0.0
+        self.active_schedule_run_key = ""
         self.schedule_timer = QTimer(self)
         self.schedule_timer.setInterval(30000)
         self.schedule_timer.timeout.connect(self.check_due_schedules)
@@ -11179,6 +11718,7 @@ class ChatPage(QWidget):
         self.last_automation_provider_compaction = "none"
         self.last_automation_history_compacted = False
         self._last_context_compaction_notice_at = 0.0
+        self._shutdown_done = False
         self.chat_column_max_width = 1480
         self.chat_column_width_ratio = 0.94
         self.user_bubble_width_ratio = 0.75
@@ -11921,6 +12461,7 @@ class ChatPage(QWidget):
                     request_id=request_id,
                     notify_wechat_user=str((payload or {}).get("to_user") or (payload or {}).get("user") or "").strip(),
                     notify_wechat_context_token=str((payload or {}).get("context_token") or "").strip(),
+                    notify_wechat_thread_id=self.thread_id,
                 )
                 return
             if action == "message":
@@ -11961,6 +12502,16 @@ class ChatPage(QWidget):
             }
             self.handle_wechat_bridge_request(payload_for_command)
             return
+        if self.is_automation_busy() or self.is_execution_running():
+            reply = "请稍后再发，目前有其他请求正在生成中。"
+            self.wechat_bridge.finish_request(request_id, {
+                "ok": True,
+                "busy": True,
+                "reply": reply,
+                "text": reply,
+                "thread_id": self.thread_id,
+            })
+            return
         requested_thread_id = str(payload.get("thread_id") or payload.get("conversation_id") or "").strip()
         if requested_thread_id and safe_thread_id(requested_thread_id) != self.thread_id:
             target_thread_id = safe_thread_id(requested_thread_id)
@@ -11969,11 +12520,7 @@ class ChatPage(QWidget):
                 thread = ensure_workspace_thread(self.project_root, self.threads, target_thread_id, "微信会话")
                 self.threads = load_workspace_threads(self.project_root)
                 self.sidebar.set_threads(self.threads, self.thread_id)
-            if self.is_automation_busy() or self.is_execution_running():
-                raise RuntimeError("当前还有任务在运行，无法切换会话。")
             self.switch_thread(target_thread_id)
-        if self.is_automation_busy() or self.is_execution_running():
-            raise RuntimeError("当前还有任务在运行，可发送 /stop 停止当前 AI 输出或执行。")
         if not self.automation_enabled:
             dep = self.automation_manager.dependency_status()
             if not dep.get("ready"):
@@ -12082,10 +12629,13 @@ class ChatPage(QWidget):
                 schedule_actions,
                 notify_user=notify_user,
                 notify_context_token=notify_context_token,
+                notify_thread_id=self.thread_id if allow_file_delivery else "",
             )
             created_schedules.extend(created)
             schedule_action_replies.extend(action_replies)
             schedule_errors.extend(errors)
+            if created or action_replies:
+                QTimer.singleShot(1200, self.check_due_schedules)
         if allow_file_delivery and self.project_root:
             for target in requested_files[:3]:
                 path = resolve_project_file_target(self.project_root, target)
@@ -12124,6 +12674,7 @@ class ChatPage(QWidget):
         request_id: str = "",
         notify_wechat_user: str = "",
         notify_wechat_context_token: str = "",
+        notify_wechat_thread_id: str = "",
     ):
         if not self.project_root:
             raise RuntimeError("尚未打开工作区。")
@@ -12134,10 +12685,12 @@ class ChatPage(QWidget):
         try:
             schedule_item = create_workspace_schedule(self.project_root, raw_title, raw_request, hour, minute)
             if notify_wechat_user and notify_wechat_context_token:
+                notify_wechat_thread_id = str(notify_wechat_thread_id or "").strip()
                 update_workspace_schedule(self.project_root, str(schedule_item.get("id") or ""), {
                     "notify_wechat_enabled": True,
                     "notify_wechat_user": notify_wechat_user,
                     "notify_wechat_context_token": notify_wechat_context_token,
+                    "notify_wechat_thread_id": safe_thread_id(notify_wechat_thread_id) if notify_wechat_thread_id else "",
                 })
                 schedule_item = next(
                     (
@@ -12183,6 +12736,8 @@ class ChatPage(QWidget):
         self.automation_loop_goal = ""
         self.active_schedule_id = ""
         self.active_schedule_notify = {}
+        self.active_schedule_started_at = 0.0
+        self.active_schedule_run_key = ""
         self.refresh_prompt_bubble_buttons()
         self.update_automation_composer_state()
         if message:
@@ -13055,7 +13610,12 @@ class ChatPage(QWidget):
         """
 
     def apply_chat_visual_settings(self):
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(app_global_style())
         self.setStyleSheet(f"background: {COLORS['bg']};")
+        if hasattr(self, "sidebar"):
+            self.sidebar.apply_theme_style()
         if self.settings_btn is not None:
             self.settings_btn.setIcon(line_icon("settings", COLORS["text"], 18))
             self.settings_btn.setStyleSheet(f"""
@@ -13135,6 +13695,12 @@ class ChatPage(QWidget):
         dialog = QDialog(self)
         dialog.setWindowTitle("偏好设置")
         dialog.setMinimumWidth(460)
+        dialog.setStyleSheet(f"""
+            QDialog {{
+                background: {COLORS['bg_top']};
+                color: {COLORS['text']};
+            }}
+        """)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(12)
@@ -14463,6 +15029,53 @@ class ChatPage(QWidget):
         self.add_chat_widget(bubble, animate=True)
         self.scroll_to_bottom()
 
+    def add_execution_result_entry(self, content: str, *, context_content: str = ""):
+        content = str(content or "").strip()
+        if not content:
+            return
+        result_bubble = ExecutionLogPanel(
+            content,
+            parent=self.chat_container,
+            max_content_height=210,
+            title="执行结果",
+        )
+        self.add_chat_widget(result_bubble, animate=True)
+        context = context_content or build_execution_context_content(content, [])
+        self.append_history({
+            "type": "result",
+            "content": content,
+            "context_content": context,
+            "changes": [],
+            "undone": False,
+        })
+        self.scroll_to_bottom()
+
+    def send_wechat_files_to_last_target(self, file_targets: List[str]) -> tuple[List[str], List[str]]:
+        sent_files: List[str] = []
+        failed_files: List[str] = []
+        if not file_targets:
+            return sent_files, failed_files
+        if not wechat_bridge_enabled_setting():
+            return sent_files, ["微信本地接口未开启"]
+        if not self.project_root:
+            return sent_files, ["尚未打开工作区"]
+        target_info = last_wechat_reply_target()
+        to_user = str(target_info.get("to_user") or "").strip()
+        context_token = str(target_info.get("context_token") or "").strip()
+        if not to_user or not context_token:
+            return sent_files, ["缺少最近微信回复上下文"]
+        for target in file_targets[:3]:
+            path = resolve_project_file_target(self.project_root, target)
+            if not path:
+                failed_files.append(f"未找到文件：{target}")
+                continue
+            try:
+                self.wechat_connector._send_file(to_user, path, context_token)
+                sent_files.append(os.path.relpath(path, self.project_root))
+            except Exception as exc:
+                failed_files.append(f"{target}（{exc}）")
+        return sent_files, failed_files
+
     def schedule_execution_prompt(self, schedule_item: Dict[str, object]) -> str:
         title = str(schedule_item.get("title") or "定时计划").strip()
         prompt = str(schedule_item.get("prompt") or "").strip()
@@ -14482,7 +15095,7 @@ class ChatPage(QWidget):
             wechat_note = (
                 "\n\n本计划完成后会通知微信用户。完成时用 AGENT_DONE 加一段面向用户的简短结论；"
                 "程序会把这段结论发到微信。若本次生成了用户应直接查看的报告、图片、表格、文档等工作区文件，"
-                "请在最终阶段用命令块单独写 `wx send_file 文件路径`。"
+                "请在最终阶段用命令块写 `wx send_file 文件路径`。"
                 "多个文件用英文逗号分隔；只发送真正有交付价值的文件，不要发送临时脚本或中间缓存。"
                 "`wx send_file` 是发送请求，不代表已经发送完成；输出该命令时不要同时声称已发送。"
             )
@@ -14503,14 +15116,50 @@ class ChatPage(QWidget):
             f"{schedule_skills_catalog_text(self.skills)}"
         )
 
+    def release_stuck_active_schedule_if_needed(self, now: datetime) -> bool:
+        schedule_id = str(getattr(self, "active_schedule_id", "") or "").strip()
+        if not schedule_id:
+            return False
+        if not (self.automation_loop_active or self.is_automation_request_running() or self.is_execution_running()):
+            return False
+        started_at = float(getattr(self, "active_schedule_started_at", 0.0) or 0.0)
+        elapsed = (time.time() - started_at) if started_at > 0 else 0.0
+        active_schedule = next(
+            (item for item in load_workspace_schedules(self.project_root) if str(item.get("id") or "") == schedule_id),
+            None,
+        )
+        title = str((active_schedule or {}).get("title") or "定时计划")
+        next_due = False
+        if active_schedule is not None and schedule_due(active_schedule, now):
+            current_run_key = str(getattr(self, "active_schedule_run_key", "") or "")
+            next_due = schedule_run_key(active_schedule, now) != current_run_key
+        timed_out = elapsed >= SCHEDULE_ACTIVE_RUN_TIMEOUT_SECONDS
+        if not next_due and not timed_out:
+            return False
+        if next_due:
+            message = f"定时计划上一轮未结束，已释放以执行下一次：{title}"
+        else:
+            message = f"定时计划运行超过 {SCHEDULE_ACTIVE_RUN_TIMEOUT_SECONDS // 60} 分钟，已释放：{title}"
+        self.add_status_bubble(message)
+        if self.is_automation_request_running():
+            self.cancel_automation_request()
+        else:
+            if self.is_execution_running() and self.worker is not None:
+                self.worker.requestInterruption()
+            self.stop_automation_loop("", ensure_manual_entry=False)
+        QTimer.singleShot(1500, self.check_due_schedules)
+        return True
+
     def check_due_schedules(self):
         if not self.project_root:
+            return
+        now = datetime.now()
+        if self.release_stuck_active_schedule_if_needed(now):
             return
         if self.is_automation_request_running() or self.is_execution_running():
             return
         if self.automation_loop_active:
             self.stop_automation_loop("", ensure_manual_entry=False)
-        now = datetime.now()
         for schedule_item in load_workspace_schedules(self.project_root):
             if not bool(schedule_item.get("enabled", True)):
                 continue
@@ -14535,8 +15184,8 @@ class ChatPage(QWidget):
             return
         schedule_id = str(schedule_item.get("id") or "schedule").strip() or "schedule"
         title = str(schedule_item.get("title") or "定时计划").strip()
-        thread_id = schedule_run_thread_id(schedule_id, run_key or datetime.now().strftime("%Y%m%d"))
-        thread_title = f"计划：{title} {run_key or datetime.now().strftime('%Y%m%d')}"
+        thread_id = schedule_run_thread_id(schedule_id)
+        thread_title = f"计划：{title}"
         self.flush_history_save(wait=True)
         self.threads = load_workspace_threads(self.project_root)
         ensure_workspace_thread(self.project_root, self.threads, thread_id, thread_title)
@@ -14570,6 +15219,8 @@ class ChatPage(QWidget):
         self.switch_to_schedule_thread(schedule_item, run_key)
         self.active_schedule_id = schedule_id
         self.active_schedule_notify = {}
+        self.active_schedule_started_at = time.time()
+        self.active_schedule_run_key = run_key
         if bool(wechat_bridge_enabled_setting()):
             to_user = str(schedule_item.get("notify_wechat_user") or "").strip()
             context_token = str(schedule_item.get("notify_wechat_context_token") or "").strip()
@@ -14581,6 +15232,7 @@ class ChatPage(QWidget):
                 self.active_schedule_notify = {
                     "to_user": to_user,
                     "context_token": context_token,
+                    "thread_id": str(schedule_item.get("notify_wechat_thread_id") or ""),
                     "title": str(schedule_item.get("title") or "定时计划"),
                 }
         schedule_patch: Dict[str, object] = {
@@ -14615,6 +15267,80 @@ class ChatPage(QWidget):
         self.begin_automation_loop(f"定时计划：{title}")
         self.start_automation_worker(prompt_text, "", None, None, prompt_entry_id)
 
+    def resolve_schedule_wechat_thread_id(self, preferred_thread_id: str, to_user: str = "") -> str:
+        if not self.project_root:
+            return ""
+        threads = normalize_threads(load_workspace_threads(self.project_root))
+        thread_ids = {str(thread.get("id") or "") for thread in threads}
+        raw_preferred = str(preferred_thread_id or "").strip()
+        preferred = safe_thread_id(raw_preferred) if raw_preferred else ""
+        if preferred and preferred in thread_ids:
+            return preferred
+        if to_user:
+            for candidate in (
+                safe_thread_id(to_user),
+                safe_thread_id(f"{to_user}_im_wechat"),
+                safe_thread_id(f"{to_user}-im-wechat"),
+            ):
+                if candidate in thread_ids:
+                    return candidate
+        for thread in reversed(threads):
+            thread_id = str(thread.get("id") or "")
+            title = str(thread.get("title") or "")
+            if thread_id.endswith("_im_wechat") or title == "微信会话":
+                return thread_id
+        return ""
+
+    def append_schedule_event_to_wechat_thread(
+        self,
+        *,
+        preferred_thread_id: str,
+        to_user: str,
+        schedule_id: str,
+        title: str,
+        summary: str,
+        sent_files: List[str],
+        failed_files: List[str],
+        notification_error: str = "",
+    ):
+        if not self.project_root:
+            return
+        thread_id = self.resolve_schedule_wechat_thread_id(preferred_thread_id, to_user)
+        if not thread_id:
+            return
+        now_text = datetime.now().isoformat(timespec="seconds")
+        clean_summary = re.sub(r"\s+", " ", wechat_strip_markdown_code(summary, keep_summary=True)).strip()
+        clean_summary = text_within_utf8_budget(clean_summary or "任务已执行完成。", 1200)
+        lines = [
+            "【定时计划执行】",
+            f"时间：{now_text}",
+            f"计划：{title or '定时计划'}",
+            f"计划ID：{schedule_id}",
+            f"结果：{clean_summary}",
+        ]
+        if sent_files:
+            lines.append("发送文件：" + "、".join(sent_files))
+        if failed_files:
+            lines.append("文件发送失败：" + "、".join(failed_files[:3]))
+        if notification_error:
+            lines.append(f"微信通知失败：{notification_error}")
+        event_text = "\n".join(lines).strip()
+        entry = {
+            "id": uuid.uuid4().hex,
+            "type": "ai",
+            "content": event_text,
+            "context_content": event_text,
+            "created_at": now_text,
+            "schedule_event": True,
+            "schedule_id": schedule_id,
+        }
+        if thread_id == self.thread_id:
+            self.append_history(entry)
+            return
+        entries = load_workspace_history(self.project_root, thread_id)
+        entries.append(entry)
+        save_workspace_history(self.project_root, entries, thread_id)
+
     def finish_active_schedule_success(self, summary: str):
         schedule_id = str(getattr(self, "active_schedule_id", "") or "").strip()
         if not schedule_id or not self.project_root:
@@ -14628,6 +15354,7 @@ class ChatPage(QWidget):
         notify_info = dict(getattr(self, "active_schedule_notify", {}) or {})
         to_user = str(notify_info.get("to_user") or "").strip()
         context_token = str(notify_info.get("context_token") or "").strip()
+        notify_thread_id = str(notify_info.get("thread_id") or "").strip()
         if wechat_bridge_enabled_setting() and (not to_user or not context_token):
             fallback_target = last_wechat_reply_target()
             to_user = to_user or str(fallback_target.get("to_user") or "")
@@ -14638,10 +15365,11 @@ class ChatPage(QWidget):
         reply_text = wechat_strip_markdown_code(clean_summary, keep_summary=True)
         reply_text = re.sub(r"\s+", " ", reply_text).strip()
         reply_text = text_within_utf8_budget(reply_text or "任务已执行完成。", 1600)
+        sent_files: List[str] = []
+        failed_files: List[str] = []
+        notification_error = ""
         try:
-            self.wechat_connector._send_text(to_user, f"定时计划已完成：{title}\n{reply_text}", context_token)
-            sent_files: List[str] = []
-            failed_files: List[str] = []
+            self.wechat_connector._send_text(to_user, f"{reply_text}\n[定时计划已完成：{title}]", context_token)
             for target in requested_files[:3]:
                 path = resolve_project_file_target(self.project_root, target)
                 if not path:
@@ -14657,7 +15385,18 @@ class ChatPage(QWidget):
             if failed_files:
                 self.add_status_bubble("微信计划附件发送失败：" + "、".join(failed_files))
         except Exception as exc:
+            notification_error = str(exc)
             self.add_status_bubble(f"微信计划通知发送失败：{exc}")
+        self.append_schedule_event_to_wechat_thread(
+            preferred_thread_id=notify_thread_id,
+            to_user=to_user,
+            schedule_id=schedule_id,
+            title=title,
+            summary=clean_summary,
+            sent_files=sent_files,
+            failed_files=failed_files,
+            notification_error=notification_error,
+        )
 
     def show_automation_composer(self, focus: bool = False):
         if self.automation_composer is None:
@@ -14807,11 +15546,12 @@ class ChatPage(QWidget):
             return
         if self.automation_input is not None:
             self.automation_input.clear()
-        full_prompt = self.build_system_prompt(text)
-        prompt_entry_id = self.add_automation_user_prompt_bubble(full_prompt, animate=True)
-        self.begin_automation_loop(text)
+        provider_text = self.schedule_thread_manual_prompt(text)
+        full_prompt = self.build_system_prompt(provider_text, marker_user_text=text)
+        prompt_entry_id = self.add_automation_user_prompt_bubble(full_prompt, animate=True, display_text=text)
+        self.begin_automation_loop(provider_text)
         self.start_automation_worker(
-            text,
+            provider_text,
             "",
             None,
             None,
@@ -15075,8 +15815,24 @@ class ChatPage(QWidget):
                 str(preview.get("source") or ""),
             )
 
-    def build_system_prompt(self, user_text: str) -> str:
+    def is_schedule_thread(self) -> bool:
+        return str(self.thread_id or "").startswith("schedule-")
+
+    def schedule_thread_manual_prompt(self, user_text: str) -> str:
+        text = str(user_text or "").strip()
+        if not text or not self.is_schedule_thread():
+            return text
+        return (
+            "用户正在计划任务会话中手动追加新指令。当前输入优先级高于本计划原始任务；"
+            "除非用户明确要求继续执行计划，否则不要按计划任务重新生成内容。\n"
+            "请把上面这句话作为当前临时的系统提示词。\n\n"
+            "然后，我现在的需求是：\n"
+            f"{text}"
+        )
+
+    def build_system_prompt(self, user_text: str, marker_user_text: Optional[str] = None) -> str:
         raw_prompt = user_text.strip()
+        marker_prompt = raw_prompt if marker_user_text is None else str(marker_user_text or "").strip()
         prompt = raw_prompt or "请根据当前工作区创建或修改项目，并输出可直接执行的完整指令。"
         return SYSTEM_PROMPT.format(
             project_root=self.project_root,
@@ -15085,7 +15841,7 @@ class ChatPage(QWidget):
             terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
             terminal_logs_url=(self.wechat_bridge.url().rstrip("/") + "/terminallogs") if hasattr(self, "wechat_bridge") else "http://127.0.0.1:8798/terminallogs",
             **runtime_environment(),
-        ) + f"\n{PROMPT_BUBBLE_MARKER}{base64.b64encode(raw_prompt.encode('utf-8')).decode('ascii')} -->"
+        ) + f"\n{PROMPT_BUBBLE_MARKER}{base64.b64encode(marker_prompt.encode('utf-8')).decode('ascii')} -->"
 
     def build_automation_system_text(self) -> str:
         return SYSTEM_PROMPT.format(
@@ -15769,13 +16525,13 @@ class ChatPage(QWidget):
         entries = copy.deepcopy(self.history_entries)
         worker = HistorySaveWorker(self.project_root, self.thread_id, entries, generation)
         self.history_save_worker = worker
+        self.history_save_workers.append(worker)
         worker.finished_signal.connect(self.on_history_save_finished)
+        worker.finished.connect(lambda w=worker: self.cleanup_history_save_worker(w))
         worker.start()
         if wait:
             worker.wait(3000)
             QApplication.processEvents()
-            if self.history_save_worker is worker and not worker.isRunning():
-                self.history_save_worker = None
 
     def on_history_save_finished(self, generation: int, ok: bool, tmp_path: str):
         worker = self.history_save_worker
@@ -15798,6 +16554,28 @@ class ChatPage(QWidget):
             logger.warning("History save failed generation=%d thread_id=%s", generation, self.thread_id)
         if self.history_save_dirty:
             self.history_save_timer.start(300)
+
+    def cleanup_history_save_worker(self, worker: HistorySaveWorker):
+        try:
+            self.history_save_workers.remove(worker)
+        except ValueError:
+            pass
+        if self.history_save_worker is worker:
+            self.history_save_worker = None
+        worker.deleteLater()
+
+    def wait_for_history_save_workers(self, timeout_ms: int = 3000):
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        workers = list(self.history_save_workers)
+        if self.history_save_worker is not None and self.history_save_worker not in workers:
+            workers.append(self.history_save_worker)
+        for worker in workers:
+            if worker is None:
+                continue
+            remaining = int(max(0.0, deadline - time.monotonic()) * 1000)
+            if worker.isRunning() and remaining > 0:
+                worker.wait(remaining)
+        QApplication.processEvents()
 
     def load_history(self):
         self.flush_history_save(wait=True)
@@ -16014,8 +16792,24 @@ class ChatPage(QWidget):
             styled_warning(self, "清空失败", "无法删除当前工作区的 .agent_qt 缓存目录。")
 
     def shutdown(self):
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         self.flush_history_save(wait=True)
+        self.wait_for_history_save_workers(timeout_ms=5000)
         self.stop_automation_preview(remove_bubble=False)
+        try:
+            self.automation_request_serial += 1
+            for worker in (
+                self.automation_worker,
+                self.automation_context_worker,
+                self.skill_generation_worker,
+            ):
+                if worker is not None:
+                    worker.requestInterruption()
+            self.automation_manager.stop_provider_process()
+        except Exception:
+            logger.warning("Failed to stop automation provider during app shutdown.", exc_info=True)
         if hasattr(self, "wechat_connector"):
             self.wechat_connector.stop(notify=False)
         if hasattr(self, "wechat_bridge"):
@@ -16181,6 +16975,7 @@ class ChatPage(QWidget):
         wechat_trigger_context_text = ""
         done_context_text = ""
         terminal_extension_triggers: List[str] = []
+        terminal_extension_result_log = ""
         if self.automation_loop_active:
             terminal_extension_triggers = terminal_extension_directives_from_text(display_text)
         if self.automation_loop_active and self.wechat_active_request_id:
@@ -16192,6 +16987,7 @@ class ChatPage(QWidget):
                 has_real_command = bool((command_after_strip or "").strip())
                 display_text = stripped_display_text if has_real_command else wechat_trigger_summary(wechat_triggers)
                 if not has_real_command:
+                    terminal_extension_result_log = terminal_extension_execution_log(wechat_triggers, display_text)
                     done_response = True
             else:
                 wechat_triggers = echoed_wechat_trigger_lines(display_text)
@@ -16205,6 +17001,14 @@ class ChatPage(QWidget):
                 if not terminal_extension_triggers:
                     display_text = wechat_trigger_summary(wechat_triggers)
                     done_response = True
+            elif (
+                not done_response
+                and display_text.strip()
+                and not looks_like_incomplete_plain_response(display_text)
+                and not scan_all_code_blocks(display_text)
+            ):
+                done_response = True
+                done_context_text = display_text
         elif self.automation_loop_active and terminal_extension_triggers:
             stripped_display_text = strip_terminal_extension_directives_from_text(display_text)
             blocks_after_strip = scan_all_code_blocks(stripped_display_text)
@@ -16228,13 +17032,25 @@ class ChatPage(QWidget):
                     created.extend(c)
                     action_replies.extend(a)
                     errors.extend(e)
+                    if c or a:
+                        QTimer.singleShot(1200, self.check_due_schedules)
                 else:
                     errors.append("未设置工作区，无法处理定时计划。")
                 display_text = schedule_extension_reply(created, action_replies, errors) or "已处理定时计划。"
+                terminal_extension_result_log = terminal_extension_execution_log(terminal_extension_triggers, display_text)
                 done_response = True
-            elif file_targets and not has_real_command and getattr(self, "active_schedule_notify", None):
+            elif file_targets and not has_real_command:
                 display_text = wechat_trigger_summary(terminal_extension_triggers)
                 done_context_text = (display_text + "\n\n" + "\n".join(terminal_extension_triggers)).strip()
+                if not getattr(self, "active_schedule_notify", None):
+                    sent_files, failed_files = self.send_wechat_files_to_last_target(file_targets)
+                    delivery_parts: List[str] = []
+                    if sent_files:
+                        delivery_parts.append("微信附件已发送：" + "、".join(sent_files))
+                    if failed_files:
+                        delivery_parts.append("微信附件发送失败：" + "；".join(failed_files))
+                    display_text = (display_text + "\n\n" + "\n".join(delivery_parts or ["未发送附件。"])).strip()
+                terminal_extension_result_log = terminal_extension_execution_log(terminal_extension_triggers, display_text)
                 done_response = True
         if done_response and not display_text:
             self.finish_active_schedule_success("任务已执行完成。")
@@ -16278,6 +17094,11 @@ class ChatPage(QWidget):
         QApplication.processEvents()
 
         if done_response:
+            if terminal_extension_result_log:
+                self.add_execution_result_entry(
+                    terminal_extension_result_log,
+                    context_content=build_execution_context_content(terminal_extension_result_log, []),
+                )
             self.finish_active_schedule_success(done_context_text or display_text)
             self.stop_automation_loop("", ensure_manual_entry=True)
             self.scroll_to_bottom()
@@ -16312,7 +17133,29 @@ class ChatPage(QWidget):
         
         if not commands:
             if self.automation_loop_active:
-                self.stop_automation_loop("", ensure_manual_entry=True)
+                rejection_text = (
+                    f"⚠️ 未识别到可执行命令，也没有检测到 {AUTOMATION_DONE_MARKER} 完成标记。\n"
+                    f"自动化循环需要继续时必须输出一个完整的 ```{runtime_environment()['command_block_lang']} "
+                    f"命令块；已完成时必须输出 {AUTOMATION_DONE_MARKER} 加简短总结。"
+                )
+                warning_bubble = ChatBubble(
+                    "system",
+                    rejection_text,
+                    parent=self.chat_container,
+                    scrollable=False,
+                    max_content_height=140,
+                )
+                self.add_chat_widget(warning_bubble, animate=True)
+                context_content = build_execution_context_content(
+                    f"Local execution rejected:\n{rejection_text}",
+                    [],
+                )
+                self.append_history({
+                    "type": "result",
+                    "content": rejection_text,
+                    "context_content": context_content,
+                })
+                self.request_next_automation_step(context_content)
                 self.scroll_to_bottom()
                 return
             warning_bubble = ChatBubble(
@@ -16515,6 +17358,11 @@ class ChatPage(QWidget):
             )
             return
         self.automation_loop_round += 1
+        previous_ai_response = ""
+        for entry in reversed(self.history_entries):
+            if str(entry.get("type") or "") == "ai":
+                previous_ai_response = str(entry.get("context_content") or entry.get("content") or "").strip()
+                break
         prompt = build_automation_feedback_prompt(
             self.project_root,
             self.automation_loop_goal,
@@ -16526,6 +17374,7 @@ class ChatPage(QWidget):
                 and self.wechat_active_to_user
                 and self.wechat_active_context_token
             ),
+            previous_ai_response=previous_ai_response,
         )
         self.start_automation_worker(
             prompt,
@@ -16617,8 +17466,11 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.chat_page)
         self.chat_page.set_project(path)
 
-    def closeEvent(self, event):
+    def shutdown(self):
         self.chat_page.shutdown()
+
+    def closeEvent(self, event):
+        self.shutdown()
         super().closeEvent(event)
 
 def main():
@@ -16626,7 +17478,9 @@ def main():
     app.setStyle("Fusion")
     app.setFont(QFont("PingFang SC", 13))
     app.setStyleSheet(app_global_style())
-    MainWindow().show()
+    window = MainWindow()
+    app.aboutToQuit.connect(window.shutdown)
+    window.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
