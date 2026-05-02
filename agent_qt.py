@@ -6386,9 +6386,14 @@ class TerminalPanel(QWidget):
         self.count_label = QLabel("0 个进程")
         self.count_label.setFixedHeight(22)
         self.count_label.setStyleSheet(f"color: {COLORS['terminal_muted']}; font-size: 11px; background: transparent;")
-        header.addWidget(title)
-        header.addWidget(self.count_label)
-        header.addStretch()
+        self.header_status_label = QLabel("")
+        self.header_status_label.setFixedHeight(22)
+        self.header_status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.header_status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.header_status_label.setStyleSheet(
+            f"color: {COLORS['terminal_muted']}; font-size: 11px; background: transparent;"
+        )
+        self.header_status_label.setVisible(False)
         collapse_btn = QPushButton("─")
         collapse_btn.setFixedSize(26, 22)
         collapse_btn.setCursor(Qt.PointingHandCursor)
@@ -6409,6 +6414,10 @@ class TerminalPanel(QWidget):
         """)
         collapse_btn.clicked.connect(self.collapse)
         header.addWidget(collapse_btn)
+        header.addWidget(title)
+        header.addWidget(self.count_label)
+        header.addStretch()
+        header.addWidget(self.header_status_label, 1)
         layout.addWidget(header_shell, 0, Qt.AlignmentFlag.AlignTop)
         
         self.tab_row_shell = QWidget(self)
@@ -6772,6 +6781,11 @@ class TerminalPanel(QWidget):
 
     def refresh_header(self):
         self.count_label.setText(f"{self.count()} 个进程")
+
+    def set_header_status(self, text: str):
+        message = str(text or "").strip()
+        self.header_status_label.setText(message)
+        self.header_status_label.setVisible(bool(message))
 
 # ============================================================
 # 执行线程
@@ -8558,6 +8572,7 @@ class WeChatConnector(QObject):
         self.monitor_thread: Optional[threading.Thread] = None
         self.login_thread: Optional[threading.Thread] = None
         self._running_lock = threading.Lock()
+        self._direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def is_running(self) -> bool:
         thread = self.monitor_thread
@@ -8609,10 +8624,13 @@ class WeChatConnector(QObject):
             return
         self.status_signal.emit("已清除微信登录信息。")
 
+    def _open_url(self, req: urllib.request.Request, timeout: int):
+        return self._direct_opener.open(req, timeout=timeout)
+
     def _api_get(self, base_url: str, endpoint: str, timeout: int = 15) -> dict:
         url = urllib.parse.urljoin(base_url.rstrip("/") + "/", endpoint)
         req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with self._open_url(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
         payload = json.loads(raw or "{}")
         return payload if isinstance(payload, dict) else {}
@@ -8630,7 +8648,7 @@ class WeChatConnector(QObject):
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(url, data=raw, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with self._open_url(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8", errors="replace")
         payload = json.loads(text or "{}")
         return payload if isinstance(payload, dict) else {}
@@ -8837,7 +8855,7 @@ class WeChatConnector(QObject):
         else:
             raise RuntimeError("缺少微信 CDN 下载参数。")
         req = urllib.request.Request(url, headers={"User-Agent": "AgentQt/5.1"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with self._open_url(req, timeout=60) as resp:
             data = resp.read()
         if aes_key:
             return self._decrypt_aes_ecb(data, self._parse_aes_key(aes_key))
@@ -8888,7 +8906,7 @@ class WeChatConnector(QObject):
             headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(ciphertext))},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with self._open_url(req, timeout=60) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"微信 CDN 上传失败：HTTP {resp.status}")
             response_body = resp.read()
@@ -9018,7 +9036,7 @@ class WeChatConnector(QObject):
             headers["Authorization"] = f"Bearer {api_key}"
         req = urllib.request.Request(f"{bridge_url}/v1/chat/completions", data=raw, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=int(cfg.get("timeout_seconds") or 900) + 30) as resp:
+            with self._open_url(req, timeout=int(cfg.get("timeout_seconds") or 900) + 30) as resp:
                 result = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace").strip()
@@ -11694,7 +11712,7 @@ class ChatPage(QWidget):
         self.wechat_bridge = WeChatBridge(self)
         self.wechat_bridge.request_signal.connect(self.handle_wechat_bridge_request)
         self.wechat_connector = WeChatConnector(self)
-        self.wechat_connector.status_signal.connect(self.add_status_bubble)
+        self.wechat_connector.status_signal.connect(self.handle_wechat_connector_status)
         self.wechat_connector.qr_signal.connect(self.show_wechat_qr_dialog)
         self.wechat_qr_image_workers: List[WeChatQrImageWorker] = []
         self.wechat_active_request_id = ""
@@ -11759,6 +11777,8 @@ class ChatPage(QWidget):
         self._ensure_ai_entry_pending = False
         self._last_status_message = ""
         self._last_status_at = 0.0
+        self._status_bar_override_text = ""
+        self._status_bar_override_until = 0.0
         self.chat_scroll_user_controlled = False
         self.chat_scroll_programmatic = False
         self.chat_scroll_bottom_tolerance = 12
@@ -15092,6 +15112,24 @@ class ChatPage(QWidget):
         self.add_chat_widget(bubble, animate=True)
         self.scroll_to_bottom()
 
+    def set_status_bar_override(self, text: str, duration_ms: int = 12000):
+        self._status_bar_override_text = str(text or "").strip()
+        self._status_bar_override_until = time.time() + max(1, int(duration_ms)) / 1000.0 if self._status_bar_override_text else 0.0
+        self.terminal_panel.set_header_status(self._status_bar_override_text)
+        self.update_status_bar()
+        if self._status_bar_override_text:
+            QTimer.singleShot(max(1, int(duration_ms)), self.update_status_bar)
+
+    def handle_wechat_connector_status(self, text: str):
+        message = str(text or "").strip()
+        if not message:
+            return
+        lowered = message.lower()
+        if any(token in lowered for token in ("微信连接器异常", "微信轮询失败", "微信回复发送失败", "二维码状态查询暂时失败")):
+            self.set_status_bar_override(message, duration_ms=15000)
+            return
+        self.add_status_bubble(message)
+
     def add_execution_result_entry(self, content: str, *, context_content: str = ""):
         content = str(content or "").strip()
         if not content:
@@ -16515,13 +16553,18 @@ class ChatPage(QWidget):
     def update_status_bar(self):
         n = self.terminal_panel.count()
         is_collapsed = self.terminal_panel.maximumHeight() == 0
+        override_active = bool(self._status_bar_override_text and time.time() < self._status_bar_override_until)
         if is_collapsed:
-            self.status_bar.setText(f"终端 · {n} 个进程")
+            self.status_bar.setText(self._status_bar_override_text if override_active else f"终端 · {n} 个进程")
             self.status_bar.setVisible(True)
             self.terminal_resize_handle.setVisible(False)
         else:
             self.status_bar.setVisible(False)
             self.terminal_resize_handle.setVisible(True)
+        if not override_active and self._status_bar_override_text:
+            self._status_bar_override_text = ""
+            self._status_bar_override_until = 0.0
+            self.terminal_panel.set_header_status("")
 
     def resize_terminal_panel(self, height: int):
         was_at_bottom = self.is_chat_at_bottom()
