@@ -279,6 +279,13 @@ LOG_TIMING = os.environ.get("DEEPSEEK_WEB_LOG_TIMING", "1").strip().lower() not 
     "no",
     "",
 }
+DISABLE_SYSTEM_PROXY = os.environ.get("DEEPSEEK_WEB_DISABLE_PROXY", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
 
 STRICT_JSON_FORMAT_PROMPT = (
     "【非常重要，必须严格遵守输出协议】\n"
@@ -2282,6 +2289,11 @@ class DeepSeekWebBridge:
                 "headless": requested_headless,
                 "viewport": {"width": 1440, "height": 960},
             }
+            if DISABLE_SYSTEM_PROXY:
+                launch_options["args"] = [
+                    "--no-proxy-server",
+                    "--proxy-bypass-list=<-loopback>",
+                ]
             if self.browser_channel:
                 launch_options["channel"] = self.browser_channel
             try:
@@ -6125,7 +6137,6 @@ class DeepSeekWebBridge:
         placeholder_wait_limit = max(self.stable_rounds * 4, 10)
         short_fragment_copy_retry_done = False
         short_fragment_extra_wait_rounds = 0
-        incomplete_command_extra_wait_rounds = 0
         best_seen_text = ""
         best_seen_empty_rounds = 0
         best_seen_empty_copy_retry_done = False
@@ -6692,15 +6703,15 @@ class DeepSeekWebBridge:
                             len(copied),
                         )
                         return copied
-                    if incomplete_command_extra_wait_rounds < max(self.stable_rounds * 100, 300):
-                        incomplete_command_extra_wait_rounds += 1
-                        logger.warning(
-                            "DeepSeek wait_for_response postponing incomplete command chars=%d round=%d",
-                            len(current),
-                            incomplete_command_extra_wait_rounds,
-                        )
-                        page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
-                        continue
+                    if trace is not None:
+                        trace.set("response_chars", len(current))
+                        trace.set("response_ready_reason", "dom_incomplete_command_no_postpone")
+                        trace.mark("response_stable")
+                    logger.warning(
+                        "DeepSeek wait_for_response returning DOM text without incomplete-command postponing chars=%d",
+                        len(current),
+                    )
+                    return current
                 if not plain_protocol and looks_like_assistant_payload_candidate(current):
                     copied = self.try_copy_last_assistant_text(page, plain_protocol=plain_protocol)
                     if copied and self._matches_current_request_response_candidate(copied):

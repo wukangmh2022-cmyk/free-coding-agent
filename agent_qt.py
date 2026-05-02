@@ -72,6 +72,14 @@ OFFICIAL_PIP_INDEX_URL = "https://pypi.org/simple"
 logger = logging.getLogger(__name__)
 
 
+def ai_border_color() -> str:
+    return "#d7ccff" if app_theme_setting() == "light" else COLORS["border"]
+
+
+def soft_accent_border_color() -> str:
+    return "#d8d0ff" if app_theme_setting() == "light" else COLORS["border"]
+
+
 def subprocess_no_window_kwargs(extra_creationflags: int = 0) -> Dict[str, object]:
     if platform.system() != "Windows":
         return {}
@@ -270,6 +278,16 @@ def wechat_connector_autostart_setting() -> bool:
 def set_wechat_connector_autostart_setting(enabled: bool):
     settings = load_app_settings()
     settings["wechat_connector_autostart"] = bool(enabled)
+    save_app_settings(settings)
+
+
+def use_system_proxy_setting() -> bool:
+    return bool(load_app_settings().get("use_system_proxy", False))
+
+
+def set_use_system_proxy_setting(enabled: bool):
+    settings = load_app_settings()
+    settings["use_system_proxy"] = bool(enabled)
     save_app_settings(settings)
 
 
@@ -4043,6 +4061,7 @@ def build_automation_feedback_prompt(
 - 如果执行结果提示“命令块不完整”“未闭合的 shell 引号”“unmatched quote”或 shell 语法不完整，优先判断为上一轮输出被截断；重新输出完整命令块即可。多行 `python -c "..."` 是支持的，不要仅因这类错误改写成单行脚本。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作已完成、已生成、已验证或已发送。
 - 涉及统计、表格、数据查找或文件事实时，必须完整读取/计算后再下结论；示例行只能用于判断结构，不能据此编造定量结论、模型结论或总体判断。
+- 如果当前任务本质上是在网上搜索信息、找推荐、查近况、找新闻、查附近吃喝玩乐或收集公开网页内容，而不是操作本地项目文件，请优先直接用自然语言完成网页搜索并给出结论；不要为了搜索而生成本地 shell/python 抓取脚本，除非用户明确要求你写脚本，或目标数据只存在当前工作区/本机文件里。
 - 后台安装/构建/拉取不要当作完成；启动常驻命令时不要加 `&`/`nohup`，等执行结果给出 `Terminal processes:` 摘要后，再使用 `curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'` 查询控制台输出。
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
 {wechat_completion_note}
@@ -4164,6 +4183,7 @@ def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True) -> str
         "- 要查看、删除或修改时间计划：输出命令块。查看写 `schedule list`；删除写 `schedule delete 计划名称、序号或 id`；修改写 `schedule update JSON`，JSON 结构：{\"target\":\"计划名称、序号或 id\",\"enabled\":true,\"trigger\":{\"run_at\":\"YYYY-MM-DD HH:MM:SS\",\"repeat_every_seconds\":3600,\"until_at\":\"YYYY-MM-DD HH:MM:SS\"},\"prompt\":\"可选的新计划内容\",\"title\":\"可选的新标题\"}。`enabled:false` 表示暂停；`enabled:true` 且不带 `trigger` 表示开启并立即安排执行一次；如果只想恢复到未来某个时间，必须同时给 `trigger.run_at`。修改时只写需要变化的字段。如果目标不明确，先简短追问，不要猜。\n"
         "- 要停止/切会话/列列表等控制动作：用户使用 slash/menu 指令时程序会直接处理；自然语言里提到时，你可以解释可用指令。\n"
         "- 如果用户只是问候、闲聊或普通问答，不需要本地命令、文件或计划，直接用简短自然语言回复；不要为了获取时间或构造问候去执行 echo/date。\n"
+        "- 如果用户要你搜索网上信息、找推荐、查新闻、查附近吃喝玩乐或整理公开网页内容，而不是操作本地工作区，请优先直接使用网页搜索能力并用自然语言给出结论；不要为了搜索而生成本地 shell/python 抓取脚本，除非用户明确要求脚本，或目标数据只在当前工作区/本机文件里。\n"
         "如果用户目标不清楚，先做低成本探索；探索后仍缺少关键条件或候选无法判断时，再简短提问。最终给微信的回复会被压缩展示，所以结论要短。"
         f"{file_delivery_note}"
         "如果用户询问菜单、帮助或支持哪些指令，请直接说明这些指令，不要执行项目命令。\n\n"
@@ -6019,7 +6039,7 @@ class ManagedProcess(QWidget):
             QPushButton {{
                 background: {COLORS['surface']};
                 color: {COLORS['accent_dark']};
-                border: 1px solid #d8d0ff;
+                border: 1px solid {soft_accent_border_color()};
                 border-radius: 8px;
                 padding: 3px 10px;
                 font-size: 11px;
@@ -7046,6 +7066,21 @@ class AutomationProviderManager:
 
     def provider_env(self) -> Dict[str, str]:
         env = os.environ.copy()
+        if not use_system_proxy_setting():
+            # Keep the local web provider on a direct network path instead of
+            # inheriting user/global shell proxies. This matches the WeChat
+            # connector behavior and avoids proxy-specific TLS /
+            # connection-closed failures when loading chat.deepseek.com in
+            # Playwright.
+            for proxy_key in (
+                "http_proxy",
+                "https_proxy",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "all_proxy",
+                "ALL_PROXY",
+            ):
+                env.pop(proxy_key, None)
         pythonpath_parts = [self.harness_path(), self.backend_dir]
         if env.get("PYTHONPATH"):
             pythonpath_parts.append(env["PYTHONPATH"])
@@ -7078,6 +7113,7 @@ class AutomationProviderManager:
                 env.setdefault("XIAOMI_MIMO_WEB_BROWSER_CHANNEL", browser_channel)
         env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
         env.setdefault("no_proxy", env["NO_PROXY"])
+        env["DEEPSEEK_WEB_DISABLE_PROXY"] = "0" if use_system_proxy_setting() else "1"
         return env
 
     def run_python_probe(self, python_bin: str, code: str, timeout: int = 20) -> tuple[bool, str]:
@@ -8625,6 +8661,8 @@ class WeChatConnector(QObject):
         self.status_signal.emit("已清除微信登录信息。")
 
     def _open_url(self, req: urllib.request.Request, timeout: int):
+        if use_system_proxy_setting():
+            return urllib.request.urlopen(req, timeout=timeout)
         return self._direct_opener.open(req, timeout=timeout)
 
     def _api_get(self, base_url: str, endpoint: str, timeout: int = 15) -> dict:
@@ -9326,7 +9364,7 @@ class ChatBubble(QFrame):
         self.setObjectName("chatBubblePlainSystemLog" if self.plain_system_log else "chatBubble")
         colors = {
             "user": (COLORS["card_user"], COLORS["border"], "你"),
-            "ai": (COLORS["card_ai"], "#d7ccff", "AI 输出"),
+            "ai": (COLORS["card_ai"], ai_border_color(), "AI 输出"),
             "system": (COLORS["card_system"], COLORS["border"], "执行结果"),
         }
         bg, border, label_text = colors.get(getattr(self, 'role', 'system'), colors["system"])
@@ -9418,7 +9456,7 @@ class ChatBubble(QFrame):
                     QPushButton {{
                         background: {COLORS['surface']};
                         color: {COLORS['accent_dark']};
-                        border: 1px solid #d8d0ff;
+                        border: 1px solid {soft_accent_border_color()};
                         border-radius: 9px;
                         padding: 5px 12px;
                         font-size: 12px;
@@ -9439,7 +9477,7 @@ class ChatBubble(QFrame):
                     QPushButton {{
                         background: {COLORS['surface']};
                         color: {COLORS['accent_dark']};
-                        border: 1px solid #d8d0ff;
+                        border: 1px solid {soft_accent_border_color()};
                         border-radius: 9px;
                         padding: 5px 12px;
                         font-size: 12px;
@@ -10008,7 +10046,7 @@ class ChatBubble(QFrame):
     def refresh_visual_settings(self):
         colors = {
             "user": (COLORS["card_user"], COLORS["border"], "你"),
-            "ai": (COLORS["card_ai"], "#d7ccff" if app_theme_setting() == "light" else COLORS["border"], "AI 输出"),
+            "ai": (COLORS["card_ai"], ai_border_color(), "AI 输出"),
             "system": (COLORS["card_system"], COLORS["border"], "执行结果"),
         }
         bg, border, _label_text = colors.get(getattr(self, 'role', 'system'), colors["system"])
@@ -11101,7 +11139,7 @@ class Sidebar(QFrame):
             QPushButton:hover {{
                 background: {COLORS['accent_light']};
                 color: {COLORS['accent_dark']};
-                border-color: #d6ccff;
+                border-color: {soft_accent_border_color()};
             }}
         """)
         self.bottom_btn.clicked.connect(lambda: self.refresh_tree(self._root_path))
@@ -11510,7 +11548,7 @@ class HomePage(QWidget):
             QLabel {{
                 color: {COLORS['accent_dark']};
                 background: {COLORS['accent_light']};
-                border: 1px solid #dbd2ff;
+                border: 1px solid {soft_accent_border_color()};
                 border-radius: 14px;
                 padding: 7px 13px;
                 font-size: 11px;
@@ -11564,7 +11602,7 @@ class HomePage(QWidget):
                 QLabel {{
                     background: {COLORS['surface']};
                     color: {COLORS['accent_dark']};
-                    border: 1px solid #dcd4ff;
+                    border: 1px solid {soft_accent_border_color()};
                     border-radius: 10px;
                     font-size: 10px;
                     font-weight: 900;
@@ -11587,7 +11625,10 @@ class HomePage(QWidget):
         shell_layout.addWidget(features_frame)
         
         # 目录选择
-        dir_frame = QFrame(styleSheet=f"background: {COLORS['accent_light']}; border-radius: 18px; border: 1px solid #d8d0ff;")
+        dir_frame = QFrame()
+        dir_frame.setStyleSheet(
+            f"background: {COLORS['accent_light']}; border-radius: 18px; border: 1px solid {soft_accent_border_color()};"
+        )
         dir_layout = QVBoxLayout(dir_frame)
         dir_layout.setContentsMargins(18, 16, 18, 16)
         dir_layout.setSpacing(12)
@@ -11602,7 +11643,7 @@ class HomePage(QWidget):
             QLineEdit {{
                 background: {COLORS['surface']};
                 color: {COLORS['text']};
-                border: 1px solid #d7cffc;
+                border: 1px solid {soft_accent_border_color()};
                 border-radius: 12px;
                 padding: 10px 14px;
                 font-size: 13px;
@@ -11621,14 +11662,14 @@ class HomePage(QWidget):
                 QPushButton {{
                     background: {COLORS['surface']};
                     color: {COLORS['text']};
-                    border: 1px solid #d7cffc;
+                    border: 1px solid {soft_accent_border_color()};
                     border-radius: 12px;
                     padding: 10px 14px;
                     font-size: 12px;
                     font-weight: 700;
                 }}
                 QPushButton:hover {{
-                    background: #f7f4ff;
+                    background: {COLORS['surface_alt']};
                     color: {COLORS['accent_dark']};
                 }}
             """)
@@ -11938,7 +11979,7 @@ class ChatPage(QWidget):
             QToolButton:hover {{
                 background: {COLORS['accent_light']};
                 color: {COLORS['accent_dark']};
-                border-color: #d8d0ff;
+                border-color: {soft_accent_border_color()};
             }}
         """)
         path_bar.addWidget(self.settings_btn)
@@ -13790,6 +13831,14 @@ class ChatPage(QWidget):
         )
         layout.addWidget(theme_toggle)
 
+        proxy_toggle = SettingsToggleRow(
+            "使用系统代理",
+            "让 Provider 与微信连接器继承系统 HTTP/HTTPS 代理",
+            use_system_proxy_setting(),
+            parent=dialog,
+        )
+        layout.addWidget(proxy_toggle)
+
         font_label = QLabel("对话字号")
         font_label.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900;")
         layout.addWidget(font_label)
@@ -13847,6 +13896,16 @@ class ChatPage(QWidget):
             self.show_preferences_dialog()
 
         theme_toggle.toggled.connect(on_theme_toggled)
+
+        def on_proxy_toggled(enabled: bool):
+            set_use_system_proxy_setting(enabled)
+            self.add_status_bubble(
+                "已开启系统代理继承：后续 Provider / 微信连接器请求将走系统代理。"
+                if enabled
+                else "已关闭系统代理继承：后续 Provider / 微信连接器请求将直连。"
+            )
+
+        proxy_toggle.toggled.connect(on_proxy_toggled)
 
         row = QHBoxLayout()
         row.addStretch()
@@ -16941,7 +17000,7 @@ class ChatPage(QWidget):
         ai_frame.setStyleSheet(f"""
             QFrame#aiResponseFrame {{
                 background: {COLORS['card_ai']};
-                border: 1px solid #d7ccff;
+                border: 1px solid {ai_border_color()};
                 border-radius: 16px;
                 margin: 4px 0;
             }}
