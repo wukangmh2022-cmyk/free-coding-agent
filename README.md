@@ -118,6 +118,14 @@ body {
 ```text
 .agent_qt/
 ├── schedules.json
+
+## Provider 维护
+
+如果 DeepSeek 网页后续改版，仓库里已经保留了网页 Provider 的回归资产和升级提示词。优先参考：
+
+- [docs/deepseek-web-upgrade-prompt.md](/Users/pippo/github-repo/free-coding-agent/docs/deepseek-web-upgrade-prompt.md)
+- [scripts/run_deepseek_copy_validation.py](/Users/pippo/github-repo/free-coding-agent/scripts/run_deepseek_copy_validation.py)
+- [tests/fixtures/deepseek-copy-validation/web-cases-100.json](/Users/pippo/github-repo/free-coding-agent/tests/fixtures/deepseek-copy-validation/web-cases-100.json)
 ├── skills/
 │   └── <skill-id>/SKILL.md
 └── threads/

@@ -818,15 +818,28 @@ class BridgePool:
         for slot in reversed(self._all):
             self._available.put(slot)
 
-    def prewarm_available(self, spec: ModelSpec, *, limit: int | None = None) -> None:
+    def prewarm_available(
+        self,
+        spec: ModelSpec,
+        *,
+        limit: int | None = None,
+        exclude_slot_indexes: set[int] | None = None,
+    ) -> None:
         if not DEEPSEEK_WEB_PREWARM_POOL:
             return
         limit = self.size if limit is None else max(0, min(limit, self.size))
         if limit <= 0:
             return
+        excluded = set(exclude_slot_indexes or ())
         available_slots = list(getattr(self._available, "queue", []))
-        for slot in available_slots[:limit]:
+        scheduled = 0
+        for slot in available_slots:
+            if slot.index in excluded:
+                continue
             slot.prewarm(_spec_for_bridge_slot(spec, slot))
+            scheduled += 1
+            if scheduled >= limit:
+                break
 
     def acquire(self) -> BridgeSlot:
         admitted = self._admission.acquire(blocking=False)
@@ -1131,7 +1144,11 @@ async def run_on_bridge_slot(
         released_at = time.perf_counter()
         pool.release(slot)
         if prewarm_after:
-            pool.prewarm_available(spec, limit=DEEPSEEK_WEB_PREWARM_SLOTS)
+            pool.prewarm_available(
+                spec,
+                limit=DEEPSEEK_WEB_PREWARM_SLOTS,
+                exclude_slot_indexes={slot.index},
+            )
         logger.warning(
             "provider[%s] %s released bridge slot=%d pool=%s available=%d lifetime_ms=%d",
             request_id,
@@ -2305,7 +2322,7 @@ def _extract_shell_command_from_text(content: str) -> str | None:
     if not stripped:
         return None
 
-    fenced = re.search(r"```(?:bash|sh|shell)\s*\n(.*?)```", stripped, re.IGNORECASE | re.DOTALL)
+    fenced = re.search(r"```(?:bash|sh|shell)\s*\n(.*?)(?:```|\Z)", stripped, re.IGNORECASE | re.DOTALL)
     if fenced:
         command = fenced.group(1).strip()
         if command:

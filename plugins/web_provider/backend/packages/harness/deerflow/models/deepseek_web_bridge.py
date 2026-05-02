@@ -264,7 +264,13 @@ DEFAULT_RESPONSE_TIMEOUT_MS = _env_int("DEEPSEEK_WEB_RESPONSE_TIMEOUT_MS", 600_0
 DEFAULT_MAX_CONTINUE_CLICKS = _env_int("DEEPSEEK_WEB_MAX_CONTINUE_CLICKS", 12, minimum=0, maximum=50)
 DEFAULT_COPY_PROBE_MAX_MS = _env_int("DEEPSEEK_WEB_COPY_PROBE_MAX_MS", 500, minimum=0, maximum=10_000)
 DEFAULT_COPY_CANDIDATE_MAX_DISTANCE = _env_int("DEEPSEEK_WEB_COPY_CANDIDATE_MAX_DISTANCE", 900, minimum=0)
-COPY_TOOLTIP_WAIT_MS = _env_int("DEEPSEEK_WEB_COPY_TOOLTIP_WAIT_MS", 140, minimum=0, maximum=5_000)
+DEFAULT_PLAIN_NO_COPY_STABLE_ROUNDS = _env_int(
+    "DEEPSEEK_WEB_PLAIN_NO_COPY_STABLE_ROUNDS",
+    100,
+    minimum=10,
+    maximum=5_000,
+)
+COPY_TOOLTIP_WAIT_MS = _env_int("DEEPSEEK_WEB_COPY_TOOLTIP_WAIT_MS", 60, minimum=0, maximum=5_000)
 COPY_FALLBACK_CLICK_DISTANCE = _env_int("DEEPSEEK_WEB_COPY_FALLBACK_CLICK_DISTANCE", 80, minimum=0, maximum=2_000)
 LOG_TIMING = os.environ.get("DEEPSEEK_WEB_LOG_TIMING", "1").strip().lower() not in {
     "0",
@@ -4806,9 +4812,25 @@ class DeepSeekWebBridge:
                 probe_id = candidate.get("probeId")
                 if not isinstance(probe_id, str):
                     continue
-                hover_texts = self.read_bottom_action_row_tooltips(page, probe_id)
                 label = str(candidate.get("label") or "").strip()
                 sibling_text = str(candidate.get("siblingText") or "").strip()
+                try:
+                    copy_started = time.perf_counter()
+                    button = page.locator(f'[data-deerflow-bottom-copy-id="{probe_id}"]').first
+                    button.click(timeout=1500)
+                    copied = read_copied_text_fast(max_wait_ms=120)
+                    copied = clean_plain_visible_assistant_text((copied or "").strip())
+                    if copied and not is_prompt_replay_text(copied) and self._matches_current_request_response_candidate(copied):
+                        logger.warning(
+                            "DeepSeek bottom copy capture fast path succeeded probe_id=%s copied_chars=%d copy_read_ms=%d",
+                            probe_id,
+                            len(copied),
+                            int((time.perf_counter() - copy_started) * 1000),
+                        )
+                        return copied
+                except Exception:
+                    logger.debug("Failed fast-path click on DeepSeek bottom message copy candidate.", exc_info=True)
+                hover_texts = self.read_bottom_action_row_tooltips(page, probe_id)
                 attempts.append(
                     {
                         "assistantKind": "bottom_message",
@@ -6489,12 +6511,31 @@ class DeepSeekWebBridge:
                     and not bool(plain_generation_status.get("has_continue"))
                 ) if plain_protocol else True
                 if plain_protocol and not plain_generation_complete:
-                    logger.warning(
-                        "DeepSeek wait_for_response postponing plain stable text while generation controls are busy chars=%d stable_seen=%d status=%s",
-                        len(current),
-                        stable_seen,
-                        json.dumps(plain_generation_status, ensure_ascii=False)[:1200],
+                    no_copy_stable = (
+                        not bool(plain_generation_status.get("has_stop"))
+                        and not bool(plain_generation_status.get("has_continue"))
+                        and not bool(plain_generation_status.get("has_copy"))
                     )
+                    if no_copy_stable and stable_seen >= DEFAULT_PLAIN_NO_COPY_STABLE_ROUNDS:
+                        if trace is not None:
+                            trace.set("response_chars", len(current))
+                            trace.set("response_ready_reason", "plain_no_copy_stable_text")
+                            trace.set("plain_no_copy_stable_seen", stable_seen)
+                            trace.mark("response_stable")
+                        logger.warning(
+                            "DeepSeek wait_for_response returning stable plain text without assistant copy action chars=%d stable_seen=%d status=%s",
+                            len(current),
+                            stable_seen,
+                            json.dumps(plain_generation_status, ensure_ascii=False)[:1200],
+                        )
+                        return current
+                    if stable_seen <= self.stable_rounds or stable_seen % max(DEFAULT_PLAIN_NO_COPY_STABLE_ROUNDS // 5, 10) == 0:
+                        logger.warning(
+                            "DeepSeek wait_for_response postponing plain stable text while generation controls are busy chars=%d stable_seen=%d status=%s",
+                            len(current),
+                            stable_seen,
+                            json.dumps(plain_generation_status, ensure_ascii=False)[:1200],
+                        )
                     page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
                     continue
                 if (
@@ -6594,7 +6635,53 @@ class DeepSeekWebBridge:
                             max_total_ms=max(self.copy_probe_max_ms * 3, 1500),
                             plain_protocol=plain_protocol,
                         )
-                    if copied and not is_suspicious_incomplete_command_text(copied) and (not plain_protocol or not is_likely_truncated_plain_text(copied)) and self._matches_current_request_response_candidate(copied):
+                    if copied and copied == stable_copy_text:
+                        stable_copy_seen += 1
+                    elif copied:
+                        stable_copy_text = copied
+                        stable_copy_seen = 1
+                    else:
+                        stable_copy_text = ""
+                        stable_copy_seen = 0
+                    copied_is_reliable = bool(copied) and not self._is_active_request_echo_text(copied)
+                    if copied_is_reliable and stable_copy_seen >= 2:
+                        if trace is not None:
+                            trace.set("response_chars", len(copied))
+                            trace.set("response_ready_reason", "copy_button_incomplete_command_stable")
+                            trace.set("stable_copy_seen", stable_copy_seen)
+                            trace.mark("response_stable")
+                        logger.warning(
+                            "DeepSeek wait_for_response accepting stable copied text after incomplete-command heuristic current_chars=%d copied_chars=%d stable_copy_seen=%d",
+                            len(current),
+                            len(copied),
+                            stable_copy_seen,
+                        )
+                        return copied
+                    if copied and self._matches_current_request_response_candidate(copied):
+                        if stable_copy_seen >= 3:
+                            if trace is not None:
+                                trace.set("response_chars", len(copied))
+                                trace.set("response_ready_reason", "copy_button_incomplete_command_stable")
+                                trace.set("stable_copy_seen", stable_copy_seen)
+                                trace.mark("response_stable")
+                            logger.warning(
+                                "DeepSeek wait_for_response accepting repeated copied text despite incomplete-command heuristic current_chars=%d copied_chars=%d stable_copy_seen=%d",
+                                len(current),
+                                len(copied),
+                                stable_copy_seen,
+                            )
+                            return copied
+                        if is_suspicious_incomplete_command_text(copied) or (plain_protocol and is_likely_truncated_plain_text(copied)):
+                            if trace is not None:
+                                trace.set("response_chars", len(copied))
+                                trace.set("response_ready_reason", "copy_button_incomplete_command_final")
+                                trace.mark("response_stable")
+                            logger.warning(
+                                "DeepSeek wait_for_response returning final copied text despite incomplete-command heuristic current_chars=%d copied_chars=%d",
+                                len(current),
+                                len(copied),
+                            )
+                            return copied
                         if trace is not None:
                             trace.set("response_chars", len(copied))
                             trace.set("response_ready_reason", "copy_button_incomplete_command_retry")

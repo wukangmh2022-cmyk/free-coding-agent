@@ -1992,6 +1992,16 @@ def scan_all_code_blocks(text: str) -> Dict[str, List[str]]:
         code_lines = []
         pending_placeholder_lang = ""
         pending_placeholder_index = 0
+    if in_code:
+        code = "".join(code_lines)
+        key = canonical_lang(lang)
+        if lang_index > 0:
+            values = blocks.setdefault(key, [])
+            while len(values) < lang_index:
+                values.append("")
+            values[lang_index - 1] = code.strip()
+        else:
+            blocks.setdefault(key, []).append(code.strip())
     return blocks
 
 def placeholder_line_key(match: re.Match) -> str:
