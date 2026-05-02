@@ -3942,6 +3942,51 @@ def looks_like_incomplete_plain_response(text: str) -> bool:
     return normalized in {"text", "plaintext", "markdown"}
 
 
+def looks_like_noop_plain_automation_response(text: str) -> bool:
+    content = str(text or "").strip()
+    if not content:
+        return False
+    if scan_all_code_blocks(content):
+        return False
+    lowered = content.lower()
+    strong_markers = (
+        "无需执行任何操作",
+        "无需执行任何命令",
+        "无需执行命令",
+        "无待执行任务",
+        "无需进一步操作",
+        "用户需求仅为打招呼",
+        "用户只是打招呼",
+        "只是问候",
+        "闲聊对话已完成",
+        "没有需要执行的命令",
+        "no command needs to be run",
+        "no commands need to be run",
+        "no execution needed",
+        "nothing needs to be executed",
+    )
+    if any(marker in content for marker in strong_markers) or any(marker in lowered for marker in strong_markers):
+        return True
+    short_reply_markers = (
+        "谢谢",
+        "感谢",
+        "收到",
+        "好的",
+        "明白",
+        "没问题",
+        "随时为你服务",
+        "有需要直接说",
+    )
+    normalized_lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if (
+        len(content) <= 120
+        and len(normalized_lines) <= 3
+        and any(marker in content for marker in short_reply_markers)
+    ):
+        return True
+    return False
+
+
 def quiet_automation_error_message(error: str) -> str:
     if looks_like_timeout_error(error):
         return "响应超时，自动化任务已暂停。"
@@ -4091,7 +4136,7 @@ def parse_wechat_builtin_command(text: str) -> Dict[str, str]:
     return {}
 
 
-def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True, schedule_summary: str = "") -> str:
+def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True) -> str:
     now = datetime.now()
     file_delivery_note = ""
     if allow_file_delivery:
@@ -4121,7 +4166,6 @@ def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True, schedu
         "- 如果用户只是问候、闲聊或普通问答，不需要本地命令、文件或计划，直接用简短自然语言回复；不要为了获取时间或构造问候去执行 echo/date。\n"
         "如果用户目标不清楚，先做低成本探索；探索后仍缺少关键条件或候选无法判断时，再简短提问。最终给微信的回复会被压缩展示，所以结论要短。"
         f"{file_delivery_note}"
-        f"\n\n当前计划列表：\n{schedule_summary.strip() or '当前没有定时计划。'}"
         "如果用户询问菜单、帮助或支持哪些指令，请直接说明这些指令，不要执行项目命令。\n\n"
         f"用户消息：\n{text.strip()}"
     )
@@ -12551,8 +12595,7 @@ class ChatPage(QWidget):
         self.wechat_active_silent = silent
         self.wechat_active_to_user = to_user if allow_file_delivery else ""
         self.wechat_active_context_token = context_token if allow_file_delivery else ""
-        schedule_summary = schedules_summary_text(load_workspace_schedules(self.project_root)) if self.project_root else "当前没有定时计划。"
-        prompt_text = build_wechat_user_prompt(text, allow_file_delivery=allow_file_delivery, schedule_summary=schedule_summary)
+        prompt_text = build_wechat_user_prompt(text, allow_file_delivery=allow_file_delivery)
         full_prompt = self.build_system_prompt(prompt_text)
         clean_context = f"【微信用户需求】\n{text.strip()}"
         prompt_entry_id = self.add_automation_user_prompt_bubble(
@@ -17143,6 +17186,11 @@ class ChatPage(QWidget):
         
         if not commands:
             if self.automation_loop_active:
+                if looks_like_noop_plain_automation_response(display_text):
+                    self.finish_active_schedule_success(display_text)
+                    self.stop_automation_loop("", ensure_manual_entry=True)
+                    self.scroll_to_bottom()
+                    return
                 rejection_text = (
                     f"⚠️ 未识别到可执行命令，也没有检测到 {AUTOMATION_DONE_MARKER} 完成标记。\n"
                     f"自动化循环需要继续时必须输出一个完整的 ```{runtime_environment()['command_block_lang']} "
