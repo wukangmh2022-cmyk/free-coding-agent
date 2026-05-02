@@ -14310,6 +14310,7 @@ class ChatPage(QWidget):
         try:
             self.wechat_bridge.start()
             set_wechat_bridge_enabled_setting(True)
+            self.ensure_wechat_connector_autostart()
         except Exception:
             logger.warning("WeChat bridge startup failed.", exc_info=True)
             set_wechat_bridge_enabled_setting(False)
@@ -14324,6 +14325,7 @@ class ChatPage(QWidget):
         try:
             url = self.wechat_bridge.start()
             set_wechat_bridge_enabled_setting(True)
+            self.ensure_wechat_connector_autostart()
             self.add_status_bubble(f"微信 Bridge 已启动：{url}")
         except Exception as exc:
             set_wechat_bridge_enabled_setting(False)
@@ -14339,6 +14341,7 @@ class ChatPage(QWidget):
             try:
                 url = self.wechat_bridge.start()
                 set_wechat_bridge_enabled_setting(True)
+                self.ensure_wechat_connector_autostart()
                 if toggle_row is not None:
                     toggle_row.setChecked(True)
                 self.add_status_bubble(f"微信本地接口已开启：{url}")
@@ -14361,6 +14364,13 @@ class ChatPage(QWidget):
     def start_wechat_connector_login(self):
         self.start_wechat_bridge_quietly()
         self.wechat_connector.login_async()
+
+    def ensure_wechat_connector_autostart(self):
+        if not wechat_connector_autostart_setting():
+            return
+        if not self.wechat_connector.account():
+            return
+        QTimer.singleShot(150, self.wechat_connector.start)
 
     def start_wechat_connector_from_menu(self):
         self.start_wechat_bridge_quietly()
@@ -17038,10 +17048,46 @@ class ChatPage(QWidget):
                 blocks_after_strip = scan_all_code_blocks(stripped_display_text)
                 command_after_strip, _command_lang = command_block_from_blocks(blocks_after_strip)
                 has_real_command = bool((command_after_strip or "").strip())
-                display_text = stripped_display_text if has_real_command else wechat_trigger_summary(wechat_triggers)
                 if not has_real_command:
+                    schedule_payloads, schedule_actions, schedule_errors = collect_schedule_extension_payloads(
+                        "\n".join(terminal_extension_triggers)
+                    )
+                    file_targets = extract_wechat_send_file_targets("\n".join(terminal_extension_triggers))
+                    has_schedule_directive = bool(schedule_payloads or schedule_actions or schedule_errors)
+                    if has_schedule_directive:
+                        created: List[str] = []
+                        action_replies: List[str] = []
+                        errors: List[str] = list(schedule_errors)
+                        if self.project_root:
+                            c, a, e = apply_schedule_extension_payloads(
+                                self.project_root,
+                                schedule_payloads,
+                                schedule_actions,
+                            )
+                            created.extend(c)
+                            action_replies.extend(a)
+                            errors.extend(e)
+                            if c or a:
+                                QTimer.singleShot(1200, self.check_due_schedules)
+                        else:
+                            errors.append("未设置工作区，无法处理定时计划。")
+                        display_text = schedule_extension_reply(created, action_replies, errors) or "已处理定时计划。"
+                    elif file_targets:
+                        display_text = wechat_trigger_summary(terminal_extension_triggers)
+                        if not getattr(self, "active_schedule_notify", None):
+                            sent_files, failed_files = self.send_wechat_files_to_last_target(file_targets)
+                            delivery_parts: List[str] = []
+                            if sent_files:
+                                delivery_parts.append("微信附件已发送：" + "、".join(sent_files))
+                            if failed_files:
+                                delivery_parts.append("微信附件发送失败：" + "；".join(failed_files))
+                            display_text = (display_text + "\n\n" + "\n".join(delivery_parts or ["未发送附件。"])).strip()
+                    else:
+                        display_text = wechat_trigger_summary(wechat_triggers)
                     terminal_extension_result_log = terminal_extension_execution_log(wechat_triggers, display_text)
                     done_response = True
+                else:
+                    display_text = stripped_display_text
             else:
                 wechat_triggers = echoed_wechat_trigger_lines(display_text)
             if wechat_triggers:
