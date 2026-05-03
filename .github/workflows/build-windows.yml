@@ -1,0 +1,186 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - codex/with-web-provider-plugin
+    paths:
+      - agent_qt.py
+      - plugins/**
+      - .github/workflows/build-windows.yml
+
+jobs:
+  build-windows:
+    name: Build AgentQT.exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "PySide6>=6.8.0.2" pyinstaller
+
+      - name: Compile check
+        shell: pwsh
+        run: python -m py_compile agent_qt.py
+
+      - name: Verify Windows install commands
+        shell: pwsh
+        run: |
+          @'
+          import agent_qt
+
+          runtime_cmd = agent_qt.build_python_runtime_install_command()
+          assert runtime_cmd.startswith(agent_qt.POWERSHELL_COMMAND_PREFIX), runtime_cmd[:120]
+          assert "$ErrorActionPreference = 'Stop'" in runtime_cmd, runtime_cmd
+          assert "winget install --id Python.Python.3.12" in runtime_cmd, runtime_cmd
+          assert 'TargetDir="$BasePythonDir"' in runtime_cmd, runtime_cmd
+          assert "& $BasePython -m venv $VenvDir" in runtime_cmd, runtime_cmd
+          assert "Scripts" in runtime_cmd and "python.exe" in runtime_cmd, runtime_cmd
+
+          manager = agent_qt.AutomationProviderManager()
+          plugin_cmd = manager.install_dependencies_command()
+          assert plugin_cmd.startswith(agent_qt.POWERSHELL_COMMAND_PREFIX), plugin_cmd[:120]
+          assert "$ErrorActionPreference = 'Stop'" in plugin_cmd, plugin_cmd
+          assert "Set-Location -LiteralPath $BackendDir" in plugin_cmd, plugin_cmd
+          assert "检查系统 Edge/Chrome" in plugin_cmd, plugin_cmd
+          assert 'TargetDir="$BasePythonDir"' in plugin_cmd, plugin_cmd
+          assert "& $BasePython -m venv $VenvDir" in plugin_cmd, plugin_cmd
+          assert "playwright install chromium" in plugin_cmd, plugin_cmd
+          assert "Playwright browser OK" in plugin_cmd, plugin_cmd
+          shell, args = agent_qt.shell_launch_for_command(agent_qt.POWERSHELL_COMMAND_PREFIX + "Write-Host ok", script_path=r"C:\Temp\agent_qt_test.ps1")
+          assert args[:4] == ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"], (shell, args)
+          shell, args = agent_qt.shell_launch_for_command(r"C:\Temp\agent_qt_test.cmd", script_path=r"C:\Temp\agent_qt_test.cmd")
+          assert args[:3] == ["/d", "/c", "call"], (shell, args)
+          print("Windows install command checks OK")
+          '@ | Set-Content -Path verify_windows_install_commands.py -Encoding UTF8
+          python verify_windows_install_commands.py
+
+      - name: Verify frozen exe is not used as Python
+        shell: pwsh
+        run: |
+          python -c "import os, sys, tempfile, agent_qt; sys.frozen = True; sys.executable = r'C:\Users\asus\AppData\Local\Temp\_MEI160042\AgentQT.exe'; manager = agent_qt.AutomationProviderManager(); manager.plugin_root = tempfile.mkdtemp(prefix='agentqt-provider-'); manager.backend_dir = os.path.abspath('plugins/web_provider/backend'); candidates = manager.candidate_pythons(); assert all(os.path.basename(path).lower() != 'agentqt.exe' for path in candidates), candidates; print('Frozen exe skip checks OK:', candidates)"
+
+      - name: Verify Windows workspace storage and tree
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -c "import os, tempfile; from PySide6.QtWidgets import QApplication; import agent_qt; root = tempfile.mkdtemp(prefix='agentqt-win-workspace-'); os.makedirs(os.path.join(root, 'src'), exist_ok=True); open(os.path.join(root, 'src', 'main.py'), 'w', encoding='utf-8').write('print(123)\n'); threads = agent_qt.load_workspace_threads(root); assert agent_qt.save_workspace_threads(root, threads); thread = agent_qt.create_workspace_thread(root, threads); thread_id = str(thread['id']); assert agent_qt.save_last_thread_id(root, thread_id); assert agent_qt.load_last_thread_id(root, agent_qt.load_workspace_threads(root)) == thread_id; entries = [{'id': 'entry-1', 'type': 'prompt', 'content': 'hello'}]; assert agent_qt.save_workspace_history(root, entries, thread_id); assert agent_qt.load_workspace_history(root, thread_id)[0]['content'] == 'hello'; assert os.path.isdir(os.path.join(root, agent_qt.HISTORY_DIR_NAME)); app = QApplication([]); sidebar = agent_qt.Sidebar(); sidebar.refresh_tree(root); assert sidebar.tree.topLevelItemCount() == 1; top = sidebar.tree.topLevelItem(0); assert top.childCount() >= 1; print('Windows workspace cache/tree checks OK:', root)"
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name AgentQT `
+            --add-data "plugins;plugins" `
+            agent_qt.py
+
+      - name: Prepare release zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item dist\AgentQT.exe release\AgentQT.exe
+          Copy-Item README.md release\README.md
+          Copy-Item LICENSE release\LICENSE
+          @'
+          AgentQT Windows 测试版
+
+          运行方式：
+          1. 解压 zip。
+          2. 双击 AgentQT.exe。
+          3. 首次使用自动化插件或 Agent Python 环境时，在设置里点击对应安装按钮。
+
+          CI 已检查：
+          - Windows 版 Python 环境安装命令使用 cmd/bat 语法。
+          - Windows 版自动化插件依赖安装命令使用 cmd/bat 语法。
+          - 自动化 provider 源码已随 exe 打包。
+          '@ | Set-Content -Path release\WINDOWS-README.txt -Encoding UTF8
+          Compress-Archive -Path release\* -DestinationPath AgentQT-Windows.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentQT-Windows
+          path: AgentQT-Windows.zip
+          if-no-files-found: error
+
+  build-macos:
+    name: Build AgentQT.dmg
+    runs-on: macos-latest
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "PySide6>=6.8.0.2" pyinstaller
+
+      - name: Compile check
+        run: python -m py_compile agent_qt.py
+
+      - name: Build app bundle
+        run: |
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            --windowed \
+            --name AgentQT \
+            --add-data "plugins:plugins" \
+            agent_qt.py
+
+      - name: Prepare DMG
+        run: |
+          mkdir -p release
+          cp -R dist/AgentQT.app release/AgentQT.app
+          cp README.md release/README.md
+          cp LICENSE release/LICENSE
+          cat > release/MACOS-README.txt <<'EOF'
+          AgentQT macOS 测试版
+
+          运行方式：
+          1. 打开 DMG。
+          2. 将 AgentQT.app 拖到 Applications，或直接双击运行。
+          3. 如果 macOS Gatekeeper 阻止打开，请在系统设置的“隐私与安全性”中允许打开。
+          4. 首次使用自动化插件或 Agent Python 环境时，在设置里点击对应安装按钮。
+
+          说明：
+          - 这是未签名测试构建。
+          - 自动化 provider 源码已随 app 打包。
+          EOF
+          hdiutil create \
+            -volname "AgentQT" \
+            -srcfolder release \
+            -ov \
+            -format UDZO \
+            AgentQT-macOS.dmg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentQT-macOS
+          path: AgentQT-macOS.dmg
+          if-no-files-found: error

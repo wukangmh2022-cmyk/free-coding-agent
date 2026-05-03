@@ -31,9 +31,72 @@ from deerflow.models.deepseek_web_bridge import DeepSeekWebBridge
 
 logger = logging.getLogger(__name__)
 
+
+def _looks_like_prompt_replay_text(text: str) -> bool:
+    content = str(text or "").strip()
+    if not content:
+        return False
+    lowered = content.lower()
+    markers = (
+        "you are acting as the backend llm for a local openai-compatible",
+        "you are acting as the backend llm for a local bash-only coding runner",
+        "continue the existing deerflow session already initialized in this chat",
+        "continue the existing plain bash agent session already initialized in this chat",
+        "return exactly one json object and nothing else",
+        "plain bash agent 模式",
+    )
+    if any(marker in lowered for marker in markers):
+        return True
+    hints = (
+        "no tools are available for this request",
+        "conversation:\n\n[user]",
+        "new conversation events since the previous request",
+        "runner 会执行你返回的 fenced bash 终端命令块",
+        "available tools (openai tools schema)",
+    )
+    return sum(1 for hint in hints if hint in lowered) >= 2
+
+
+def _looks_like_web_busy_text(text: str) -> bool:
+    raw_content = str(text or "").strip()
+    content = raw_content.lower()
+    if not content:
+        return False
+    if len(raw_content) > 100:
+        return False
+    markers = (
+        "有消息正在生成，请稍后再试",
+        "message is being generated",
+        "response is being generated",
+        "please try again later",
+    )
+    return any(marker in content for marker in markers)
+
+
+def raise_if_web_busy_payload(payload: dict[str, Any], request_id: str, route: str) -> None:
+    text = "\n".join(
+        str(payload.get(key) or "")
+        for key in ("content", "raw_text")
+        if isinstance(payload.get(key), str)
+    )
+    if _looks_like_web_busy_text(text):
+        logger.warning("provider[%s] %s DeepSeek web session busy; returning HTTP 429.", request_id, route)
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "web_session_busy",
+                    "message": "DeepSeek Web 当前会话仍有消息正在生成，请稍后再试。",
+                }
+            },
+        )
+
+
 DEFAULT_URL = os.environ.get("DEEPSEEK_WEB_URL", "https://chat.deepseek.com/")
-DEFAULT_HEADLESS = os.environ.get("DEEPSEEK_WEB_HEADLESS", "1") == "1"
+DEFAULT_HEADLESS = os.environ.get("DEEPSEEK_WEB_HEADLESS", "0") == "1"
 DEFAULT_FORCE_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FORCE_NEW_CHAT", "0") == "1"
+DEFAULT_BROWSER_CHANNEL = os.environ.get("DEEPSEEK_WEB_BROWSER_CHANNEL", "").strip() or None
 DEFAULT_MODEL_ID = os.environ.get("DEEPSEEK_LOCAL_MODEL", "DeepSeekV4")
 INTERFACE_MODE = os.environ.get("DEEPSEEK_LOCAL_INTERFACE_MODE", "both").strip().lower()
 
@@ -84,6 +147,19 @@ DEEPSEEK_WEB_POOL_ACQUIRE_TIMEOUT_S = _int_env(
     minimum=1,
     maximum=3600,
 )
+DEEPSEEK_WEB_PREWARM_POOL = os.environ.get("DEEPSEEK_WEB_PREWARM_POOL", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+DEEPSEEK_WEB_PREWARM_SLOTS = _int_env(
+    "DEEPSEEK_WEB_PREWARM_SLOTS",
+    1,
+    minimum=0,
+    maximum=6,
+)
 DEEPSEEK_WEB_PROTOCOL_RETRIES = _int_env(
     "DEEPSEEK_WEB_PROTOCOL_RETRIES",
     1,
@@ -128,6 +204,7 @@ class ModelSpec:
     sticky_marker: str | None = None
     sticky_reanchor_messages: int | None = 24
     session_state_path: str | None = None
+    browser_channel: str | None = DEFAULT_BROWSER_CHANNEL
     reuse_persisted_chat: bool = False
     forced_thinking_enabled: bool | None = None
     forced_expert_mode_enabled: bool | None = None
@@ -153,6 +230,19 @@ DEERFLOW_SESSION_STATE_PATH = os.environ.get(
     "~/.deerflow/deepseek-web-deerflow-session.json",
 )
 DEERFLOW_FORCE_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FORCE_NEW_CHAT_DEERFLOW", "1") == "1"
+DEERFLOW_FAST_NEW_CHAT = os.environ.get("DEEPSEEK_WEB_FAST_NEW_CHAT_DEERFLOW", "0").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+DEERFLOW_STABLE_POLL_INTERVAL_MS = _int_env(
+    "DEEPSEEK_WEB_STABLE_POLL_INTERVAL_MS_DEERFLOW",
+    1200,
+    minimum=100,
+    maximum=3_000,
+)
 DEERFLOW_STICKY_MARKER = os.environ.get("DEEPSEEK_WEB_STICKY_MARKER_DEERFLOW", "flowflow__system_prompt_v2")
 DEERFLOW_STICKY_REANCHOR_MESSAGES = int(os.environ.get("DEEPSEEK_WEB_STICKY_REANCHOR_MESSAGES_DEERFLOW", "24"))
 
@@ -165,6 +255,9 @@ XIAOMI_MIMO_PROFILE_DIR = os.environ.get("XIAOMI_MIMO_WEB_PROFILE", "~/.deerflow
 XIAOMI_MIMO_SESSION_STATE_PATH = os.environ.get(
     "XIAOMI_MIMO_WEB_SESSION_STATE",
     "~/.deerflow/xiaomi-mimo-session.json",
+)
+XIAOMI_MIMO_BROWSER_CHANNEL = (
+    os.environ.get("XIAOMI_MIMO_WEB_BROWSER_CHANNEL", "").strip() or DEFAULT_BROWSER_CHANNEL
 )
 XIAOMI_MIMO_FORCE_NEW_CHAT = os.environ.get("XIAOMI_MIMO_FORCE_NEW_CHAT", "1") == "1"
 XIAOMI_MIMO_STICKY_MARKER = os.environ.get("XIAOMI_MIMO_STICKY_MARKER", "mimo__system_prompt_v2")
@@ -273,6 +366,8 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         sticky_marker=DEERFLOW_STICKY_MARKER,
         sticky_reanchor_messages=DEERFLOW_STICKY_REANCHOR_MESSAGES,
         session_state_path=DEERFLOW_SESSION_STATE_PATH,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
+        fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
         forced_expert_mode_enabled=DEFAULT_EXPERT_MODE_ENABLED,
     ),
     "deepseek-web-deerflow-sticky": ModelSpec(
@@ -283,6 +378,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         sticky_reanchor_messages=DEERFLOW_STICKY_REANCHOR_MESSAGES,
         session_state_path=DEERFLOW_SESSION_STATE_PATH,
         reuse_persisted_chat=True,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
         forced_expert_mode_enabled=DEFAULT_EXPERT_MODE_ENABLED,
     ),
     "DeepSeekV4": ModelSpec(
@@ -295,6 +391,21 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         reuse_persisted_chat=False,
         forced_thinking_enabled=False,
         forced_expert_mode_enabled=DEFAULT_EXPERT_MODE_ENABLED,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
+        fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
+    ),
+    "DeepSeekV4-simple": ModelSpec(
+        model_id="DeepSeekV4-simple",
+        profile_dir=DEERFLOW_PROFILE_DIR,
+        force_new_chat=DEERFLOW_FORCE_NEW_CHAT,
+        sticky_marker=DEERFLOW_STICKY_MARKER,
+        sticky_reanchor_messages=DEERFLOW_STICKY_REANCHOR_MESSAGES,
+        session_state_path=DEERFLOW_SESSION_STATE_PATH,
+        reuse_persisted_chat=False,
+        forced_thinking_enabled=False,
+        forced_expert_mode_enabled=False,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
+        fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
     ),
     "DeepSeekV4-thinking": ModelSpec(
         model_id="DeepSeekV4-thinking",
@@ -306,12 +417,15 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         reuse_persisted_chat=False,
         forced_thinking_enabled=True,
         forced_expert_mode_enabled=DEFAULT_EXPERT_MODE_ENABLED,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
+        fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
     ),
     "xiaomi-mimo-v2.5-pro": ModelSpec(
         model_id="xiaomi-mimo-v2.5-pro",
         profile_dir=XIAOMI_MIMO_PROFILE_DIR,
         url=XIAOMI_MIMO_URL,
         headless=XIAOMI_MIMO_HEADLESS,
+        browser_channel=XIAOMI_MIMO_BROWSER_CHANNEL,
         force_new_chat=XIAOMI_MIMO_FORCE_NEW_CHAT,
         sticky_marker=XIAOMI_MIMO_STICKY_MARKER,
         sticky_reanchor_messages=XIAOMI_MIMO_STICKY_REANCHOR_MESSAGES,
@@ -336,6 +450,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         profile_dir=XIAOMI_MIMO_PROFILE_DIR,
         url=XIAOMI_MIMO_URL,
         headless=XIAOMI_MIMO_HEADLESS,
+        browser_channel=XIAOMI_MIMO_BROWSER_CHANNEL,
         force_new_chat=XIAOMI_MIMO_FORCE_NEW_CHAT,
         sticky_marker=XIAOMI_MIMO_STICKY_MARKER,
         sticky_reanchor_messages=XIAOMI_MIMO_STICKY_REANCHOR_MESSAGES,
@@ -361,6 +476,8 @@ MODEL_SPECS: dict[str, ModelSpec] = {
 MODEL_ALIASES = {
     "deepseek-web": "DeepSeekV4",
     "DeepSeek V4": "DeepSeekV4",
+    "DeepSeek V4 Simple": "DeepSeekV4-simple",
+    "DeepSeekV4-simple": "DeepSeekV4-simple",
     "DeepSeek V4-thinking": "DeepSeekV4-thinking",
     "DeepSeekV3": "DeepSeekV4",
     "DeepSeekV3-thinking": "DeepSeekV4-thinking",
@@ -588,6 +705,7 @@ def _make_bridge(base_spec: ModelSpec, *, cache_key: str, slot_index: int, pool_
             slot_index=slot_index,
             pool_size=pool_size,
         ),
+        "browser_channel": base_spec.browser_channel,
         "reuse_persisted_chat": base_spec.reuse_persisted_chat,
         "fast_new_chat": base_spec.fast_new_chat,
     }
@@ -635,6 +753,40 @@ class BridgeSlot:
             max_workers=1,
             thread_name_prefix=f"deepseek-web-{_safe_pool_name(cache_key)}-{slot_index}",
         )
+        self._prewarm_lock = threading.Lock()
+        self._prewarm_future: concurrent.futures.Future | None = None
+
+    def prewarm(self, spec: ModelSpec) -> None:
+        with self._prewarm_lock:
+            if self._prewarm_future is not None and not self._prewarm_future.done():
+                return
+
+            def operation() -> dict[str, Any]:
+                started = time.perf_counter()
+                try:
+                    result = run_bridge_with_spec(
+                        self.bridge,
+                        spec=spec,
+                        operation=lambda: self.bridge.prepare_for_next_request(
+                            thinking_enabled=spec.forced_thinking_enabled,
+                            expert_mode_enabled=spec.forced_expert_mode_enabled,
+                        ),
+                    )
+                    logger.warning(
+                        "DeepSeek bridge slot prewarmed slot=%d prepared=%s already=%s elapsed_ms=%d total_ms=%d url=%s",
+                        self.index,
+                        result.get("prepared"),
+                        result.get("already_prepared"),
+                        result.get("elapsed_ms"),
+                        int((time.perf_counter() - started) * 1000),
+                        result.get("url"),
+                    )
+                    return result
+                except Exception:
+                    logger.warning("DeepSeek bridge slot prewarm failed slot=%d", self.index, exc_info=True)
+                    raise
+
+            self._prewarm_future = self.executor.submit(lambda: _run_in_playwright_worker(operation))
 
     def close(self) -> None:
         try:
@@ -643,6 +795,13 @@ class BridgeSlot:
         except Exception:
             logger.debug("Failed to close DeepSeek bridge slot %d cleanly.", self.index, exc_info=True)
         self.executor.shutdown(wait=False, cancel_futures=True)
+
+    def request_cancel_generation(self) -> bool:
+        cancel = getattr(self.bridge, "request_cancel_generation", None)
+        if not callable(cancel):
+            return False
+        cancel()
+        return True
 
 
 class BridgePool:
@@ -658,6 +817,29 @@ class BridgePool:
         self._admission = threading.BoundedSemaphore(self.size + self.queue_limit)
         for slot in reversed(self._all):
             self._available.put(slot)
+
+    def prewarm_available(
+        self,
+        spec: ModelSpec,
+        *,
+        limit: int | None = None,
+        exclude_slot_indexes: set[int] | None = None,
+    ) -> None:
+        if not DEEPSEEK_WEB_PREWARM_POOL:
+            return
+        limit = self.size if limit is None else max(0, min(limit, self.size))
+        if limit <= 0:
+            return
+        excluded = set(exclude_slot_indexes or ())
+        available_slots = list(getattr(self._available, "queue", []))
+        scheduled = 0
+        for slot in available_slots:
+            if slot.index in excluded:
+                continue
+            slot.prewarm(_spec_for_bridge_slot(spec, slot))
+            scheduled += 1
+            if scheduled >= limit:
+                break
 
     def acquire(self) -> BridgeSlot:
         admitted = self._admission.acquire(blocking=False)
@@ -696,6 +878,9 @@ class BridgePool:
             "updated_at": 0.0,
         }
 
+    def request_cancel_generations(self) -> int:
+        return sum(1 for slot in self._all if slot.request_cancel_generation())
+
     def close(self) -> None:
         for slot in self._all:
             slot.close()
@@ -719,6 +904,7 @@ def get_bridge_pool(model_name: str, request_user: str | None = None) -> tuple[M
             pool.size,
             pool.queue_limit,
         )
+        pool.prewarm_available(spec, limit=DEEPSEEK_WEB_PREWARM_SLOTS)
     return spec, pool
 
 
@@ -899,6 +1085,7 @@ async def run_on_bridge_slot(
     request_id: str,
     route: str,
     operation,
+    prewarm_after: bool = True,
 ):
     started_at = time.perf_counter()
     try:
@@ -956,6 +1143,12 @@ async def run_on_bridge_slot(
     finally:
         released_at = time.perf_counter()
         pool.release(slot)
+        if prewarm_after:
+            pool.prewarm_available(
+                spec,
+                limit=DEEPSEEK_WEB_PREWARM_SLOTS,
+                exclude_slot_indexes={slot.index},
+            )
         logger.warning(
             "provider[%s] %s released bridge slot=%d pool=%s available=%d lifetime_ms=%d",
             request_id,
@@ -968,7 +1161,7 @@ async def run_on_bridge_slot(
 
 
 def close_bridges() -> None:
-    for pool in _bridge_pools.values():
+    for pool in list(_bridge_pools.values()):
         pool.close()
     _bridge_pools.clear()
 
@@ -976,6 +1169,29 @@ def close_bridges() -> None:
 atexit.register(close_bridges)
 
 app = FastAPI(title="DeepSeek Localhost Provider", version="0.2.0")
+
+
+@app.on_event("startup")
+async def prewarm_default_bridge_pool() -> None:
+    if not DEEPSEEK_WEB_PREWARM_POOL or DEEPSEEK_WEB_PREWARM_SLOTS <= 0:
+        return
+    try:
+        spec, pool = get_bridge_pool(DEFAULT_MODEL_ID)
+        pool.prewarm_available(spec, limit=DEEPSEEK_WEB_PREWARM_SLOTS)
+        logger.warning(
+            "DeepSeek bridge pool startup prewarm scheduled model=%s slots=%d pool=%s",
+            DEFAULT_MODEL_ID,
+            min(DEEPSEEK_WEB_PREWARM_SLOTS, pool.size),
+            pool.cache_key,
+        )
+    except Exception:
+        logger.warning("DeepSeek bridge pool startup prewarm scheduling failed", exc_info=True)
+
+
+@app.on_event("shutdown")
+async def shutdown_bridge_pools() -> None:
+    logger.warning("DeepSeek provider shutting down; closing bridge pools.")
+    close_bridges()
 
 
 class ChatMessage(BaseModel):
@@ -1333,6 +1549,10 @@ def anthropic_tools_to_openai_tools(tools: list[dict[str, Any]] | None) -> list[
 
 def build_openai_assistant_message(payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
     assistant_content = payload.get("content", "")
+    if _looks_like_prompt_replay_text(str(assistant_content or "")):
+        logger.warning("Suppressing prompt-replay content before building assistant message.")
+        assistant_content = ""
+        payload = {**payload, "content": "", "parse_error": payload.get("parse_error") or "prompt_replay"}
     message: dict[str, Any] = {
         "role": "assistant",
         "content": assistant_content,
@@ -2102,7 +2322,7 @@ def _extract_shell_command_from_text(content: str) -> str | None:
     if not stripped:
         return None
 
-    fenced = re.search(r"```(?:bash|sh|shell)\s*\n(.*?)```", stripped, re.IGNORECASE | re.DOTALL)
+    fenced = re.search(r"```(?:bash|sh|shell)\s*\n(.*?)(?:```|\Z)", stripped, re.IGNORECASE | re.DOTALL)
     if fenced:
         command = fenced.group(1).strip()
         if command:
@@ -2532,6 +2752,7 @@ async def open_login(model: str = DEFAULT_MODEL_ID) -> dict[str, Any]:
         request_id=request_id,
         route="/debug/open-login",
         operation=lambda bridge, _slot_spec: bridge.open_login_page(),
+        prewarm_after=False,
     )
     return {"model": spec.model_id, **result}
 
@@ -2541,6 +2762,18 @@ async def response_preview(model: str = DEFAULT_MODEL_ID, user: str | None = Non
     spec, pool = get_bridge_pool(model, user)
     preview = pool.response_preview()
     return {"model": spec.model_id, **preview}
+
+
+@app.post("/debug/cancel-generations")
+async def cancel_generations(model: str | None = None, user: str | None = None) -> dict[str, Any]:
+    cancelled_slots = 0
+    if model:
+        spec, pool = get_bridge_pool(model, user)
+        cancelled_slots = pool.request_cancel_generations()
+        return {"model": spec.model_id, "cancelled_slots": cancelled_slots}
+    for pool in _bridge_pools.values():
+        cancelled_slots += pool.request_cancel_generations()
+    return {"model": None, "cancelled_slots": cancelled_slots}
 
 
 @app.get("/v1/models")
@@ -2634,6 +2867,7 @@ async def responses(request: ResponsesRequest):
         payload.get("protocol_retry_count", 0),
     )
 
+    raise_if_web_busy_payload(payload, request_id, "/v1/responses")
     payload, web_search_items, search_results = await resolve_provider_web_search(
         payload=payload,
         pool=pool,
@@ -2739,8 +2973,12 @@ async def chat_completions(request: ChatCompletionRequest):
         payload.get("protocol_retry_count", 0),
     )
 
+    raise_if_web_busy_payload(payload, request_id, "/v1/chat/completions")
     payload = apply_text_tool_call_fallback(payload, request_tools)
     payload = validate_tool_calls_against_schemas(payload, request_tools)
+    if request_output_protocol == "plain" and _looks_like_prompt_replay_text(str(payload.get("content") or "")):
+        logger.warning("provider[%s] /v1 suppressed plain prompt replay response.", request_id)
+        payload = {**payload, "content": "", "tool_calls": [], "parse_error": "prompt_replay"}
     message, tool_calls, finish_reason = build_openai_assistant_message(payload)
     if tool_calls:
         logger.warning(
@@ -2850,6 +3088,7 @@ async def anthropic_messages(request: AnthropicMessageRequest):
         logger.exception("provider[%s] /v1/messages bridge.call failed", request_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    raise_if_web_busy_payload(payload, request_id, "/v1/messages")
     payload = apply_text_tool_call_fallback(payload, request_tools)
     payload = validate_tool_calls_against_schemas(payload, request_tools)
     message, tool_calls, _ = build_openai_assistant_message(payload)

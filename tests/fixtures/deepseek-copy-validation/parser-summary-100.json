@@ -1,0 +1,1890 @@
+[
+  {
+    "id": "case-001",
+    "kind": "terminal-basic",
+    "chars": 59,
+    "cleaned_chars": 47,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "echo hello"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-002",
+    "kind": "terminal-basic",
+    "chars": 57,
+    "cleaned_chars": 31,
+    "fenced_blocks": [
+      "sh"
+    ],
+    "command_lang": "sh",
+    "command_head": [
+      "echo hello"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-003",
+    "kind": "terminal-basic",
+    "chars": 53,
+    "cleaned_chars": 36,
+    "fenced_blocks": [
+      "shell"
+    ],
+    "command_lang": "shell",
+    "command_head": [
+      "echo hello"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-004",
+    "kind": "terminal-basic",
+    "chars": 39,
+    "cleaned_chars": 39,
+    "fenced_blocks": [
+      "zsh"
+    ],
+    "command_lang": "zsh",
+    "command_head": [
+      "echo hello"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-005",
+    "kind": "terminal-basic",
+    "chars": 46,
+    "cleaned_chars": 46,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "pwd && ls -la"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-006",
+    "kind": "terminal-basic",
+    "chars": 60,
+    "cleaned_chars": 48,
+    "fenced_blocks": [
+      "sh"
+    ],
+    "command_lang": "sh",
+    "command_head": [
+      "pwd && ls -la"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-007",
+    "kind": "terminal-basic",
+    "chars": 63,
+    "cleaned_chars": 37,
+    "fenced_blocks": [
+      "shell"
+    ],
+    "command_lang": "shell",
+    "command_head": [
+      "pwd && ls -la"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-008",
+    "kind": "terminal-basic",
+    "chars": 54,
+    "cleaned_chars": 37,
+    "fenced_blocks": [
+      "zsh"
+    ],
+    "command_lang": "zsh",
+    "command_head": [
+      "pwd && ls -la"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-009",
+    "kind": "terminal-basic",
+    "chars": 219,
+    "cleaned_chars": 219,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "wc -l /Users/pippo/Desktop/my-project/match-crush-game.html && head -3 /Users/pippo/Desktop/my-project/match-crush-game.html && tail -3 /Users/pippo/Desktop/my-project/match-crush-game.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-010",
+    "kind": "terminal-basic",
+    "chars": 220,
+    "cleaned_chars": 220,
+    "fenced_blocks": [
+      "sh"
+    ],
+    "command_lang": "sh",
+    "command_head": [
+      "wc -l /Users/pippo/Desktop/my-project/match-crush-game.html && head -3 /Users/pippo/Desktop/my-project/match-crush-game.html && tail -3 /Users/pippo/Desktop/my-project/match-crush-game.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-011",
+    "kind": "terminal-basic",
+    "chars": 239,
+    "cleaned_chars": 227,
+    "fenced_blocks": [
+      "shell"
+    ],
+    "command_lang": "shell",
+    "command_head": [
+      "wc -l /Users/pippo/Desktop/my-project/match-crush-game.html && head -3 /Users/pippo/Desktop/my-project/match-crush-game.html && tail -3 /Users/pippo/Desktop/my-project/match-crush-game.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-012",
+    "kind": "terminal-basic",
+    "chars": 237,
+    "cleaned_chars": 211,
+    "fenced_blocks": [
+      "zsh"
+    ],
+    "command_lang": "zsh",
+    "command_head": [
+      "wc -l /Users/pippo/Desktop/my-project/match-crush-game.html && head -3 /Users/pippo/Desktop/my-project/match-crush-game.html && tail -3 /Users/pippo/Desktop/my-project/match-crush-game.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-013",
+    "kind": "terminal-basic",
+    "chars": 105,
+    "cleaned_chars": 88,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "wx send_file /Users/pippo/Desktop/my-project/monopoly-game.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "wx send_file /Users/pippo/Desktop/my-project/monopoly-game.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-014",
+    "kind": "terminal-basic",
+    "chars": 91,
+    "cleaned_chars": 91,
+    "fenced_blocks": [
+      "sh"
+    ],
+    "command_lang": "sh",
+    "command_head": [
+      "wx send_file /Users/pippo/Desktop/my-project/monopoly-game.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "wx send_file /Users/pippo/Desktop/my-project/monopoly-game.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-015",
+    "kind": "terminal-basic",
+    "chars": 97,
+    "cleaned_chars": 97,
+    "fenced_blocks": [
+      "shell"
+    ],
+    "command_lang": "shell",
+    "command_head": [
+      "wx send_file /Users/pippo/Desktop/my-project/monopoly-game.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "wx send_file /Users/pippo/Desktop/my-project/monopoly-game.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-016",
+    "kind": "terminal-basic",
+    "chars": 111,
+    "cleaned_chars": 99,
+    "fenced_blocks": [
+      "zsh"
+    ],
+    "command_lang": "zsh",
+    "command_head": [
+      "wx send_file /Users/pippo/Desktop/my-project/monopoly-game.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "wx send_file /Users/pippo/Desktop/my-project/monopoly-game.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-017",
+    "kind": "terminal-basic",
+    "chars": 62,
+    "cleaned_chars": 36,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "schedule list"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule list"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-018",
+    "kind": "terminal-basic",
+    "chars": 53,
+    "cleaned_chars": 36,
+    "fenced_blocks": [
+      "sh"
+    ],
+    "command_lang": "sh",
+    "command_head": [
+      "schedule list"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule list"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-019",
+    "kind": "terminal-basic",
+    "chars": 44,
+    "cleaned_chars": 44,
+    "fenced_blocks": [
+      "shell"
+    ],
+    "command_lang": "shell",
+    "command_head": [
+      "schedule list"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule list"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-020",
+    "kind": "terminal-basic",
+    "chars": 45,
+    "cleaned_chars": 45,
+    "fenced_blocks": [
+      "zsh"
+    ],
+    "command_lang": "zsh",
+    "command_head": [
+      "schedule list"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule list"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-021",
+    "kind": "terminal-basic",
+    "chars": 103,
+    "cleaned_chars": 91,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "schedule update {\"target\":\"每5分钟查比特币价格\",\"enabled\":true}"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule update {\"target\":\"每5分钟查比特币价格\",\"enabled\":true}"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-022",
+    "kind": "terminal-basic",
+    "chars": 101,
+    "cleaned_chars": 75,
+    "fenced_blocks": [
+      "sh"
+    ],
+    "command_lang": "sh",
+    "command_head": [
+      "schedule update {\"target\":\"每5分钟查比特币价格\",\"enabled\":true}"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule update {\"target\":\"每5分钟查比特币价格\",\"enabled\":true}"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-023",
+    "kind": "terminal-basic",
+    "chars": 97,
+    "cleaned_chars": 80,
+    "fenced_blocks": [
+      "shell"
+    ],
+    "command_lang": "shell",
+    "command_head": [
+      "schedule update {\"target\":\"每5分钟查比特币价格\",\"enabled\":true}"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule update {\"target\":\"每5分钟查比特币价格\",\"enabled\":true}"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-024",
+    "kind": "terminal-basic",
+    "chars": 83,
+    "cleaned_chars": 83,
+    "fenced_blocks": [
+      "zsh"
+    ],
+    "command_lang": "zsh",
+    "command_head": [
+      "schedule update {\"target\":\"每5分钟查比特币价格\",\"enabled\":true}"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule update {\"target\":\"每5分钟查比特币价格\",\"enabled\":true}"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-025",
+    "kind": "terminal-basic",
+    "chars": 57,
+    "cleaned_chars": 57,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "printf '%s\\n' alpha beta"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-026",
+    "kind": "terminal-basic",
+    "chars": 71,
+    "cleaned_chars": 59,
+    "fenced_blocks": [
+      "sh"
+    ],
+    "command_lang": "sh",
+    "command_head": [
+      "printf '%s\\n' alpha beta"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-027",
+    "kind": "terminal-basic",
+    "chars": 74,
+    "cleaned_chars": 48,
+    "fenced_blocks": [
+      "shell"
+    ],
+    "command_lang": "shell",
+    "command_head": [
+      "printf '%s\\n' alpha beta"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-028",
+    "kind": "terminal-basic",
+    "chars": 65,
+    "cleaned_chars": 48,
+    "fenced_blocks": [
+      "zsh"
+    ],
+    "command_lang": "zsh",
+    "command_head": [
+      "printf '%s\\n' alpha beta"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-029",
+    "kind": "terminal-basic",
+    "chars": 206,
+    "cleaned_chars": 206,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'",
+      "<!-- Python block 1 -->",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-030",
+    "kind": "terminal-basic",
+    "chars": 207,
+    "cleaned_chars": 207,
+    "fenced_blocks": [
+      "sh"
+    ],
+    "command_lang": "sh",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'",
+      "<!-- Python block 1 -->",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-031",
+    "kind": "terminal-basic",
+    "chars": 226,
+    "cleaned_chars": 214,
+    "fenced_blocks": [
+      "shell"
+    ],
+    "command_lang": "shell",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'",
+      "<!-- Python block 1 -->",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-032",
+    "kind": "terminal-basic",
+    "chars": 224,
+    "cleaned_chars": 198,
+    "fenced_blocks": [
+      "zsh"
+    ],
+    "command_lang": "zsh",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'",
+      "<!-- Python block 1 -->",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-033",
+    "kind": "terminal-basic",
+    "chars": 118,
+    "cleaned_chars": 101,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "/Users/pippo/.agent_qt/runtime/python/bin/python <<'PYEOF'",
+      "print('ok')",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-034",
+    "kind": "terminal-basic",
+    "chars": 104,
+    "cleaned_chars": 104,
+    "fenced_blocks": [
+      "sh"
+    ],
+    "command_lang": "sh",
+    "command_head": [
+      "/Users/pippo/.agent_qt/runtime/python/bin/python <<'PYEOF'",
+      "print('ok')",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-035",
+    "kind": "terminal-basic",
+    "chars": 110,
+    "cleaned_chars": 110,
+    "fenced_blocks": [
+      "shell"
+    ],
+    "command_lang": "shell",
+    "command_head": [
+      "/Users/pippo/.agent_qt/runtime/python/bin/python <<'PYEOF'",
+      "print('ok')",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-036",
+    "kind": "terminal-basic",
+    "chars": 124,
+    "cleaned_chars": 112,
+    "fenced_blocks": [
+      "zsh"
+    ],
+    "command_lang": "zsh",
+    "command_head": [
+      "/Users/pippo/.agent_qt/runtime/python/bin/python <<'PYEOF'",
+      "print('ok')",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-037",
+    "kind": "terminal-basic",
+    "chars": 127,
+    "cleaned_chars": 101,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "if [ -f /Users/pippo/Desktop/my-project/a.txt ]; then",
+      "echo yes",
+      "else"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-038",
+    "kind": "terminal-basic",
+    "chars": 118,
+    "cleaned_chars": 101,
+    "fenced_blocks": [
+      "sh"
+    ],
+    "command_lang": "sh",
+    "command_head": [
+      "if [ -f /Users/pippo/Desktop/my-project/a.txt ]; then",
+      "echo yes",
+      "else"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-039",
+    "kind": "terminal-basic",
+    "chars": 109,
+    "cleaned_chars": 109,
+    "fenced_blocks": [
+      "shell"
+    ],
+    "command_lang": "shell",
+    "command_head": [
+      "if [ -f /Users/pippo/Desktop/my-project/a.txt ]; then",
+      "echo yes",
+      "else"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-040",
+    "kind": "terminal-basic",
+    "chars": 110,
+    "cleaned_chars": 110,
+    "fenced_blocks": [
+      "zsh"
+    ],
+    "command_lang": "zsh",
+    "command_head": [
+      "if [ -f /Users/pippo/Desktop/my-project/a.txt ]; then",
+      "echo yes",
+      "else"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-041",
+    "kind": "placeholder-multiblock",
+    "chars": 197,
+    "cleaned_chars": 197,
+    "fenced_blocks": [
+      "bash",
+      "python"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'",
+      "<!-- Python block 1 -->",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-042",
+    "kind": "placeholder-multiblock",
+    "chars": 219,
+    "cleaned_chars": 219,
+    "fenced_blocks": [
+      "bash",
+      "python"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'",
+      "<!-- Python block 1 -->",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-043",
+    "kind": "placeholder-multiblock",
+    "chars": 247,
+    "cleaned_chars": 235,
+    "fenced_blocks": [
+      "bash",
+      "python"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'",
+      "<!-- Python block 1 -->",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-044",
+    "kind": "placeholder-multiblock",
+    "chars": 241,
+    "cleaned_chars": 215,
+    "fenced_blocks": [
+      "bash",
+      "python"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'",
+      "<!-- Python block 1 -->",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-045",
+    "kind": "placeholder-multiblock",
+    "chars": 224,
+    "cleaned_chars": 207,
+    "fenced_blocks": [
+      "bash",
+      "python"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'",
+      "<!-- Python block 1 -->",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-046",
+    "kind": "placeholder-multiblock",
+    "chars": 197,
+    "cleaned_chars": 197,
+    "fenced_blocks": [
+      "bash",
+      "python"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'",
+      "<!-- Python block 1 -->",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-047",
+    "kind": "placeholder-multiblock",
+    "chars": 183,
+    "cleaned_chars": 183,
+    "fenced_blocks": [
+      "bash",
+      "html"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/index.html <<'HTMLEOF'",
+      "<!-- HTML block 1 -->",
+      "HTMLEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-048",
+    "kind": "placeholder-multiblock",
+    "chars": 205,
+    "cleaned_chars": 205,
+    "fenced_blocks": [
+      "bash",
+      "html"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/index.html <<'HTMLEOF'",
+      "<!-- HTML block 1 -->",
+      "HTMLEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-049",
+    "kind": "placeholder-multiblock",
+    "chars": 233,
+    "cleaned_chars": 221,
+    "fenced_blocks": [
+      "bash",
+      "html"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/index.html <<'HTMLEOF'",
+      "<!-- HTML block 1 -->",
+      "HTMLEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-050",
+    "kind": "placeholder-multiblock",
+    "chars": 227,
+    "cleaned_chars": 201,
+    "fenced_blocks": [
+      "bash",
+      "html"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/index.html <<'HTMLEOF'",
+      "<!-- HTML block 1 -->",
+      "HTMLEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-051",
+    "kind": "placeholder-multiblock",
+    "chars": 210,
+    "cleaned_chars": 193,
+    "fenced_blocks": [
+      "bash",
+      "html"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/index.html <<'HTMLEOF'",
+      "<!-- HTML block 1 -->",
+      "HTMLEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-052",
+    "kind": "placeholder-multiblock",
+    "chars": 183,
+    "cleaned_chars": 183,
+    "fenced_blocks": [
+      "bash",
+      "html"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/index.html <<'HTMLEOF'",
+      "<!-- HTML block 1 -->",
+      "HTMLEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-053",
+    "kind": "placeholder-multiblock",
+    "chars": 198,
+    "cleaned_chars": 198,
+    "fenced_blocks": [
+      "bash",
+      "svg"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/icon.svg <<'SVGEO'",
+      "<!-- SVG block 1 -->",
+      "SVGEO"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-054",
+    "kind": "placeholder-multiblock",
+    "chars": 220,
+    "cleaned_chars": 220,
+    "fenced_blocks": [
+      "bash",
+      "svg"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/icon.svg <<'SVGEO'",
+      "<!-- SVG block 1 -->",
+      "SVGEO"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-055",
+    "kind": "placeholder-multiblock",
+    "chars": 248,
+    "cleaned_chars": 236,
+    "fenced_blocks": [
+      "bash",
+      "svg"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/icon.svg <<'SVGEO'",
+      "<!-- SVG block 1 -->",
+      "SVGEO"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-056",
+    "kind": "placeholder-multiblock",
+    "chars": 242,
+    "cleaned_chars": 216,
+    "fenced_blocks": [
+      "bash",
+      "svg"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/icon.svg <<'SVGEO'",
+      "<!-- SVG block 1 -->",
+      "SVGEO"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-057",
+    "kind": "placeholder-multiblock",
+    "chars": 225,
+    "cleaned_chars": 208,
+    "fenced_blocks": [
+      "bash",
+      "svg"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/icon.svg <<'SVGEO'",
+      "<!-- SVG block 1 -->",
+      "SVGEO"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-058",
+    "kind": "placeholder-multiblock",
+    "chars": 198,
+    "cleaned_chars": 198,
+    "fenced_blocks": [
+      "bash",
+      "svg"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/icon.svg <<'SVGEO'",
+      "<!-- SVG block 1 -->",
+      "SVGEO"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-059",
+    "kind": "placeholder-multiblock",
+    "chars": 147,
+    "cleaned_chars": 147,
+    "fenced_blocks": [
+      "bash",
+      "json"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/data.json <<'JSONEOF'",
+      "<!-- JSON block 1 -->",
+      "JSONEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-060",
+    "kind": "placeholder-multiblock",
+    "chars": 169,
+    "cleaned_chars": 169,
+    "fenced_blocks": [
+      "bash",
+      "json"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/data.json <<'JSONEOF'",
+      "<!-- JSON block 1 -->",
+      "JSONEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-061",
+    "kind": "placeholder-multiblock",
+    "chars": 197,
+    "cleaned_chars": 185,
+    "fenced_blocks": [
+      "bash",
+      "json"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/data.json <<'JSONEOF'",
+      "<!-- JSON block 1 -->",
+      "JSONEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-062",
+    "kind": "placeholder-multiblock",
+    "chars": 191,
+    "cleaned_chars": 165,
+    "fenced_blocks": [
+      "bash",
+      "json"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/data.json <<'JSONEOF'",
+      "<!-- JSON block 1 -->",
+      "JSONEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-063",
+    "kind": "placeholder-multiblock",
+    "chars": 174,
+    "cleaned_chars": 157,
+    "fenced_blocks": [
+      "bash",
+      "json"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/data.json <<'JSONEOF'",
+      "<!-- JSON block 1 -->",
+      "JSONEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-064",
+    "kind": "placeholder-multiblock",
+    "chars": 147,
+    "cleaned_chars": 147,
+    "fenced_blocks": [
+      "bash",
+      "json"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/data.json <<'JSONEOF'",
+      "<!-- JSON block 1 -->",
+      "JSONEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-065",
+    "kind": "placeholder-multiblock",
+    "chars": 194,
+    "cleaned_chars": 194,
+    "fenced_blocks": [
+      "bash",
+      "javascript"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/app.js <<'JSEOF'",
+      "<!-- JavaScript block 1 -->",
+      "JSEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-066",
+    "kind": "placeholder-multiblock",
+    "chars": 216,
+    "cleaned_chars": 216,
+    "fenced_blocks": [
+      "bash",
+      "javascript"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/app.js <<'JSEOF'",
+      "<!-- JavaScript block 1 -->",
+      "JSEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-067",
+    "kind": "placeholder-multiblock",
+    "chars": 244,
+    "cleaned_chars": 232,
+    "fenced_blocks": [
+      "bash",
+      "javascript"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/app.js <<'JSEOF'",
+      "<!-- JavaScript block 1 -->",
+      "JSEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-068",
+    "kind": "placeholder-multiblock",
+    "chars": 238,
+    "cleaned_chars": 212,
+    "fenced_blocks": [
+      "bash",
+      "javascript"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/app.js <<'JSEOF'",
+      "<!-- JavaScript block 1 -->",
+      "JSEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-069",
+    "kind": "placeholder-multiblock",
+    "chars": 221,
+    "cleaned_chars": 204,
+    "fenced_blocks": [
+      "bash",
+      "javascript"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/app.js <<'JSEOF'",
+      "<!-- JavaScript block 1 -->",
+      "JSEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-070",
+    "kind": "placeholder-multiblock",
+    "chars": 194,
+    "cleaned_chars": 194,
+    "fenced_blocks": [
+      "bash",
+      "javascript"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat > /Users/pippo/Desktop/my-project/app.js <<'JSEOF'",
+      "<!-- JavaScript block 1 -->",
+      "JSEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-071",
+    "kind": "terminal-extension",
+    "chars": 100,
+    "cleaned_chars": 74,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "wx send_file /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "wx send_file /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-072",
+    "kind": "terminal-extension",
+    "chars": 98,
+    "cleaned_chars": 81,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "wx send_file /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "wx send_file /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-073",
+    "kind": "terminal-extension",
+    "chars": 122,
+    "cleaned_chars": 122,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "schedule create {\"title\":\"测试\",\"prompt\":\"echo ok\",\"trigger\":{\"run_at\":\"2026-05-02 23:00:00\"}}"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule create {\"title\":\"测试\",\"prompt\":\"echo ok\",\"trigger\":{\"run_at\":\"2026-05-02 23:00:00\"}}"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-074",
+    "kind": "terminal-extension",
+    "chars": 115,
+    "cleaned_chars": 115,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "schedule create {\"title\":\"测试\",\"prompt\":\"echo ok\",\"trigger\":{\"run_at\":\"2026-05-02 23:00:00\"}}"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule create {\"title\":\"测试\",\"prompt\":\"echo ok\",\"trigger\":{\"run_at\":\"2026-05-02 23:00:00\"}}"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-075",
+    "kind": "terminal-extension",
+    "chars": 123,
+    "cleaned_chars": 111,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "echo before",
+      "wx send_file /Users/pippo/Desktop/my-project/a.html",
+      "echo after"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "wx send_file /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-076",
+    "kind": "terminal-extension",
+    "chars": 125,
+    "cleaned_chars": 99,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "echo before",
+      "wx send_file /Users/pippo/Desktop/my-project/a.html",
+      "echo after"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "wx send_file /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-077",
+    "kind": "terminal-extension",
+    "chars": 112,
+    "cleaned_chars": 95,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "schedule list",
+      "wx send_file /Users/pippo/Desktop/my-project/report.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule list",
+      "wx send_file /Users/pippo/Desktop/my-project/report.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-078",
+    "kind": "terminal-extension",
+    "chars": 92,
+    "cleaned_chars": 92,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "schedule list",
+      "wx send_file /Users/pippo/Desktop/my-project/report.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule list",
+      "wx send_file /Users/pippo/Desktop/my-project/report.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-079",
+    "kind": "terminal-extension",
+    "chars": 89,
+    "cleaned_chars": 89,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "bash wx send_file /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-080",
+    "kind": "terminal-extension",
+    "chars": 116,
+    "cleaned_chars": 104,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "bash wx send_file /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-081",
+    "kind": "terminal-extension",
+    "chars": 65,
+    "cleaned_chars": 39,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "wx schedule list"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-082",
+    "kind": "terminal-extension",
+    "chars": 63,
+    "cleaned_chars": 46,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "wx schedule list"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-083",
+    "kind": "terminal-extension",
+    "chars": 92,
+    "cleaned_chars": 92,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "AGENT_WECHAT_SEND_FILE: /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "AGENT_WECHAT_SEND_FILE: /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-084",
+    "kind": "terminal-extension",
+    "chars": 85,
+    "cleaned_chars": 85,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "AGENT_WECHAT_SEND_FILE: /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "AGENT_WECHAT_SEND_FILE: /Users/pippo/Desktop/my-project/a.html"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-085",
+    "kind": "terminal-extension",
+    "chars": 148,
+    "cleaned_chars": 136,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "AGENT_WECHAT_CREATE_SCHEDULE: {\"title\":\"x\",\"prompt\":\"y\",\"trigger\":{\"run_at\":\"2026-05-02 23:00:00\"}}"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "AGENT_WECHAT_CREATE_SCHEDULE: {\"title\":\"x\",\"prompt\":\"y\",\"trigger\":{\"run_at\":\"2026-05-02 23:00:00\"}}"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-086",
+    "kind": "terminal-extension",
+    "chars": 150,
+    "cleaned_chars": 124,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "AGENT_WECHAT_CREATE_SCHEDULE: {\"title\":\"x\",\"prompt\":\"y\",\"trigger\":{\"run_at\":\"2026-05-02 23:00:00\"}}"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "AGENT_WECHAT_CREATE_SCHEDULE: {\"title\":\"x\",\"prompt\":\"y\",\"trigger\":{\"run_at\":\"2026-05-02 23:00:00\"}}"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-087",
+    "kind": "terminal-extension",
+    "chars": 88,
+    "cleaned_chars": 71,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "schedule update {\"target\":\"x\",\"enabled\":false}"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule update {\"target\":\"x\",\"enabled\":false}"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-088",
+    "kind": "terminal-extension",
+    "chars": 68,
+    "cleaned_chars": 68,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "schedule update {\"target\":\"x\",\"enabled\":false}"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule update {\"target\":\"x\",\"enabled\":false}"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-089",
+    "kind": "terminal-extension",
+    "chars": 50,
+    "cleaned_chars": 50,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "schedule delete x"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule delete x"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-090",
+    "kind": "terminal-extension",
+    "chars": 77,
+    "cleaned_chars": 65,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "schedule delete x"
+    ],
+    "has_command": true,
+    "terminal_extensions": [
+      "schedule delete x"
+    ],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-091",
+    "kind": "noisy-or-mixed",
+    "chars": 141,
+    "cleaned_chars": 89,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "/Users/pippo/.agent_qt/runtime/python/bin/python <<'PYEOF'",
+      "print('ok')",
+      "PYEOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-092",
+    "kind": "noisy-or-mixed",
+    "chars": 37,
+    "cleaned_chars": 34,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "echo ok"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-093",
+    "kind": "noisy-or-mixed",
+    "chars": 62,
+    "cleaned_chars": 62,
+    "fenced_blocks": [
+      "python",
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "echo terminal"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-094",
+    "kind": "noisy-or-mixed",
+    "chars": 67,
+    "cleaned_chars": 67,
+    "fenced_blocks": [
+      "html",
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "echo after html"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-095",
+    "kind": "noisy-or-mixed",
+    "chars": 51,
+    "cleaned_chars": 51,
+    "fenced_blocks": [
+      "bash",
+      "json"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "echo one"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-096",
+    "kind": "noisy-or-mixed",
+    "chars": 46,
+    "cleaned_chars": 46,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "if [ -n \"$HOME\" ]; then",
+      "echo ok",
+      "fi"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-097",
+    "kind": "noisy-or-mixed",
+    "chars": 33,
+    "cleaned_chars": 33,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "cat <<'EOF'",
+      "hello",
+      "EOF"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-098",
+    "kind": "noisy-or-mixed",
+    "chars": 59,
+    "cleaned_chars": 47,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "printf '%s\\n' \"中文\""
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-099",
+    "kind": "noisy-or-mixed",
+    "chars": 58,
+    "cleaned_chars": 58,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "# <desc 检查>",
+      "ls /Users/pippo/Desktop/my-project"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  },
+  {
+    "id": "case-100",
+    "kind": "noisy-or-mixed",
+    "chars": 28,
+    "cleaned_chars": 28,
+    "fenced_blocks": [
+      "bash"
+    ],
+    "command_lang": "bash",
+    "command_head": [
+      "echo final-check"
+    ],
+    "has_command": true,
+    "terminal_extensions": [],
+    "contains_disclaimer": false,
+    "contains_ui_noise": false
+  }
+]

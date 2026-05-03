@@ -1,3 +1,3 @@
-from .factory import create_chat_model
+"""Minimal models package for Agent Qt's web provider plugin."""
 
-__all__ = ["create_chat_model"]
+__all__ = []
