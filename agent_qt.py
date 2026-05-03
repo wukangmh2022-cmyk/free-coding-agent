@@ -975,11 +975,14 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 先建目录再写文件；项目中脚本文件调用以及终端中文件生成与访问使用绝对路径，代码内可以使用相对路径引用同级文件或子级文件。
 - 常驻命令会自动进入后台终端，不要加 `&`/`nohup`，不要自己写 pid 文件。启动常驻命令后本轮结束，下一轮从执行结果里的 `Terminal processes:` 摘要获取 pid 再查询控制台输出。
 - 不输出备用方案；自己选择一个最高把握路径。
-- 自动化循环完成时只回复 `{done_marker}` 加简短总结；未完成则继续给下一轮完整命令块。
+- 自动化循环完成时只回复 `{done_marker}` 加最终总结；总结必须面向用户，至少交代：已完成了什么、当前结论是什么、若未完全完成还差什么/下一步建议。不要只输出空泛一句话。
+- 未完成时，如果需要本地执行，继续给下一轮完整命令块；但在命令块之外，必须先用 1 到 3 句简短正文说明：当前整体判断、本轮准备做什么、这个命令块的作用。永远不要只输出命令块而没有任何说明。
+- 若当前启用了深度思考/推理模式，也必须把已经得到的高价值判断、排查思路和本轮策略精炼写进可见正文；不要把关键信息只留在隐藏思考里。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作“已生成/已写入/已验证/已发送”。执行后会有下一轮结果，再基于结果下结论。
 - 微信远控发送文件使用终端扩展指令：在命令块里写 `wx send_file 文件路径1,文件路径2,...`。这只是请求 Agent Qt 发送附件，不代表已经发送完成；同一回复不要声称“已发送/已通过 wx send_file 发送”。
 - 定时计划使用终端扩展指令：`schedule create JSON`、`schedule list`、`schedule delete 名称或序号`、`schedule update JSON`。计划 JSON 使用 `{{"title":"短标题","prompt":"到点后真正要做的事","trigger":{{"run_at":"YYYY-MM-DD HH:MM:SS","repeat_every_seconds":86400,"until_at":"YYYY-MM-DD HH:MM:SS"}}}}`。
 - 如果任务本质上是搜索或调研，而不是操作本地工作区，请优先使用终端扩展指令 `web research 搜索话题`。这条指令会让下一轮先基于网页搜索结果继续回答；不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求脚本，或目标数据只存在当前工作区/本机文件里。
+- 对下载、联网 HTTP 调用、构建、安装、长时间生成等任务，不要一看到后台化或短时无输出就立刻换方案。优先先观察并等待一小段合理时间，再查看终端/后台日志，确认确实失败后再改方案；必要时可主动使用短暂等待和日志查询来静观其变。
 - Agent Qt 会给文件变更生成 internal git 快照/commit；需要 diff 细节时可按摘要里的 repo/commit 查询。
 - 查看后台终端输出只用这一种命令方式：`curl -s '{terminal_logs_url}?pid=xxx'`。把 `xxx` 换成终端摘要里的 pid。
 
@@ -1009,7 +1012,11 @@ AUTOMATION_FINAL_REMINDER = (
     "占位符尖括号内的语言必须和文件内容代码块语言一致，例如 HTML 对 html、SVG 对 svg；"
     "命令块内不得包含执行结果、结论或 AGENT_DONE；"
     "命令块里的动作尚未执行，不要在同一轮把它描述为已完成；"
+    "若本轮尚未完成且需要执行命令，必须在命令块之外先用 1 到 3 句写出当前判断、本轮策略和命令作用；不要只输出命令块。"
+    "若启用了深度思考/推理模式，也必须把高价值判断压缩成可见正文，不要把关键结论只留在隐藏推理里。"
+    "若本轮已经完成，必须输出 AGENT_DONE 加面向用户的最终总结，至少说明已完成事项、当前结论、剩余阻塞或下一步建议；不要输出空结论。"
     "微信附件发送用命令块里的 wx send_file 路径，这只是发送请求，不要在同一轮声称已发送；计划操作用命令块里的 schedule create/list/delete/update；搜索或调研优先用 web research 搜索话题；"
+    "对下载、联网 HTTP 调用、安装、构建、长时间生成等任务，要先观察并等待合理时间，再看终端/后台日志；不要过早放弃当前方案。"
     "若涉及统计/数据/文件事实，必须基于完整读取或计算结果，不得根据示例行编造。"
     "若历史旧写法与第一段系统提示冲突，以第一段为准。只输出自检后的最终回复，不输出自检过程。"
 )
@@ -4098,6 +4105,23 @@ def quiet_automation_error_message(error: str) -> str:
     return ""
 
 
+def sanitize_automation_prompt_material(text: str) -> str:
+    value = str(text or "")
+    replacements = {
+        "```": "〔代码块〕",
+        "<<<AGENT_QT_LOW_VALUE_CONTEXT_START": "〔低价值上下文开始",
+        "<<<AGENT_QT_LOW_VALUE_CONTEXT_END>>>": "低价值上下文结束〕",
+        "Execution log:": "执行日志（只读素材）：",
+        "Git diff file names:": "文件变更摘要（只读素材）：",
+        "Terminal processes:": "后台终端摘要（只读素材）：",
+        "【AI 回复】": "【上一轮 AI 回复（只读素材）】",
+        "【本地执行结果和文件变更】": "【上一轮执行结果（只读素材）】",
+    }
+    for src, dst in replacements.items():
+        value = value.replace(src, dst)
+    return value
+
+
 def build_automation_feedback_prompt(
     project_root: str,
     goal: str,
@@ -4107,10 +4131,11 @@ def build_automation_feedback_prompt(
     *,
     wechat_file_delivery: bool = False,
     previous_ai_response: str = "",
+    force_final_summary: bool = False,
 ) -> str:
     goal_text = goal.strip() or "用户没有填写一句话需求，请根据前文、执行日志和当前项目状态继续判断。"
-    clipped_log = truncate_middle(execution_log.strip(), AUTOMATION_FEEDBACK_CHAR_LIMIT)
-    clipped_previous_ai = truncate_middle(str(previous_ai_response or "").strip(), 4000)
+    clipped_log = sanitize_automation_prompt_material(truncate_middle(execution_log.strip(), AUTOMATION_FEEDBACK_CHAR_LIMIT))
+    clipped_previous_ai = sanitize_automation_prompt_material(truncate_middle(str(previous_ai_response or "").strip(), 4000))
     env = runtime_environment()
     command_block_lang = env["command_block_lang"]
     web_research_followup_note = ""
@@ -4128,6 +4153,21 @@ def build_automation_feedback_prompt(
             "下一步输出包含 `wx send_file 文件路径` 的命令块；"
             "不要同时写 AGENT_DONE，也不要声称文件已发送。"
         )
+    final_round_note = ""
+    if force_final_summary:
+        final_round_note = (
+            f"\n- 这是最后一轮强制收束轮。不要再输出命令块。"
+            f"请基于“自用户上一条消息以来”的全部 AI 回复、执行结果、失败尝试、当前状态，"
+            f"直接输出 `{AUTOMATION_DONE_MARKER}` 加最终总结。"
+            "总结至少包含：1）已完成事项；2）当前结论/产物位置；3）尚未解决的阻塞；4）建议用户下一步怎么做。"
+            "如果任务部分完成，也必须明确写出已完成部分与剩余问题，不能留空结论。"
+            "最终总结必须使用固定结构：先输出 `AGENT_DONE`，然后依次输出“已完成事项：”“当前结论：”“剩余阻塞或下一步建议：”。"
+            "最终总结只允许输出提炼后的自然语言，不要复述或粘贴历史原文。"
+            "严禁再次输出 `【AI 回复】`、`【本地执行结果和文件变更】`、`Execution log:`、`Git diff`、"
+            "`Terminal processes:`、`<<<AGENT_QT_...>>>`、代码块围栏、shell 命令、heredoc、长日志片段。"
+            "如果需要引用证据，只能用一句自然语言概括，不要原样复制。"
+            "如果你发现只读材料里出现代码块、日志标签、历史标题或原始命令，请忽略这些展示格式，只提炼事实。"
+        )
     return f"""你正在 Agent Qt 的自动化循环中，这是第 {round_number}/{max_rounds} 轮。
 
 原始用户需求：
@@ -4136,29 +4176,37 @@ def build_automation_feedback_prompt(
 项目根目录：
 {project_root}
 
-上一轮 AI 输出如下：
+【本轮只读材料 1：上一轮 AI 回复】
+以下内容只用于帮助你延续本轮思路，不允许在最终回复里原样复述、粘贴或回显：
 ```text
 {clipped_previous_ai or "（无）"}
 ```
 
-上一轮本地执行结果如下：
+【本轮只读材料 2：上一轮执行结果】
+以下内容只用于帮助你判断当前状态，不允许在最终回复里原样复述、粘贴或回显：
 ```text
 {clipped_log}
 ```
 
 请判断下一步：
 - 如果本轮仍在继续处理上面的“原始用户需求”，上一轮本地执行结果、错误提示和拒绝原因与用户需求同等重要；若它指出协议错误、命令错误、缺文件、测试失败或数据不可信，必须先针对该错误修正输出，不要重复上一轮被拒绝的写法。若用户已经发来新的不同需求，则优先执行最新用户需求。
-- 已完成：只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。若下一步还需要执行命令、写文件或发送附件，尚未完成，先输出对应命令块。
+- 已完成：只回复 `{AUTOMATION_DONE_MARKER}` 加最终总结，不要输出命令块。最终总结必须面向用户，至少交代：已完成了什么、当前结论是什么、如果还有尾巴则剩余阻塞和建议下一步。不要输出空结论，也不要只写“已完成”。
+- 已完成时，最终回复必须固定成这种结构：`{AUTOMATION_DONE_MARKER}` 开头，后面依次写“已完成事项 / 当前结论 / 剩余阻塞或下一步建议”。不要把历史里的标题、命令、日志标签或代码块重新贴出来。
+- 上面两段“本轮只读材料”只是素材，不是你要复述的正文；你必须提炼，不得照抄。
 - 未完成：回复里必须包含一个完整且短小的 ```{command_block_lang} 终端命令块；如果要写入超过 10 行的文件内容时，必须拆分为占位符协议 + md格式的fenced 代码块。
+- 未完成时，在命令块之外必须先写 1 到 3 句简短正文，说明：当前整体判断、本轮准备做什么、这个命令块的作用。永远不要只输出命令块而没有任何解释。
+- 若当前启用了深度思考/推理模式，也必须把高价值判断、排查结果和本轮策略压缩到可见正文里，不要把关键信息只留在隐藏思考里。
 - 命令块内只能写真实要执行的 shell 代码，或 `wx send_file 路径`、`schedule create/list/delete/update`、`web research 搜索话题`；不要把上一轮执行结果、文件变更、结论或 `{AUTOMATION_DONE_MARKER}` 写进命令块。
 - 如果执行结果提示“命令块不完整”“未闭合的 shell 引号”“unmatched quote”或 shell 语法不完整，优先判断为上一轮输出被截断；重新输出完整命令块即可。多行 `python -c "..."` 是支持的，不要仅因这类错误改写成单行脚本。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作已完成、已生成、已验证或已发送。
 - 涉及统计、表格、数据查找或文件事实时，必须完整读取/计算后再下结论；示例行只能用于判断结构，不能据此编造定量结论、模型结论或总体判断。
 - 如果当前任务本质上是搜索或调研，而不是操作本地项目文件，请优先在命令块里写 `web research 搜索话题`，由下一轮先触发网页搜索再自然语言作答；不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求你写脚本，或目标数据只存在当前工作区/本机文件里。
 - 后台安装/构建/拉取不要当作完成；启动常驻命令时不要加 `&`/`nohup`，等执行结果给出 `Terminal processes:` 摘要后，再使用 `curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'` 查询控制台输出。
+- 对下载、联网 HTTP 调用、安装、构建、长时间生成等任务，如果已经转入后台或暂时无输出，不要立刻换方案。优先先等待一小段合理时间，并主动查看终端/后台日志；必要时可以使用短暂等待后再查询日志，确认失败后再换方案。
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
 {web_research_followup_note}
 {wechat_completion_note}
+{final_round_note}
 """
 
 WECHAT_COMMAND_MENU_TEXT = """你可以这样说：
@@ -4169,12 +4217,11 @@ WECHAT_COMMAND_MENU_TEXT = """你可以这样说：
 新建会话 名称：创建一个新会话
 显示文件列表：返回当前工作区的多层级文本树
 /schedule：查看当前计划
+/model：查看当前模型和可选模型
+直接发送模型名称或用自然语言说明要切换到哪个模型：由 Agent 切换模型
 直接描述提醒或计划：由 Agent 创建一次性或循环计划
 删除计划 名称/序号：由 Agent 删除对应计划；也可用 /delete_schedule 名称
 发送文件 路径/文件名：把工作区文件发到微信
-/think：查看推理模式
-/think on：开启推理模式
-/think off：关闭推理模式
 
 也可以直接发送自然语言需求，让 Agent Qt 处理当前工作区。"""
 
@@ -4214,17 +4261,60 @@ def automation_model_for_thinking(enabled: bool, current_model: str) -> str:
     return AUTOMATION_DEFAULT_MODEL
 
 
+def automation_model_options_text() -> str:
+    lines = [f"当前模型：{automation_context_mode_label_for_state()}" ]
+    lines.append("可选模型：")
+    for preset in AUTOMATION_CONTEXT_PRESETS:
+        lines.append(f"- {str(preset.get('label') or '').strip()}")
+    lines.append("可以直接回复模型名称，或说“切换到 DeepSeek PRO web thinking”这类自然语言。")
+    return "\n".join(line for line in lines if line).strip()
+
+
+def normalize_preset_text(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "").strip().lower())
+
+
+def resolve_automation_preset_from_text(text: str) -> Optional[Dict[str, str]]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    normalized = normalize_preset_text(raw)
+    if not any(token in normalized for token in ("deepseek", "flash", "thinking", "模型", "/model", "切换")):
+        return None
+    best = None
+    best_len = -1
+    for preset in AUTOMATION_CONTEXT_PRESETS:
+        label = str(preset.get("label") or "").strip()
+        label_norm = normalize_preset_text(label)
+        if not label_norm:
+            continue
+        if normalized == label_norm or label_norm in normalized:
+            if len(label_norm) > best_len:
+                best = {"mode": str(preset.get("mode") or "expert"), "model": str(preset.get("model") or AUTOMATION_DEFAULT_MODEL), "label": label}
+                best_len = len(label_norm)
+    return best
+
+
+def automation_context_mode_label_for_state(mode: str = "", model_id: str = "") -> str:
+    target_mode = str(mode or "") or None
+    target_model = str(model_id or "") or None
+    for preset in AUTOMATION_CONTEXT_PRESETS:
+        if (target_mode is None or str(preset.get("mode") or "") == target_mode) and (target_model is None or str(preset.get("model") or "") == target_model):
+            return str(preset.get("label") or "")
+    return automation_model_label(model_id or AUTOMATION_DEFAULT_MODEL)
+
+
 def parse_wechat_builtin_command(text: str) -> Dict[str, str]:
     raw = str(text or "").strip()
     compact = re.sub(r"\s+", "", raw).lower()
     if not compact:
         return {}
-    if compact in {"/think", "/thinking", "推理", "推理状态", "查看推理", "查看推理模式"}:
-        return {"action": "thinking", "mode": "status"}
-    if compact in {"/thinkon", "/thinkingon", "推理开", "开启推理", "打开推理", "开启推理模式"}:
-        return {"action": "thinking", "mode": "on"}
-    if compact in {"/thinkoff", "/thinkingoff", "推理关", "关闭推理", "关掉推理", "关闭推理模式"}:
-        return {"action": "thinking", "mode": "off"}
+    model_match = re.match(r"^/model(?:[:：\s]+(.*))?$", raw, re.I)
+    if model_match:
+        target = (model_match.group(1) or "").strip()
+        if target:
+            return {"action": "model", "target": target}
+        return {"action": "model"}
     if compact in {"/stop", "停止", "暂停", "中断", "停止当前任务", "暂停当前任务", "停止输出", "停止执行"}:
         return {"action": "stop"}
     if compact in {"/threads", "/conversations", "/ls", "会话列表", "对话列表", "列出会话", "列出对话", "显示会话", "显示对话"}:
@@ -4246,6 +4336,9 @@ def parse_wechat_builtin_command(text: str) -> Dict[str, str]:
     select_match = re.match(r"^/select[:：\s]+(.+)$", raw, re.I)
     if select_match:
         return {"action": "select_thread", "thread_id": (select_match.group(1) or "").strip()}
+    preset = resolve_automation_preset_from_text(raw)
+    if preset:
+        return {"action": "model", "target": str(preset.get("label") or "")}
     return {}
 
 
@@ -8429,6 +8522,23 @@ def sanitize_wechat_visible_text(text: str, *, keep_code_summary: bool = False, 
     return text_within_utf8_budget(content, limit)
 
 
+def is_low_value_wechat_result_summary(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return True
+    normalized = value.replace("\r\n", "\n")
+    if "... 已省略文件写入命令和正文 ..." in normalized:
+        simplified = normalized.replace("执行结果：", "").replace("Execution log:", "").strip()
+        simplified = simplified.replace("... 已省略文件写入命令和正文 ...", "").replace("... 已省略文件正文 ...", "").strip()
+        if not simplified:
+            return True
+    low_value_markers = [
+        "返回空（grep 未匹配到关键词",
+        "扩展指令已处理，未返回额外输出。",
+    ]
+    return any(marker in normalized for marker in low_value_markers) and len(normalized) < 120
+
+
 def extract_wechat_send_file_targets(text: str) -> List[str]:
     targets: List[str] = []
     for line in str(text or "").splitlines():
@@ -8673,9 +8783,13 @@ def wechat_history_reply(entries: List[Dict[str, object]], silent: bool = True) 
         if not content:
             continue
         if entry_type in {"result", "terminal_result"}:
-            result_parts.append(sanitize_wechat_visible_text(content, keep_code_summary=False, limit=1600))
+            sanitized = sanitize_wechat_visible_text(content, keep_code_summary=False, limit=2600)
+            if sanitized and not is_low_value_wechat_result_summary(sanitized):
+                result_parts.append(sanitized)
         elif entry_type == "ai":
-            conclusion_parts.append(sanitize_wechat_visible_text(content, keep_code_summary=not silent, limit=1200))
+            sanitized = sanitize_wechat_visible_text(content, keep_code_summary=not silent, limit=2200)
+            if sanitized:
+                conclusion_parts.append(sanitized)
     parts: List[str] = []
     if result_parts:
         parts.append("执行结果：\n" + result_parts[-1])
@@ -9379,6 +9493,11 @@ class WeChatConnector(QObject):
             text = f"{text}\n\n{attachment_text}".strip()
         if not text:
             text = "[微信消息] 收到空文本消息。"
+        if self._should_send_immediate_ack(text, to_user, context_token):
+            try:
+                self._send_text(to_user, "收到，正在执行，请稍后。", context_token)
+            except Exception as exc:
+                self.status_signal.emit(f"微信回执发送失败：{exc}")
         try:
             reply = self._call_agent_qt(text, to_user, context_token)
         except Exception as exc:
@@ -9388,6 +9507,36 @@ class WeChatConnector(QObject):
                 self._send_text(to_user, reply, context_token)
             except Exception as exc:
                 self.status_signal.emit(f"微信回复发送失败：{exc}")
+
+    def _bridge_state(self) -> Dict[str, object]:
+        cfg = wechat_bridge_settings()
+        bridge_url = self.chat_page.wechat_bridge.url().rstrip("/")
+        headers = {}
+        api_key = str(cfg.get("api_key") or "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(f"{bridge_url}/state", headers=headers, method="GET")
+        with self._open_url(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+
+    def _should_send_immediate_ack(self, text: str, to_user: str, context_token: str) -> bool:
+        command = str(text or "").strip()
+        if not command or not to_user:
+            return False
+        if is_wechat_menu_command(command) or parse_wechat_builtin_command(command):
+            return False
+        try:
+            state = self._bridge_state()
+        except Exception:
+            return True
+        if not bool(state.get("busy")):
+            return True
+        same_target_busy = bool(
+            state.get("wechat_active_request_id")
+            and str(state.get("wechat_active_to_user") or "") == str(to_user or "")
+            and str(state.get("wechat_active_context_token") or "") == str(context_token or "")
+        )
+        return False
 
     def _call_agent_qt(self, text: str, conversation_id: str, context_token: str = "") -> str:
         cfg = wechat_bridge_settings()
@@ -12208,6 +12357,10 @@ class ChatPage(QWidget):
         self.wechat_active_silent = True
         self.wechat_active_to_user = ""
         self.wechat_active_context_token = ""
+        self.wechat_interrupt_confirm_to_user = ""
+        self.wechat_interrupt_confirm_context_token = ""
+        self.wechat_interrupt_confirm_to_user = ""
+        self.wechat_interrupt_confirm_context_token = ""
         self.automation_active_messages: List[Dict[str, str]] = []
         self.automation_active_model = ""
         self.automation_enabled = automation_enabled_setting()
@@ -12254,6 +12407,7 @@ class ChatPage(QWidget):
         self.automation_loop_round = 0
         self.automation_loop_max_rounds = AUTOMATION_LOOP_MAX_ROUNDS
         self.automation_loop_goal = ""
+        self.automation_loop_force_final_summary = False
         self.active_schedule_id = ""
         self.active_schedule_notify: Dict[str, str] = {}
         self.active_schedule_started_at = 0.0
@@ -12914,24 +13068,27 @@ class ChatPage(QWidget):
                     "busy": self.is_automation_busy() or self.is_execution_running(),
                     "automation_enabled": self.automation_enabled,
                     "wechat_bridge": self.wechat_bridge.url(),
+                    "wechat_active_request_id": self.wechat_active_request_id,
+                    "wechat_active_to_user": self.wechat_active_to_user,
+                    "wechat_active_context_token": self.wechat_active_context_token,
+                    "wechat_interrupt_confirm_to_user": self.wechat_interrupt_confirm_to_user,
+                    "wechat_interrupt_confirm_context_token": self.wechat_interrupt_confirm_context_token,
                 })
                 return
             if action in {"provider"}:
                 self.wechat_bridge.finish_request(request_id, {"ok": True, **self.provider_info_payload()})
                 return
-            if action in {"thinking", "think"}:
-                mode = str((payload or {}).get("mode") or (payload or {}).get("enabled") or "status").strip().lower()
-                if mode in {"1", "true", "yes", "on", "开启", "开", "enable", "enabled"}:
-                    target_model = automation_model_for_thinking(True, self.automation_model)
-                    self.set_automation_model(target_model)
-                    reply = f"已开启推理模式：{automation_model_label(self.automation_model)}"
-                elif mode in {"0", "false", "no", "off", "关闭", "关", "disable", "disabled"}:
-                    target_model = automation_model_for_thinking(False, self.automation_model)
-                    self.set_automation_model(target_model)
-                    reply = f"已关闭推理模式：{automation_model_label(self.automation_model)}"
+            if action in {"model", "models"}:
+                target = str((payload or {}).get("target") or "").strip()
+                if target:
+                    preset = resolve_automation_preset_from_text(target)
+                    if not preset:
+                        reply = automation_model_options_text()
+                    else:
+                        self.set_automation_preset(str(preset.get("mode") or "expert"), str(preset.get("model") or AUTOMATION_DEFAULT_MODEL))
+                        reply = f"已切换模型：{automation_context_mode_label_for_state(self.automation_context_mode, self.automation_model)}"
                 else:
-                    state = "开启" if automation_thinking_enabled(self.automation_model) else "关闭"
-                    reply = f"当前推理模式：{state}（{automation_model_label(self.automation_model)}）。可发送 /think on 或 /think off 切换。"
+                    reply = automation_model_options_text()
                 self.wechat_bridge.finish_request(request_id, {"ok": True, "reply": reply, "text": reply, "model": self.automation_model})
                 return
             if action in {"terminals", "terminal_list"}:
@@ -13106,17 +13263,48 @@ class ChatPage(QWidget):
             })
             return
         builtin = parse_wechat_builtin_command(command)
+        to_user = str(payload.get("to_user") or payload.get("user") or payload.get("thread_id") or "").strip()
+        context_token = str(payload.get("context_token") or "").strip()
         if builtin:
             payload_for_command = {
                 "request_id": request_id,
-                "to_user": payload.get("to_user") or payload.get("user") or payload.get("thread_id") or "",
-                "context_token": payload.get("context_token") or "",
+                "to_user": to_user,
+                "context_token": context_token,
                 **builtin,
             }
             self.handle_wechat_bridge_request(payload_for_command)
             return
         if self.is_automation_busy() or self.is_execution_running():
-            reply = "请稍后再发，目前有其他请求正在生成中。"
+            same_active_wechat = bool(
+                self.wechat_active_request_id
+                and to_user
+                and context_token
+                and to_user == self.wechat_active_to_user
+                and context_token == self.wechat_active_context_token
+            )
+            if same_active_wechat:
+                compact = re.sub(r"\s+", "", command).strip().lower()
+                pending_same_target = bool(
+                    to_user == self.wechat_interrupt_confirm_to_user
+                    and context_token == self.wechat_interrupt_confirm_context_token
+                )
+                if pending_same_target and compact in {"y", "yes", "是", "好", "结束", "停止", "确认"}:
+                    self.wechat_interrupt_confirm_to_user = ""
+                    self.wechat_interrupt_confirm_context_token = ""
+                    self.cancel_automation_request()
+                    if self.is_execution_running() and self.worker is not None:
+                        self.worker.requestInterruption()
+                    reply = "已发送停止指令。当前微信会话生成结束后，请重新发送你的新需求。"
+                elif pending_same_target and compact in {"n", "no", "否", "不用", "继续"}:
+                    self.wechat_interrupt_confirm_to_user = ""
+                    self.wechat_interrupt_confirm_context_token = ""
+                    reply = "好的，继续当前微信会话生成，请稍后。"
+                else:
+                    self.wechat_interrupt_confirm_to_user = to_user
+                    self.wechat_interrupt_confirm_context_token = context_token
+                    reply = "当前微信对话还在生成中，是否要立刻结束？请回复 y/n。"
+            else:
+                reply = "请稍后再发，目前有其他请求正在生成中。"
             self.wechat_bridge.finish_request(request_id, {
                 "ok": True,
                 "busy": True,
@@ -13145,10 +13333,10 @@ class ChatPage(QWidget):
             self.show_automation_composer(focus=False)
         settings = wechat_bridge_settings()
         silent = parse_boolish(payload.get("silent"), bool(settings.get("silent", True)))
-        to_user = str(payload.get("to_user") or payload.get("user") or payload.get("thread_id") or "").strip()
-        context_token = str(payload.get("context_token") or "").strip()
         remember_wechat_reply_target(to_user, context_token)
         allow_file_delivery = bool(wechat_bridge_enabled_setting() and to_user and context_token)
+        self.wechat_interrupt_confirm_to_user = ""
+        self.wechat_interrupt_confirm_context_token = ""
         self.wechat_active_request_id = request_id
         self.wechat_active_start_index = len(self.history_entries)
         self.wechat_active_silent = silent
@@ -13339,6 +13527,7 @@ class ChatPage(QWidget):
         self.automation_loop_active = True
         self.automation_loop_round = 1
         self.automation_loop_goal = goal.strip()
+        self.automation_loop_force_final_summary = False
         self.refresh_prompt_bubble_buttons()
         self.update_automation_composer_state()
 
@@ -13346,6 +13535,7 @@ class ChatPage(QWidget):
         self.automation_loop_active = False
         self.automation_loop_round = 0
         self.automation_loop_goal = ""
+        self.automation_loop_force_final_summary = False
         self.active_schedule_id = ""
         self.active_schedule_notify = {}
         self.active_schedule_started_at = 0.0
@@ -15969,6 +16159,51 @@ class ChatPage(QWidget):
                 failed_files.append(f"{target}（{exc}）")
         return sent_files, failed_files
 
+    def execute_terminal_extension_directives(self, directives: List[str]) -> str:
+        cleaned_directives = [str(item or "").strip() for item in directives if str(item or "").strip()]
+        if not cleaned_directives:
+            return ""
+        schedule_payloads, schedule_actions, schedule_errors = collect_schedule_extension_payloads(
+            "\n".join(cleaned_directives)
+        )
+        file_targets = extract_wechat_send_file_targets("\n".join(cleaned_directives))
+        web_research_queries = extract_web_research_queries("\n".join(cleaned_directives))
+        output_parts: List[str] = []
+        if schedule_payloads or schedule_actions or schedule_errors:
+            created: List[str] = []
+            action_replies: List[str] = []
+            errors: List[str] = list(schedule_errors)
+            if self.project_root:
+                c, a, e = apply_schedule_extension_payloads(
+                    self.project_root,
+                    schedule_payloads,
+                    schedule_actions,
+                )
+                created.extend(c)
+                action_replies.extend(a)
+                errors.extend(e)
+                if c or a:
+                    QTimer.singleShot(1200, self.check_due_schedules)
+            else:
+                errors.append("未设置工作区，无法处理定时计划。")
+            reply = schedule_extension_reply(created, action_replies, errors) or "已处理定时计划。"
+            output_parts.append(reply)
+        if file_targets:
+            sent_files, failed_files = self.send_wechat_files_to_last_target(file_targets)
+            delivery_parts: List[str] = []
+            if sent_files:
+                delivery_parts.append("微信附件已发送：" + "、".join(sent_files))
+            if failed_files:
+                delivery_parts.append("微信附件发送失败：" + "；".join(failed_files))
+            output_parts.append(
+                (wechat_trigger_summary(cleaned_directives) + "\n\n" + "\n".join(delivery_parts or ["未发送附件。"])).strip()
+            )
+        if web_research_queries:
+            output_parts.append(web_research_extension_reply(web_research_queries))
+        if not output_parts:
+            output_parts.append("已处理终端扩展指令。")
+        return terminal_extension_execution_log(cleaned_directives, "\n\n".join(part for part in output_parts if part).strip())
+
     def schedule_execution_prompt(self, schedule_item: Dict[str, object]) -> str:
         title = str(schedule_item.get("title") or "定时计划").strip()
         prompt = str(schedule_item.get("prompt") or "").strip()
@@ -17884,6 +18119,8 @@ class ChatPage(QWidget):
         terminal_extension_result_log = ""
         if self.automation_loop_active:
             terminal_extension_triggers = terminal_extension_directives_from_text(display_text)
+        else:
+            terminal_extension_triggers = terminal_extension_directives_from_text(display_text)
         if self.automation_loop_active and self.wechat_active_request_id:
             if terminal_extension_triggers:
                 wechat_triggers = terminal_extension_triggers
@@ -18081,6 +18318,19 @@ class ChatPage(QWidget):
             return
         
         if not commands:
+            if terminal_extension_triggers:
+                execution_text = terminal_extension_result_log or self.execute_terminal_extension_directives(
+                    terminal_extension_triggers
+                )
+                if execution_text:
+                    context_content = build_execution_context_content(execution_text, [])
+                    self.add_execution_result_entry(execution_text, context_content=context_content)
+                    if self.automation_loop_active:
+                        self.request_next_automation_step(context_content)
+                    else:
+                        self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
+                    self.scroll_to_bottom()
+                    return
             if self.automation_loop_active and terminal_extension_triggers:
                 web_research_queries = extract_web_research_queries("\n".join(terminal_extension_triggers))
                 if web_research_queries:
@@ -18158,7 +18408,8 @@ class ChatPage(QWidget):
             self.pending_snapshot = snapshot_project(self.project_root)
         self.pending_long_running_launches = 0
         self.pending_terminal_launches = []
-        
+        self.pending_terminal_extension_triggers = list(terminal_extension_triggers)
+
         self.worker = ExecuteWorker(commands, self.project_root)
         self.worker.output_signal.connect(self.on_output)
         self.worker.long_running_signal.connect(self.on_long_running)
@@ -18266,6 +18517,8 @@ class ChatPage(QWidget):
             change_records = build_change_records(self.pending_snapshot, after_snapshot)
         self.pending_snapshot = {}
         self.pending_internal_git_commit = ""
+        terminal_extension_triggers = list(getattr(self, "pending_terminal_extension_triggers", []) or [])
+        self.pending_terminal_extension_triggers = []
         long_running_launches = self.pending_long_running_launches
         self.pending_long_running_launches = 0
         terminal_launches = []
@@ -18285,6 +18538,12 @@ class ChatPage(QWidget):
             log_with_changes += "\n\n文件变更：\n未检测到文件改动。若命令正在底部终端继续运行，保存/生成文件后需要等待进程结束或再执行一次检查。"
         elif not log_with_changes.strip():
             log_with_changes = "命令执行完成，未产生终端输出或文件变更。"
+        terminal_extension_log = ""
+        if terminal_extension_triggers:
+            terminal_extension_log = self.execute_terminal_extension_directives(terminal_extension_triggers)
+            if terminal_extension_log:
+                log_with_changes = (log_with_changes + "\n\n" + terminal_extension_log).strip()
+                full_log = (full_log + "\n\n" + terminal_extension_log).strip()
         context_content = build_execution_context_content(full_log, change_records, long_running_launches, terminal_launches)
         self.result_bubble.update_content(log_with_changes)
         if change_records:
@@ -18318,12 +18577,15 @@ class ChatPage(QWidget):
         if not self.automation_loop_active:
             return
         if self.automation_loop_round >= self.automation_loop_max_rounds:
-            self.stop_automation_loop(
-                f"已达到自动化最大轮数 {self.automation_loop_max_rounds}，循环已暂停。你可以检查结果后继续发送。",
-                ensure_manual_entry=True,
-            )
-            return
-        self.automation_loop_round += 1
+            if self.automation_loop_force_final_summary:
+                self.stop_automation_loop(
+                    f"已达到自动化最大轮数 {self.automation_loop_max_rounds}，且最终总结轮仍未正常收束，循环已暂停。你可以检查结果后继续发送。",
+                    ensure_manual_entry=True,
+                )
+                return
+            self.automation_loop_force_final_summary = True
+        else:
+            self.automation_loop_round += 1
         previous_ai_response = ""
         for entry in reversed(self.history_entries):
             if str(entry.get("type") or "") == "ai":
@@ -18341,6 +18603,7 @@ class ChatPage(QWidget):
                 and self.wechat_active_context_token
             ),
             previous_ai_response=previous_ai_response,
+            force_final_summary=self.automation_loop_force_final_summary,
         )
         self.start_automation_worker(
             prompt,
