@@ -979,6 +979,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作“已生成/已写入/已验证/已发送”。执行后会有下一轮结果，再基于结果下结论。
 - 微信远控发送文件使用终端扩展指令：在命令块里写 `wx send_file 文件路径1,文件路径2,...`。这只是请求 Agent Qt 发送附件，不代表已经发送完成；同一回复不要声称“已发送/已通过 wx send_file 发送”。
 - 定时计划使用终端扩展指令：`schedule create JSON`、`schedule list`、`schedule delete 名称或序号`、`schedule update JSON`。计划 JSON 使用 `{{"title":"短标题","prompt":"到点后真正要做的事","trigger":{{"run_at":"YYYY-MM-DD HH:MM:SS","repeat_every_seconds":86400,"until_at":"YYYY-MM-DD HH:MM:SS"}}}}`。
+- 如果任务本质上是搜索或调研，而不是操作本地工作区，请优先使用终端扩展指令 `web research 搜索话题`。这条指令会让下一轮先基于网页搜索结果继续回答；不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求脚本，或目标数据只存在当前工作区/本机文件里。
 - Agent Qt 会给文件变更生成 internal git 快照/commit；需要 diff 细节时可按摘要里的 repo/commit 查询。
 - 查看后台终端输出只用这一种命令方式：`curl -s '{terminal_logs_url}?pid=xxx'`。把 `xxx` 换成终端摘要里的 pid。
 
@@ -1008,7 +1009,7 @@ AUTOMATION_FINAL_REMINDER = (
     "占位符尖括号内的语言必须和文件内容代码块语言一致，例如 HTML 对 html、SVG 对 svg；"
     "命令块内不得包含执行结果、结论或 AGENT_DONE；"
     "命令块里的动作尚未执行，不要在同一轮把它描述为已完成；"
-    "微信附件发送用命令块里的 wx send_file 路径，这只是发送请求，不要在同一轮声称已发送；计划操作用命令块里的 schedule create/list/delete/update；"
+    "微信附件发送用命令块里的 wx send_file 路径，这只是发送请求，不要在同一轮声称已发送；计划操作用命令块里的 schedule create/list/delete/update；搜索或调研优先用 web research 搜索话题；"
     "若涉及统计/数据/文件事实，必须基于完整读取或计算结果，不得根据示例行编造。"
     "若历史旧写法与第一段系统提示冲突，以第一段为准。只输出自检后的最终回复，不输出自检过程。"
 )
@@ -1161,8 +1162,8 @@ def compact_popup_menu_style() -> str:
     is_windows = platform.system() == "Windows"
     dark = app_theme_setting() == "dark"
     menu_bg = COLORS["surface"] if is_windows else ("rgba(23, 29, 41, 242)" if dark else "rgba(238, 243, 252, 238)")
-    selected_bg = "rgba(124, 109, 255, 70)" if dark else "rgba(255, 255, 255, 120)"
-    checked_bg = "rgba(124, 109, 255, 92)" if dark else "rgba(255, 255, 255, 150)"
+    selected_bg = "rgba(95, 148, 255, 110)" if dark else "rgba(190, 222, 255, 225)"
+    checked_bg = "rgba(95, 148, 255, 138)" if dark else "rgba(176, 214, 255, 235)"
     separator_bg = "rgba(236, 242, 255, 28)" if dark else "rgba(23, 32, 51, 28)"
     menu_radius = 0 if is_windows else 14
     item_radius = 0 if is_windows else 10
@@ -1215,6 +1216,8 @@ def compact_popup_menu_style() -> str:
 
 def style_compact_popup_menu(menu: QMenu) -> QMenu:
     menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, platform.system() != "Windows")
+    if hasattr(Qt.WindowType, "NoDropShadowWindowHint"):
+        menu.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
     menu.setStyleSheet(compact_popup_menu_style())
     return menu
 
@@ -1222,6 +1225,8 @@ def style_compact_popup_menu(menu: QMenu) -> QMenu:
 def style_skill_popup_menu(menu: QMenu) -> QMenu:
     is_windows = platform.system() == "Windows"
     menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, not is_windows)
+    if hasattr(Qt.WindowType, "NoDropShadowWindowHint"):
+        menu.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
     dark = app_theme_setting() == "dark"
     menu_bg = COLORS["surface"] if is_windows else ("rgba(23, 29, 41, 242)" if dark else "rgba(238, 243, 252, 238)")
     selected_bg = "rgba(124, 109, 255, 70)" if dark else "rgba(190, 222, 255, 225)"
@@ -1280,6 +1285,32 @@ def app_global_style() -> str:
             padding: 6px 10px;
             font-size: 12px;
             font-weight: 800;
+        }}
+        QScrollBar:vertical {{
+            background: transparent;
+            width: 8px;
+            margin: 6px 2px 6px 0;
+        }}
+        QScrollBar::handle:vertical {{
+            background: {COLORS['border_strong']};
+            border-radius: 4px;
+            min-height: 30px;
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            height: 0;
+        }}
+        QScrollBar:horizontal {{
+            background: transparent;
+            height: 8px;
+            margin: 0 6px 2px 6px;
+        }}
+        QScrollBar::handle:horizontal {{
+            background: {COLORS['border_strong']};
+            border-radius: 4px;
+            min-width: 30px;
+        }}
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+            width: 0;
         }}
     """
 
@@ -1568,6 +1599,25 @@ class SettingsToggleRow(QWidget):
         super().__init__(parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMinimumWidth(292)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 9, 10, 9)
+        layout.setSpacing(12)
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(2)
+        title_label = QLabel(title)
+        subtitle_label = QLabel(subtitle)
+        self.title_label = title_label
+        self.subtitle_label = subtitle_label
+        text_layout.addWidget(title_label)
+        text_layout.addWidget(subtitle_label)
+        layout.addLayout(text_layout, 1)
+        self.switch = ToggleSwitch(checked)
+        self.switch.toggled.connect(self.toggled.emit)
+        layout.addWidget(self.switch, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.apply_style()
+
+    def apply_style(self):
         self.setStyleSheet(f"""
             QWidget {{
                 background: {COLORS['surface']};
@@ -1581,22 +1631,11 @@ class SettingsToggleRow(QWidget):
                 border: none;
             }}
         """)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 9, 10, 9)
-        layout.setSpacing(12)
-        text_layout = QVBoxLayout()
-        text_layout.setContentsMargins(0, 0, 0, 0)
-        text_layout.setSpacing(2)
-        title_label = QLabel(title)
-        title_label.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900;")
-        subtitle_label = QLabel(subtitle)
-        subtitle_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; font-weight: 700;")
-        text_layout.addWidget(title_label)
-        text_layout.addWidget(subtitle_label)
-        layout.addLayout(text_layout, 1)
-        self.switch = ToggleSwitch(checked)
-        self.switch.toggled.connect(self.toggled.emit)
-        layout.addWidget(self.switch, 0, Qt.AlignmentFlag.AlignVCenter)
+        if hasattr(self, "title_label"):
+            self.title_label.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900;")
+        if hasattr(self, "subtitle_label"):
+            self.subtitle_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; font-weight: 700;")
+        self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -2506,6 +2545,13 @@ TERMINAL_EXTENSION_COMMAND_SPECS = (
         "internal_prefixes": ("AGENT_WECHAT_CREATE_SCHEDULE", "AGENT_WECHAT_SCHEDULE_ACTION"),
         "usage": "`schedule create/list/delete/update ...`",
     },
+    {
+        "name": "web research",
+        "prefix_re": re.compile(r"^(?:web\s+research(?:\s|$)|AGENT_WEB_RESEARCH(?:\s|[:：]|$))", re.I),
+        "complete_re": re.compile(r"^(?:web\s+research\s+.+|AGENT_WEB_RESEARCH(?:\s*[:：]\s*|\s+).+)$", re.I),
+        "internal_prefixes": ("AGENT_WEB_RESEARCH",),
+        "usage": "`web research 搜索话题`",
+    },
 )
 
 
@@ -2547,6 +2593,11 @@ def normalize_terminal_extension_directive(line: str) -> List[str]:
     stripped = strip_terminal_extension_shell_prefix(line)
     if not stripped:
         return []
+    web_research_match = re.match(r"^web\s+research\s+(.+)$", stripped, re.I)
+    if web_research_match:
+        query = terminal_extension_payload_text(web_research_match.group(1) or "")
+        if query:
+            return [f"AGENT_WEB_RESEARCH: {query}"]
     wx_send_match = re.match(r"^wx\s+send_file\s+(.+)$", stripped, re.I)
     if wx_send_match:
         tail = (wx_send_match.group(1) or "").strip()
@@ -2577,11 +2628,45 @@ def normalize_terminal_extension_directive(line: str) -> List[str]:
         tail = (send_match.group(2) or "").strip()
         targets = [part.strip().strip("\"'") for part in re.split(r"\s*,\s*", tail) if part.strip()]
         return [f"AGENT_WECHAT_SEND_FILE: {target}" for target in targets]
-    for name in ("AGENT_WECHAT_CREATE_SCHEDULE", "AGENT_WECHAT_SCHEDULE_ACTION"):
+    for name in ("AGENT_WECHAT_CREATE_SCHEDULE", "AGENT_WECHAT_SCHEDULE_ACTION", "AGENT_WEB_RESEARCH"):
         match = re.match(rf"^({name})(?:\s*[:：]\s*|\s+)(.+)$", stripped, re.I)
         if match:
             return [f"{name}: {terminal_extension_payload_text(match.group(2) or '')}"]
     return []
+
+
+def extract_web_research_queries(text: str) -> List[str]:
+    queries: List[str] = []
+    for line in str(text or "").splitlines():
+        normalized = normalize_terminal_extension_directive(line)
+        for directive in normalized:
+            upper = directive.upper()
+            if not upper.startswith("AGENT_WEB_RESEARCH:") and not upper.startswith("AGENT_WEB_RESEARCH："):
+                continue
+            _, _, tail = directive.partition(":" if ":" in directive else "：")
+            query = terminal_extension_payload_text(tail)
+            if query:
+                queries.append(query)
+    return queries[:3]
+
+
+def web_research_extension_reply(queries: List[str]) -> str:
+    items = [str(item or "").strip() for item in queries if str(item or "").strip()]
+    if not items:
+        return (
+            "网页搜索请求已接收。下一轮不要再次输出 `web research` 命令；"
+            "请直接使用网页搜索能力补齐所需事实，再基于搜索结果自然语言回答用户。"
+        )
+    if len(items) == 1:
+        return (
+            f"网页搜索请求已接收。下一轮不要再次输出 `web research` 命令；"
+            f"请直接使用网页搜索能力搜索“{items[0]}”，再基于搜索结果自然语言回答用户。"
+        )
+    joined = "；".join(f"“{item}”" for item in items[:3])
+    return (
+        "网页搜索请求已接收。下一轮不要再次输出 `web research` 命令；"
+        f"请直接使用网页搜索能力依次搜索以下话题，再基于搜索结果自然语言回答用户：{joined}。"
+    )
 
 
 def looks_like_incomplete_terminal_extension_command(command_text: str) -> bool:
@@ -4028,6 +4113,14 @@ def build_automation_feedback_prompt(
     clipped_previous_ai = truncate_middle(str(previous_ai_response or "").strip(), 4000)
     env = runtime_environment()
     command_block_lang = env["command_block_lang"]
+    web_research_followup_note = ""
+    log_text = str(execution_log or "")
+    if "web research " in log_text.lower() or "AGENT_WEB_RESEARCH" in log_text:
+        web_research_followup_note = (
+            "\n- 如果上一轮本地执行结果显示网页搜索请求已接收，说明 `web research` 已经触发。"
+            " 下一轮不要再次输出 `web research` 命令，也不要重复解释扩展指令是否生效；"
+            "请直接使用网页搜索能力搜索对应话题，并基于搜索结果自然语言回答用户。"
+        )
     wechat_completion_note = ""
     if wechat_file_delivery:
         wechat_completion_note = (
@@ -4057,13 +4150,14 @@ def build_automation_feedback_prompt(
 - 如果本轮仍在继续处理上面的“原始用户需求”，上一轮本地执行结果、错误提示和拒绝原因与用户需求同等重要；若它指出协议错误、命令错误、缺文件、测试失败或数据不可信，必须先针对该错误修正输出，不要重复上一轮被拒绝的写法。若用户已经发来新的不同需求，则优先执行最新用户需求。
 - 已完成：只回复 `{AUTOMATION_DONE_MARKER}` 加简短总结，不要输出命令块。若下一步还需要执行命令、写文件或发送附件，尚未完成，先输出对应命令块。
 - 未完成：回复里必须包含一个完整且短小的 ```{command_block_lang} 终端命令块；如果要写入超过 10 行的文件内容时，必须拆分为占位符协议 + md格式的fenced 代码块。
-- 命令块内只能写真实要执行的 shell 代码，或 `wx send_file 路径`、`schedule create/list/delete/update`；不要把上一轮执行结果、文件变更、结论或 `{AUTOMATION_DONE_MARKER}` 写进命令块。
+- 命令块内只能写真实要执行的 shell 代码，或 `wx send_file 路径`、`schedule create/list/delete/update`、`web research 搜索话题`；不要把上一轮执行结果、文件变更、结论或 `{AUTOMATION_DONE_MARKER}` 写进命令块。
 - 如果执行结果提示“命令块不完整”“未闭合的 shell 引号”“unmatched quote”或 shell 语法不完整，优先判断为上一轮输出被截断；重新输出完整命令块即可。多行 `python -c "..."` 是支持的，不要仅因这类错误改写成单行脚本。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作已完成、已生成、已验证或已发送。
 - 涉及统计、表格、数据查找或文件事实时，必须完整读取/计算后再下结论；示例行只能用于判断结构，不能据此编造定量结论、模型结论或总体判断。
-- 如果当前任务本质上是在网上搜索信息、找推荐、查近况、找新闻、查附近吃喝玩乐或收集公开网页内容，而不是操作本地项目文件，请优先直接用自然语言完成网页搜索并给出结论；不要为了搜索而生成本地 shell/python 抓取脚本，除非用户明确要求你写脚本，或目标数据只存在当前工作区/本机文件里。
+- 如果当前任务本质上是搜索或调研，而不是操作本地项目文件，请优先在命令块里写 `web research 搜索话题`，由下一轮先触发网页搜索再自然语言作答；不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求你写脚本，或目标数据只存在当前工作区/本机文件里。
 - 后台安装/构建/拉取不要当作完成；启动常驻命令时不要加 `&`/`nohup`，等执行结果给出 `Terminal processes:` 摘要后，再使用 `curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'` 查询控制台输出。
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
+{web_research_followup_note}
 {wechat_completion_note}
 """
 
@@ -4183,7 +4277,7 @@ def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True) -> str
         "- 要查看、删除或修改时间计划：输出命令块。查看写 `schedule list`；删除写 `schedule delete 计划名称、序号或 id`；修改写 `schedule update JSON`，JSON 结构：{\"target\":\"计划名称、序号或 id\",\"enabled\":true,\"trigger\":{\"run_at\":\"YYYY-MM-DD HH:MM:SS\",\"repeat_every_seconds\":3600,\"until_at\":\"YYYY-MM-DD HH:MM:SS\"},\"prompt\":\"可选的新计划内容\",\"title\":\"可选的新标题\"}。`enabled:false` 表示暂停；`enabled:true` 且不带 `trigger` 表示开启并立即安排执行一次；如果只想恢复到未来某个时间，必须同时给 `trigger.run_at`。修改时只写需要变化的字段。如果目标不明确，先简短追问，不要猜。\n"
         "- 要停止/切会话/列列表等控制动作：用户使用 slash/menu 指令时程序会直接处理；自然语言里提到时，你可以解释可用指令。\n"
         "- 如果用户只是问候、闲聊或普通问答，不需要本地命令、文件或计划，直接用简短自然语言回复；不要为了获取时间或构造问候去执行 echo/date。\n"
-        "- 如果用户要你搜索网上信息、找推荐、查新闻、查附近吃喝玩乐或整理公开网页内容，而不是操作本地工作区，请优先直接使用网页搜索能力并用自然语言给出结论；不要为了搜索而生成本地 shell/python 抓取脚本，除非用户明确要求脚本，或目标数据只在当前工作区/本机文件里。\n"
+        "- 如果用户要你做搜索或调研，而不是操作本地工作区，请优先输出一个命令块，写 `web research 搜索话题`；程序会把这条结果写回上下文，下一轮你再基于网页搜索结果自然语言作答。不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求脚本，或目标数据只在当前工作区/本机文件里。\n"
         "如果用户目标不清楚，先做低成本探索；探索后仍缺少关键条件或候选无法判断时，再简短提问。最终给微信的回复会被压缩展示，所以结论要短。"
         f"{file_delivery_note}"
         "如果用户询问菜单、帮助或支持哪些指令，请直接说明这些指令，不要执行项目命令。\n\n"
@@ -4231,49 +4325,75 @@ def unwrap_provider_text(text: str) -> str:
 
 def render_diff_html(record: Dict[str, object]) -> str:
     rows = record.get("diff_rows") or []
+    page_bg = COLORS["code_bg"]
+    page_text = COLORS["text"]
+    text_secondary = COLORS["text_secondary"]
     if not rows:
         return (
-            "<html><body style='font-family: Menlo, monospace; color: #172033;'>"
+            f"<html><body style='margin:0; background:{page_bg}; font-family: Menlo, monospace; color: {page_text};'>"
             f"<pre>{html.escape(str(record.get('diff', '')))}</pre>"
             "</body></html>"
         )
 
     html_rows = [
-        "<html><body style='margin:0; background:#ffffff;'>",
+        f"<html><body style='margin:0; background:{page_bg};'>",
         "<table cellspacing='0' cellpadding='0' width='100%' "
         "style='border-collapse:collapse; font-family: Menlo, monospace; font-size:12px;'>",
     ]
+    dark_theme = app_theme_setting() == "dark"
     for row in rows:
         row_type = row.get("type")
         text = html.escape(str(row.get("text", ""))).replace(" ", "&nbsp;")
         old_num = html.escape(str(row.get("old", "")))
         new_num = html.escape(str(row.get("new", "")))
         if row_type == "add":
-            bg = "#e6f6ed"
-            border = "#12b76a"
-            num_color = "#079455"
+            if dark_theme:
+                bg = "#0f2b22"
+                border = "#19c37d"
+                num_color = "#5fe3a8"
+                text_color = "#dcfff0"
+            else:
+                bg = "#e6f6ed"
+                border = "#12b76a"
+                num_color = "#079455"
+                text_color = page_text
             marker = "+"
         elif row_type == "del":
-            bg = "#ffecec"
-            border = "#ef4444"
-            num_color = "#dc2626"
+            if dark_theme:
+                bg = "#33171b"
+                border = "#ff6b7a"
+                num_color = "#ff95a1"
+                text_color = "#ffe4e7"
+            else:
+                bg = "#ffecec"
+                border = "#ef4444"
+                num_color = "#dc2626"
+                text_color = page_text
             marker = "-"
         elif row_type == "hunk":
-            bg = "#eef4ff"
-            border = "#8ea8ff"
-            num_color = "#657089"
+            if dark_theme:
+                bg = "#182235"
+                border = "#7598ff"
+                num_color = "#9db6ff"
+                text_color = "#dbe5ff"
+            else:
+                bg = "#eef4ff"
+                border = "#8ea8ff"
+                num_color = text_secondary
+                text_color = page_text
             marker = " "
         else:
-            bg = "#ffffff"
-            border = "#ffffff"
-            num_color = "#657089"
+            bg = page_bg
+            border = page_bg
+            num_color = text_secondary
+            text_color = page_text
             marker = " "
         html_rows.append(
             f"<tr style='background:{bg};'>"
             f"<td width='48' style='color:{num_color}; text-align:right; padding:3px 8px; border-left:4px solid {border};'>{old_num}</td>"
             f"<td width='48' style='color:{num_color}; text-align:right; padding:3px 8px;'>{new_num}</td>"
             f"<td width='18' style='color:{num_color}; padding:3px 4px;'>{marker}</td>"
-            f"<td style='color:#172033; padding:3px 8px;'>{text}</td>"
+            f"<td style='color:{text_color}; padding:3px 8px;'>{text}</td>"
             "</tr>"
         )
     html_rows.extend(["</table>", "</body></html>"])
@@ -5728,6 +5848,31 @@ class TerminalResizeHandle(QFrame):
         layout.addStretch()
         layout.addWidget(grip, alignment=Qt.AlignmentFlag.AlignCenter)
         layout.addStretch()
+        self.grip = grip
+        self.apply_theme_style()
+
+    def apply_theme_style(self):
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg']};
+                border: none;
+                border-top: 1px solid {COLORS['border']};
+                border-bottom: 1px solid {COLORS['border']};
+            }}
+            QFrame:hover {{
+                background: {COLORS['accent_light']};
+                border-top: 1px solid {soft_accent_border_color()};
+                border-bottom: 1px solid {soft_accent_border_color()};
+            }}
+        """)
+        if hasattr(self, "grip"):
+            self.grip.setStyleSheet(f"""
+                QFrame {{
+                    background: {COLORS['border_strong']};
+                    border: none;
+                    border-radius: 2px;
+                }}
+            """)
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -5755,6 +5900,8 @@ class TerminalResizeHandle(QFrame):
 
 class SidebarResizeHandle(QFrame):
     resize_requested = Signal(int)
+    drag_started = Signal()
+    drag_finished = Signal()
 
     def __init__(self, sidebar: "Sidebar", parent=None):
         super().__init__(parent)
@@ -5789,6 +5936,26 @@ class SidebarResizeHandle(QFrame):
         self._layout.addWidget(self.grip, alignment=Qt.AlignmentFlag.AlignCenter)
         self._layout.addStretch()
         self.set_grip_visible(False)
+        self.apply_theme_style()
+
+    def apply_theme_style(self):
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg']};
+                border: none;
+            }}
+            QFrame:hover {{
+                background: {COLORS['surface_alt']};
+            }}
+        """)
+        if hasattr(self, "grip"):
+            self.grip.setStyleSheet(f"""
+                QFrame {{
+                    background: {COLORS['border_strong']};
+                    border: none;
+                    border-radius: 2px;
+                }}
+            """)
 
     def install_toggle_button(self, button: QToolButton):
         self._layout.insertSpacing(0, 8)
@@ -5803,6 +5970,7 @@ class SidebarResizeHandle(QFrame):
             self._dragging = True
             self._start_x = int(event.globalPosition().x())
             self._start_width = self.sidebar.current_width()
+            self.drag_started.emit()
             event.accept()
             return
         super().mousePressEvent(event)
@@ -5818,6 +5986,7 @@ class SidebarResizeHandle(QFrame):
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton and self._dragging:
             self._dragging = False
+            self.drag_finished.emit()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -6051,6 +6220,50 @@ class ManagedProcess(QWidget):
             }}
         """)
         self.copy_btn.adjustSize()
+        self.position_copy_button()
+
+    def refresh_visual_settings(self):
+        self.setStyleSheet(f"background: {COLORS['terminal_panel']}; border: none;")
+        self.output.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background: {COLORS['terminal_card']};
+                color: {COLORS['terminal_text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+                font-family: 'SF Mono', 'Menlo', monospace;
+                font-size: 11px;
+                padding: 8px;
+                selection-background-color: {COLORS['accent_light']};
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 8px;
+                margin: 4px 2px 4px 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {COLORS['border_strong']};
+                border-radius: 4px;
+                min-height: 30px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+        """)
+        self.copy_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['surface']};
+                color: {COLORS['accent_dark']};
+                border: 1px solid {soft_accent_border_color()};
+                border-radius: 8px;
+                padding: 3px 10px;
+                font-size: 11px;
+                font-weight: 800;
+            }}
+            QPushButton:hover {{
+                background: {COLORS['accent_light']};
+                border-color: {COLORS['accent']};
+            }}
+        """)
         self.position_copy_button()
 
     def resizeEvent(self, event):
@@ -6331,9 +6544,9 @@ class TerminalTabCard(QFrame):
             self.icon_btn.setIcon(terminal_icon(COLORS["text_secondary"], 16))
 
     def apply_style(self):
-        background = "#eef1f6" if self.active else "transparent"
+        background = COLORS["surface_alt"] if self.active else "transparent"
         border = COLORS["border"] if self.active else "transparent"
-        hover_background = "#f4f6fa" if self.active else "#f7f8fb"
+        hover_background = COLORS["surface"] if self.active else COLORS["surface_alt"]
         hover_border = COLORS["border"] if self.active else "transparent"
         self.setStyleSheet(f"""
             QFrame#terminalTabCard {{
@@ -6346,6 +6559,27 @@ class TerminalTabCard(QFrame):
                 border: 1px solid {hover_border};
             }}
         """)
+        self.title_label.setStyleSheet(f"""
+            QLabel {{
+                color: {COLORS['terminal_text']};
+                background: transparent;
+                border: none;
+                font-size: 12px;
+                font-weight: 700;
+                padding: 0 0 1px 0;
+            }}
+        """)
+        self.icon_btn.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+            }}
+            QToolButton:hover {{
+                background: {COLORS['surface_alt']};
+            }}
+        """)
+        self.update_icon()
 
     def set_active(self, active: bool):
         self.active = active
@@ -6414,11 +6648,12 @@ class TerminalPanel(QWidget):
             f"color: {COLORS['terminal_muted']}; font-size: 11px; background: transparent;"
         )
         self.header_status_label.setVisible(False)
-        collapse_btn = QPushButton("─")
-        collapse_btn.setFixedSize(26, 22)
-        collapse_btn.setCursor(Qt.PointingHandCursor)
-        collapse_btn.setToolTip("")
-        collapse_btn.setStyleSheet(f"""
+        self.title_label = title
+        self.collapse_btn = QPushButton("─")
+        self.collapse_btn.setFixedSize(26, 22)
+        self.collapse_btn.setCursor(Qt.PointingHandCursor)
+        self.collapse_btn.setToolTip("")
+        self.collapse_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {COLORS['surface_alt']};
                 color: {COLORS['text']};
@@ -6432,8 +6667,8 @@ class TerminalPanel(QWidget):
                 color: {COLORS['accent_dark']};
             }}
         """)
-        collapse_btn.clicked.connect(self.collapse)
-        header.addWidget(collapse_btn)
+        self.collapse_btn.clicked.connect(self.collapse)
+        header.addWidget(self.collapse_btn)
         header.addWidget(title)
         header.addWidget(self.count_label)
         header.addStretch()
@@ -6478,6 +6713,49 @@ class TerminalPanel(QWidget):
         self.processes: List[ManagedProcess] = []
         self.completed_terminal_entries: List[Dict[str, object]] = []
         self.setVisible(False)
+
+    def apply_theme_style(self):
+        self.setStyleSheet(f"""
+            QWidget#terminalPanel {{
+                background: {COLORS['terminal_panel']};
+                border-top: 1px solid {COLORS['border']};
+            }}
+        """)
+        for card in self.tab_cards.values():
+            card.apply_style()
+        for proc in self.processes:
+            proc.refresh_visual_settings()
+        self.add_btn.setIcon(line_icon("plus", COLORS["text_secondary"], 18))
+        self.add_btn.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                border: none;
+                border-radius: 10px;
+            }}
+            QToolButton:hover {{
+                background: {COLORS['surface_alt']};
+            }}
+        """)
+        for label, style in (
+            (self.count_label, f"color: {COLORS['terminal_muted']}; font-size: 11px; background: transparent;"),
+            (self.header_status_label, f"color: {COLORS['terminal_muted']}; font-size: 11px; background: transparent;"),
+        ):
+            label.setStyleSheet(style)
+        self.title_label.setStyleSheet(f"color: {COLORS['terminal_text']}; font-weight: 800; font-size: 12px; background: transparent;")
+        self.collapse_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 7px;
+                font-size: 12px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background: {COLORS['accent_light']};
+                color: {COLORS['accent_dark']};
+            }}
+        """)
 
     def set_project_root(self, path: str):
         self.project_root = path
@@ -6919,6 +7197,12 @@ AUTOMATION_DEFAULT_MODEL = "DeepSeekV4"
 AUTOMATION_CONTEXT_MODES = [
     ("专家模式", "expert"),
     ("简单模式", "simple"),
+]
+AUTOMATION_CONTEXT_PRESETS = [
+    {"label": "DeepSeek PRO web", "mode": "expert", "model": "DeepSeekV4"},
+    {"label": "DeepSeek PRO web thinking", "mode": "expert", "model": "DeepSeekV4-thinking"},
+    {"label": "DeepSeek Flash web", "mode": "simple", "model": "xiaomi-mimo-v2.5"},
+    {"label": "DeepSeek Flash web thinking", "mode": "simple", "model": "xiaomi-mimo-v2.5-pro"},
 ]
 AUTOMATION_SIMPLE_MODEL_BY_MODEL = {
     "DeepSeekV4": "DeepSeekV4-simple",
@@ -7565,7 +7849,7 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
             return False
         return self.provider_source_mtime() > started_at + 0.5
 
-    def stop_provider_process(self):
+    def stop_provider_process(self, wait_timeout: float = 6.0, aggressive: bool = False):
         try:
             with open(self.pid_file, "r", encoding="utf-8") as f:
                 pid = int(f.read().strip() or "0")
@@ -7593,16 +7877,30 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
                 os.kill(pid, signal.SIGTERM)
         except Exception:
             pass
-        deadline = time.time() + 6
+        deadline = time.time() + max(0.0, float(wait_timeout))
         while time.time() < deadline:
             if not process_alive(pid):
                 break
             time.sleep(0.2)
+        if aggressive and process_alive(pid):
+            try:
+                if platform.system() == "Windows":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                        **subprocess_no_window_kwargs(),
+                    )
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
         if platform.system() != "Windows" and provider_pgid > 0 and provider_pgid != os.getpgrp():
             try:
                 # Uvicorn gets a graceful SIGTERM first; the process group is only
                 # a safety net for Playwright/Chrome children that outlive it.
-                os.killpg(provider_pgid, signal.SIGKILL if process_alive(pid) else signal.SIGTERM)
+                os.killpg(provider_pgid, signal.SIGKILL if aggressive or process_alive(pid) else signal.SIGTERM)
             except Exception:
                 pass
         try:
@@ -7680,7 +7978,15 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         payload = self.request_json("POST", f"/debug/open-login?model={urllib.parse.quote(model)}", timeout=60)
         return f"已打开登录页: {payload.get('url', self.base_url)}"
 
-    def chat(self, messages: List[Dict[str, str]], model: str, thread_id: str) -> str:
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        thread_id: str,
+        *,
+        thinking_enabled: Optional[bool] = None,
+        expert_mode_enabled: Optional[bool] = None,
+    ) -> str:
         self.start_provider()
         payload = self.request_json(
             "POST",
@@ -7690,8 +7996,14 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
                 "messages": messages,
                 "temperature": 0,
                 "user": thread_id,
+                "thinking_enabled": thinking_enabled,
+                "expert_mode_enabled": expert_mode_enabled,
                 "output_protocol": "plain",
-                "extra_body": {"output_protocol": "plain"},
+                "extra_body": {
+                    "output_protocol": "plain",
+                    "thinking_enabled": thinking_enabled,
+                    "expert_mode_enabled": expert_mode_enabled,
+                },
             },
             timeout=900,
             attempts=PROVIDER_REQUEST_RETRY_ATTEMPTS,
@@ -7804,22 +8116,41 @@ class PythonRuntimeSetupWorker(QThread):
 class AutomationChatWorker(QThread):
     finished_signal = Signal(str, str)
 
-    def __init__(self, manager: AutomationProviderManager, messages: List[Dict[str, str]], model: str, thread_id: str):
+    def __init__(
+        self,
+        manager: AutomationProviderManager,
+        messages: List[Dict[str, str]],
+        model: str,
+        thread_id: str,
+        *,
+        thinking_enabled: Optional[bool] = None,
+        expert_mode_enabled: Optional[bool] = None,
+    ):
         super().__init__()
         self.manager = manager
         self.messages = messages
         self.model = model
         self.thread_id = thread_id
+        self.thinking_enabled = thinking_enabled
+        self.expert_mode_enabled = expert_mode_enabled
 
     def run(self):
         try:
             started = time.perf_counter()
-            text = self.manager.chat(self.messages, self.model, self.thread_id)
+            text = self.manager.chat(
+                self.messages,
+                self.model,
+                self.thread_id,
+                thinking_enabled=self.thinking_enabled,
+                expert_mode_enabled=self.expert_mode_enabled,
+            )
             logger.warning(
-                "Automation chat worker done elapsed_ms=%d message_chars=%d response_chars=%d",
+                "Automation chat worker done elapsed_ms=%d message_chars=%d response_chars=%d thinking_enabled=%s expert_mode_enabled=%s",
                 int((time.perf_counter() - started) * 1000),
                 sum(len(str(message.get("content") or "")) for message in self.messages),
                 len(text),
+                self.thinking_enabled,
+                self.expert_mode_enabled,
             )
             self.finished_signal.emit(text, "")
         except Exception as exc:
@@ -8242,6 +8573,9 @@ def schedule_extension_reply(
 def terminal_extension_command_for_log(directive: str) -> str:
     stripped = str(directive or "").strip()
     upper = stripped.upper()
+    if upper.startswith("AGENT_WEB_RESEARCH:") or upper.startswith("AGENT_WEB_RESEARCH："):
+        _, _, tail = stripped.partition(":" if ":" in stripped else "：")
+        return "web research " + tail.strip()
     if upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE:") or upper.startswith("AGENT_WECHAT_CREATE_SCHEDULE："):
         _, _, tail = stripped.partition(":" if ":" in stripped else "：")
         return "schedule create " + tail.strip()
@@ -10060,6 +10394,40 @@ class ChatBubble(QFrame):
             if label in self.markdown_widgets:
                 continue
             label.setStyleSheet(f"color: {COLORS['text']}; font-weight: 700; font-size: 13px; background: transparent;")
+        copy_btn = getattr(self, "copy_btn", None)
+        if isinstance(copy_btn, QPushButton):
+            copy_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['accent_dark']};
+                    border: 1px solid {soft_accent_border_color()};
+                    border-radius: 9px;
+                    padding: 5px 12px;
+                    font-size: 12px;
+                    font-weight: 700;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS['accent_light']};
+                    border-color: {COLORS['accent']};
+                }}
+            """)
+        paste_ai_btn = getattr(self, "paste_ai_btn", None)
+        if isinstance(paste_ai_btn, QPushButton):
+            paste_ai_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['accent_dark']};
+                    border: 1px solid {soft_accent_border_color()};
+                    border-radius: 9px;
+                    padding: 5px 12px;
+                    font-size: 12px;
+                    font-weight: 700;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS['accent_light']};
+                    border-color: {COLORS['accent']};
+                }}
+            """)
         if self.markdown and self.expand_to_content:
             parts = split_markdown_fenced_blocks(self.visible_content())
             signatures = [
@@ -10587,7 +10955,7 @@ class ChangeSummaryCard(QFrame):
         diff_view.setVisible(False)
         diff_view.setStyleSheet(f"""
             QTextEdit {{
-                background: #ffffff;
+                background: {COLORS['code_bg']};
                 color: {COLORS['text']};
                 border: 1px solid {COLORS['border']};
                 border-radius: 10px;
@@ -10625,15 +10993,43 @@ class ChangeSummaryCard(QFrame):
         }.get(status, "二进制/Office 文件已变更")
         path = html.escape(str(record.get("path", "")))
         return (
-            "<html><body style='margin:0; background:#ffffff; color:#172033; "
+            f"<html><body style='margin:0; background:{COLORS['code_bg']}; color:{COLORS['text']}; "
             "font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;'>"
             "<div style='padding:12px 14px;'>"
             f"<div style='font-weight:700; font-size:13px;'>{status_text}</div>"
-            f"<div style='margin-top:6px; color:#657089; font-size:12px;'>{path}</div>"
-            "<div style='margin-top:8px; color:#657089; font-size:12px;'>"
+            f"<div style='margin-top:6px; color:{COLORS['text_secondary']}; font-size:12px;'>{path}</div>"
+            f"<div style='margin-top:8px; color:{COLORS['text_secondary']}; font-size:12px;'>"
             "此类文件无法生成逐行文本 diff，但仍可撤销/重做本轮变更。"
             "</div></div></body></html>"
         )
+
+    def refresh_visual_settings(self):
+        for record, diff_view in zip(self.records, self.detail_widgets):
+            if record.get("binary"):
+                diff_view.setHtml(self.render_binary_change_html(record))
+            else:
+                diff_view.setHtml(render_diff_html(record))
+            diff_view.setStyleSheet(f"""
+                QTextEdit {{
+                    background: {COLORS['code_bg']};
+                    color: {COLORS['text']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 10px;
+                    padding: 0;
+                    font-family: 'SF Mono', 'Menlo', monospace;
+                    font-size: 12px;
+                }}
+                QScrollBar:vertical {{
+                    background: transparent;
+                    width: 8px;
+                }}
+                QScrollBar::handle:vertical {{
+                    background: {COLORS['border_strong']};
+                    border-radius: 4px;
+                    min-height: 28px;
+                }}
+            """)
+        self.apply_state_style(self.is_undone)
 
     def apply_state_style(self, undone: bool):
         self.setStyleSheet(f"""
@@ -10652,12 +11048,63 @@ class ChangeSummaryCard(QFrame):
             self.stats_del_label.setStyleSheet(f"color: {COLORS['muted'] if undone else COLORS['danger']}; font-size: 12px; font-weight: 900; background: transparent; border: none;")
         if self.status_label:
             self.status_label.setVisible(undone)
+            self.status_label.setStyleSheet(f"""
+                QLabel {{
+                    background: {COLORS['surface_alt']};
+                    color: {COLORS['muted']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 9px;
+                    padding: 4px 8px;
+                    font-size: 11px;
+                    font-weight: 900;
+                }}
+            """)
+        if self.undo_btn:
+            accent_text = COLORS['accent_dark'] if undone else COLORS['danger']
+            hover_bg = COLORS['accent_light'] if undone else COLORS['danger_soft']
+            hover_border = COLORS['accent'] if undone else "#ffd0d2"
+            self.undo_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {accent_text};
+                    border: 1px solid {hover_border};
+                    border-radius: 10px;
+                    padding: 6px 12px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{
+                    background: {hover_bg};
+                }}
+                QPushButton:disabled {{
+                    color: {COLORS['muted']};
+                    border-color: {COLORS['border']};
+                    background: {COLORS['surface_alt']};
+                }}
+            """)
         for row in self.file_row_widgets:
             row.setStyleSheet(f"""
                 QFrame#changeFileRow {{
                     background: {COLORS['code_bg']};
                     border: 1px solid {COLORS['border']};
                     border-radius: 12px;
+                }}
+            """)
+        for row in self.file_row_toggles:
+            row.setStyleSheet(f"""
+                QFrame#changeFileToggle {{
+                    background: transparent;
+                    border: none;
+                    padding: 4px 2px;
+                }}
+                QFrame#changeFileToggle:hover QLabel#changePathLabel {{
+                    color: {COLORS['accent_dark']};
+                }}
+                QLabel {{
+                    background: transparent;
+                    border: none;
+                    font-size: 12px;
+                    font-weight: 800;
                 }}
             """)
         for label in [*self.file_row_text_labels, *self.file_row_stat_labels]:
@@ -11558,11 +12005,11 @@ class HomePage(QWidget):
         """)
         shell_layout.addWidget(brand_badge, alignment=Qt.AlignCenter)
 
-        title = QLabel("Agent 控制台", alignment=Qt.AlignCenter)
+        title = QLabel("Agent. QT智能体", alignment=Qt.AlignCenter)
         title.setStyleSheet(f"font-size: 34px; font-weight: 900; color: {COLORS['text']}; background: transparent; border: none;")
         shell_layout.addWidget(title)
 
-        subtitle = QLabel("把 AI 输出粘贴回来，自动解析占位符、写入文件并管理本地进程。")
+        subtitle = QLabel("粘贴 AI 回复后，自动识别命令块、文件正文、扩展指令与后台进程。")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(f"font-size: 14px; color: {COLORS['text_secondary']}; background: transparent; border: none;")
@@ -11577,12 +12024,12 @@ class HomePage(QWidget):
         features_layout.setVerticalSpacing(12)
         
         for idx, (emoji, name, desc) in enumerate([
-            ("PROMPT", "复制提示词", "自动生成带项目路径和执行协议的完整提示词。"),
-            ("PASTE", "粘贴 AI 回复", "识别 Bash、HTML、CSS、JS 等代码块并缓存。"),
-            ("RUN", "自动执行", "替换占位符后按顺序执行，heredoc 会保持完整。"),
-            ("TERM", "后台进程", "本地服务器会进入底部终端，随时查看和停止。"),
-            ("FILES", "文件管理", "侧栏浏览项目文件，支持刷新、打开和复制路径。"),
-            ("FLOW", "连续工作", "第二天继续也能从目录结构快速恢复上下文。"),
+            ("PROMPT", "复制提示词", "生成带工作区路径、执行协议和扩展指令说明的完整提示词。"),
+            ("PASTE", "粘贴 AI 回复", "识别 Bash、HTML、CSS、JS、SVG、JSON 等代码块并安全分离内容。"),
+            ("RUN", "自动执行", "按顺序执行命令块、替换占位符、保留 heredoc，并记录执行结果。"),
+            ("TERM", "终端与后台", "长任务会进入底部终端区域，可持续查看输出、复制日志和手动停止。"),
+            ("FILES", "文件与变更", "侧栏浏览项目文件，展示文件变更卡片，并支持 Undo / Redo。"),
+            ("FLOW", "连续协作", "保留对话、执行结果和自动化上下文，方便继续编程、办公和调研工作。"),
         ]):
             card = QFrame()
             card.setMinimumHeight(92)
@@ -11608,7 +12055,7 @@ class HomePage(QWidget):
                     font-weight: 900;
                 }}
             """)
-            row.addWidget(badge, alignment=Qt.AlignTop)
+            row.addWidget(badge, alignment=Qt.AlignVCenter)
             text_col = QVBoxLayout()
             text_col.setSpacing(4)
             name_label = QLabel(name)
@@ -11834,6 +12281,7 @@ class ChatPage(QWidget):
         self.last_automation_history_compacted = False
         self._last_context_compaction_notice_at = 0.0
         self._shutdown_done = False
+        self.preferences_dialog: Optional[QDialog] = None
         self.chat_column_max_width = 1480
         self.chat_column_width_ratio = 0.94
         self.user_bubble_width_ratio = 0.75
@@ -11907,12 +12355,15 @@ class ChatPage(QWidget):
         sw_layout.setSpacing(0)
         self.sidebar_resize_handle = SidebarResizeHandle(self.sidebar)
         self.sidebar_resize_handle.resize_requested.connect(self.resize_sidebar)
+        self.sidebar_resize_handle.drag_started.connect(self.begin_sidebar_resize_feedback)
+        self.sidebar_resize_handle.drag_finished.connect(self.end_sidebar_resize_feedback)
         self.sidebar_resize_handle.install_toggle_button(self.sidebar_btn)
         sw_layout.addWidget(self.sidebar)
         sw_layout.addWidget(self.sidebar_resize_handle)
         body.addWidget(sidebar_wrapper, 0)
         
         right_panel = QWidget(styleSheet=f"background: {COLORS['bg']};")
+        self.right_panel = right_panel
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 16, 18, 0)
         right_layout.setSpacing(12)
@@ -11920,6 +12371,7 @@ class ChatPage(QWidget):
         # 路径标签（双击返回首页）
         path_bar = QHBoxLayout()
         path_title = QLabel("工作区")
+        self.path_title = path_title
         path_title.setStyleSheet(f"color: {COLORS['text']}; font-size: 18px; font-weight: 900; background: transparent;")
         path_bar.addWidget(path_title)
         self.path_label = QLabel("", cursor=Qt.PointingHandCursor,
@@ -12013,9 +12465,11 @@ class ChatPage(QWidget):
                                            }}
                                            QScrollArea QWidget#qt_scrollarea_viewport {{
                                                background: {COLORS['surface']};
+                                               border-radius: 18px;
                                            }}
                                            QScrollArea > QWidget > QWidget {{
                                                background: {COLORS['surface']};
+                                               border-radius: 18px;
                                            }}
                                            QScrollBar:vertical {{
                                                background: transparent;
@@ -12049,9 +12503,23 @@ class ChatPage(QWidget):
         self.chat_root_layout.addWidget(self.chat_column, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self.chat_layout = self.chat_column_layout
         self.scroll_area.setWidget(self.chat_container)
-        self.scroll_area.viewport().setStyleSheet(f"background: {COLORS['surface']};")
+        self.scroll_area.viewport().setStyleSheet(f"background: {COLORS['surface']}; border-radius: 18px;")
         self.scroll_area.viewport().installEventFilter(self)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self.on_chat_scroll_changed)
+        self.sidebar_resize_overlay = QLabel("正在调整侧栏宽度，释放后恢复内容显示", self.scroll_area.viewport())
+        self.sidebar_resize_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sidebar_resize_overlay.setVisible(False)
+        self.sidebar_resize_overlay.setStyleSheet(f"""
+            QLabel {{
+                background: {COLORS['surface']};
+                color: {COLORS['text_secondary']};
+                border: 1px dashed {COLORS['border']};
+                border-radius: 18px;
+                font-size: 13px;
+                font-weight: 800;
+                padding: 20px;
+            }}
+        """)
         right_layout.addWidget(self.scroll_area, 1)
 
         self.automation_composer = QFrame()
@@ -12070,7 +12538,13 @@ class ChatPage(QWidget):
         composer_layout.setSpacing(8)
         composer_input_column = QWidget()
         self.automation_composer_input_column = composer_input_column
-        composer_input_column.setStyleSheet("background: transparent;")
+        composer_input_column.setObjectName("automationComposerInputColumn")
+        composer_input_column.setStyleSheet("""
+            QWidget#automationComposerInputColumn {
+                background: transparent;
+                border-radius: 14px;
+            }
+        """)
         composer_input_layout = QVBoxLayout(composer_input_column)
         composer_input_layout.setContentsMargins(0, 0, 0, 0)
         composer_input_layout.setSpacing(2)
@@ -12086,6 +12560,7 @@ class ChatPage(QWidget):
             lambda pos, editor=self.automation_input: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
         )
         self.automation_input.setStyleSheet(self.automation_input_style())
+        self.automation_input.viewport().setStyleSheet("background: transparent; border-radius: 14px;")
         composer_input_layout.addWidget(self.automation_input, 1)
         mode_row = QHBoxLayout()
         mode_row.setContentsMargins(0, 0, 0, 0)
@@ -12214,6 +12689,7 @@ class ChatPage(QWidget):
         try:
             if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
                 self.update_chat_column_width()
+                self.update_sidebar_resize_overlay_geometry()
         except RuntimeError:
             return False
         return super().eventFilter(watched, event)
@@ -12340,6 +12816,28 @@ class ChatPage(QWidget):
     def update_sidebar_wrapper_width(self):
         handle_width = self.sidebar_resize_handle.width()
         self.sidebar_wrapper.setFixedWidth(self.sidebar.current_width() + handle_width)
+
+    def update_sidebar_resize_overlay_geometry(self):
+        if not hasattr(self, "scroll_area") or not hasattr(self, "sidebar_resize_overlay"):
+            return
+        viewport = self.scroll_area.viewport()
+        self.sidebar_resize_overlay.setGeometry(viewport.rect())
+
+    def begin_sidebar_resize_feedback(self):
+        if hasattr(self, "chat_column"):
+            self.chat_column.setVisible(False)
+        self.update_sidebar_resize_overlay_geometry()
+        if hasattr(self, "sidebar_resize_overlay"):
+            self.sidebar_resize_overlay.setVisible(True)
+            self.sidebar_resize_overlay.raise_()
+
+    def end_sidebar_resize_feedback(self):
+        if hasattr(self, "sidebar_resize_overlay"):
+            self.sidebar_resize_overlay.setVisible(False)
+        if hasattr(self, "chat_column"):
+            self.chat_column.setVisible(True)
+            self.chat_column.adjustSize()
+        QTimer.singleShot(0, self.update_chat_column_width)
     
     def scroll_to_bottom(self):
         if not self.should_auto_follow_chat_scroll():
@@ -12906,16 +13404,28 @@ class ChatPage(QWidget):
         return
 
     def automation_context_mode_label(self) -> str:
+        for preset in AUTOMATION_CONTEXT_PRESETS:
+            if (
+                str(preset.get("mode") or "") == self.automation_context_mode
+                and str(preset.get("model") or "") == self.automation_model
+            ):
+                return str(preset.get("label") or "")
         if self.automation_context_mode == "simple":
-            return f"简单模式 · {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)}"
-        return "专家模式 · 约45k"
+            return "DeepSeek PRO web thinking"
+        return "DeepSeek PRO web"
 
     def create_automation_context_mode_menu(self) -> QMenu:
         menu = style_skill_popup_menu(QMenu(self))
-        for label, mode in AUTOMATION_CONTEXT_MODES:
-            suffix = f" · {context_k_label(AUTOMATION_CONTEXT_COMPACT_TRIGGER_TOKENS)}" if mode == "simple" else " · 约45k"
-            action = QAction(label + suffix, self)
-            action.triggered.connect(lambda _checked=False, value=mode: self.set_automation_context_mode(value))
+        for preset in AUTOMATION_CONTEXT_PRESETS:
+            label = str(preset.get("label") or "")
+            mode = str(preset.get("mode") or "expert")
+            model_id = str(preset.get("model") or AUTOMATION_DEFAULT_MODEL)
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(mode == self.automation_context_mode and model_id == self.automation_model)
+            action.triggered.connect(
+                lambda _checked=False, value_mode=mode, value_model=model_id: self.set_automation_preset(value_mode, value_model)
+            )
             menu.addAction(action)
         return menu
 
@@ -12923,6 +13433,18 @@ class ChatPage(QWidget):
         def sync_width():
             width = button.width() or button.sizeHint().width()
             menu.setFixedWidth(max(1, width))
+
+        menu.aboutToShow.connect(sync_width)
+        sync_width()
+        button.setMenu(menu)
+
+    def attach_button_min_width_menu(self, button: QToolButton, menu: QMenu):
+        def sync_width():
+            button_width = button.width() or button.sizeHint().width()
+            label_widths = [button.fontMetrics().horizontalAdvance(action.text()) for action in menu.actions() if action.text()]
+            content_width = max(label_widths or [0]) + 44
+            target = max(button_width, min(340, max(170, content_width)))
+            menu.setFixedWidth(target)
 
         menu.aboutToShow.connect(sync_width)
         sync_width()
@@ -12944,7 +13466,7 @@ class ChatPage(QWidget):
         if button is None:
             return
         button.setText(self.automation_context_mode_label() + " ▾")
-        self.attach_button_sized_menu(button, self.create_automation_context_mode_menu())
+        self.attach_button_min_width_menu(button, self.create_automation_context_mode_menu())
         button.setStyleSheet(f"""
             QToolButton {{
                 background: transparent;
@@ -12956,6 +13478,10 @@ class ChatPage(QWidget):
                 font-weight: 700;
             }}
             QToolButton:hover {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text']};
+            }}
+            QToolButton:pressed, QToolButton:open {{
                 background: {COLORS['surface_alt']};
                 color: {COLORS['text']};
             }}
@@ -12995,22 +13521,33 @@ class ChatPage(QWidget):
         for skill in self.skills:
             skill_id = str(skill.get("id") or "")
             label = str(skill.get("name") or skill_id)
-            row = QWidget(menu)
-            row.setStyleSheet("QWidget { background: transparent; border: none; }")
+            row = ClickableFrame(menu)
+            row.setObjectName("automationSkillOptionRow")
             row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(8, 3, 8, 3)
-            row_layout.setSpacing(6)
-            checkbox = QCheckBox(label, row)
+            row_layout.setContentsMargins(8, 4, 8, 4)
+            row_layout.setSpacing(8)
+            row.setStyleSheet(f"""
+                QFrame#automationSkillOptionRow {{
+                    background: transparent;
+                    border: none;
+                    border-radius: 10px;
+                }}
+                QFrame#automationSkillOptionRow:hover {{
+                    background: {COLORS['accent_light']};
+                }}
+                QLabel {{
+                    background: transparent;
+                    border: none;
+                }}
+            """)
+            checkbox = QCheckBox("", row)
             checkbox.setChecked(skill_id in self.selected_skill_ids)
             checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
             checkbox.setStyleSheet(f"""
                 QCheckBox {{
                     background: transparent;
-                    color: {COLORS['text']};
                     border: none;
-                    font-size: 11px;
-                    font-weight: 800;
-                    spacing: 7px;
+                    spacing: 0;
                 }}
                 QCheckBox::indicator {{
                     width: 12px;
@@ -13025,11 +13562,18 @@ class ChatPage(QWidget):
                     image: none;
                 }}
             """)
-            row_layout.addWidget(checkbox, 1)
+            label_widget = QLabel(label, row)
+            label_widget.setStyleSheet(
+                f"color: {COLORS['text']}; font-size: 11px; font-weight: 800; background: transparent; border: none;"
+            )
+            label_widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            row_layout.addWidget(checkbox, 0)
+            row_layout.addWidget(label_widget, 1)
             action = QWidgetAction(menu)
             action.setText(label)
             action.setDefaultWidget(row)
             checkbox.toggled.connect(lambda checked=False, value=skill_id: self.set_automation_skill_selected(value, checked, rebuild_menu=False))
+            row.clicked.connect(lambda box=checkbox: box.setChecked(not box.isChecked()))
             menu.addAction(action)
         if self.skills:
             menu.addSeparator()
@@ -13059,11 +13603,22 @@ class ChatPage(QWidget):
                 background: {COLORS['surface_alt']};
                 color: {COLORS['text']};
             }}
+            QToolButton:pressed, QToolButton:open {{
+                background: {COLORS['surface_alt']};
+                color: {COLORS['text']};
+            }}
             QToolButton::menu-indicator {{
                 image: none;
                 width: 0;
             }}
         """)
+
+    def set_automation_preset(self, mode: str, model_id: str):
+        self.automation_model = str(model_id or AUTOMATION_DEFAULT_MODEL)
+        self.automation_context_mode = "simple" if str(mode).strip().lower() == "simple" else "expert"
+        set_automation_context_mode_setting(self.automation_context_mode)
+        self.update_automation_context_mode_button()
+        self.update_automation_composer_state()
 
     def update_automation_skill_button_text(self):
         button = self.automation_skill_btn
@@ -13190,16 +13745,16 @@ class ChatPage(QWidget):
         def segment_style(active: bool) -> str:
             return f"""
                 QPushButton {{
-                    background: {'#e8edf7' if active else COLORS['surface']};
-                    color: {COLORS['text']};
-                    border: none;
+                    background: {COLORS['accent'] if active else COLORS['surface']};
+                    color: {'white' if active else COLORS['text']};
+                    border: 1px solid {COLORS['accent'] if active else COLORS['border']};
                     border-radius: 11px;
                     padding: 7px 14px;
                     font-size: 12px;
                     font-weight: 900;
                 }}
                 QPushButton:hover {{
-                    background: {COLORS['surface_alt']};
+                    background: {COLORS['accent_dark'] if active else COLORS['surface_alt']};
                 }}
             """
 
@@ -13730,6 +14285,53 @@ class ChatPage(QWidget):
         self.setStyleSheet(f"background: {COLORS['bg']};")
         if hasattr(self, "sidebar"):
             self.sidebar.apply_theme_style()
+        if hasattr(self, "sidebar_resize_handle"):
+            self.sidebar_resize_handle.apply_theme_style()
+        if hasattr(self, "sidebar_btn"):
+            self.sidebar_btn.setStyleSheet(f"""
+                QToolButton {{
+                    background: transparent;
+                    border: none;
+                    color: {COLORS['accent_dark']};
+                    font-size: 20px;
+                    font-weight: 800;
+                    padding-top: 3px;
+                }}
+                QToolButton:hover {{
+                    background: {COLORS['accent_light']};
+                    border-radius: 8px;
+                }}
+            """)
+        if hasattr(self, "right_panel"):
+            self.right_panel.setStyleSheet(f"background: {COLORS['bg']};")
+        if hasattr(self, "path_title"):
+            self.path_title.setStyleSheet(f"color: {COLORS['text']}; font-size: 18px; font-weight: 900; background: transparent;")
+        if hasattr(self, "path_label"):
+            self.path_label.setStyleSheet(f"""
+                QLabel {{
+                    color: {COLORS['text_secondary']};
+                    font-size: 12px;
+                    padding: 8px 12px;
+                    background: {COLORS['surface']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 12px;
+                }}
+            """)
+        if hasattr(self, "copy_prompt_btn"):
+            self.copy_prompt_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['accent']};
+                    color: white;
+                    border: none;
+                    border-radius: 10px;
+                    padding: 6px 12px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS['accent_dark']};
+                }}
+            """)
         if self.settings_btn is not None:
             self.settings_btn.setIcon(line_icon("settings", COLORS["text"], 18))
             self.settings_btn.setStyleSheet(f"""
@@ -13746,12 +14348,67 @@ class ChatPage(QWidget):
                     color: {COLORS['accent_dark']};
                 }}
             """)
+        if hasattr(self, "top_clear_history_btn"):
+            self.top_clear_history_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['danger']};
+                    border: 1px solid #ffd0d2;
+                    border-radius: 10px;
+                    padding: 6px 12px;
+                    font-size: 12px;
+                    font-weight: 800;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS['danger_soft']};
+                }}
+            """)
         if hasattr(self, "chat_container"):
-            self.chat_container.setStyleSheet(f"background: {COLORS['surface']};")
+            self.chat_container.setStyleSheet(f"background: {COLORS['surface']}; border-radius: 18px;")
         if hasattr(self, "chat_column"):
             self.chat_column.setStyleSheet(f"background: {COLORS['surface']};")
         if hasattr(self, "scroll_area"):
-            self.scroll_area.viewport().setStyleSheet(f"background: {COLORS['surface']};")
+            self.scroll_area.setStyleSheet(f"""
+                QScrollArea {{
+                    background: {COLORS['surface']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 18px;
+                }}
+                QScrollArea QWidget#qt_scrollarea_viewport {{
+                    background: {COLORS['surface']};
+                    border-radius: 18px;
+                }}
+                QScrollArea > QWidget > QWidget {{
+                    background: {COLORS['surface']};
+                    border-radius: 18px;
+                }}
+                QScrollBar:vertical {{
+                    background: transparent;
+                    width: 8px;
+                    margin: 6px 2px 6px 0;
+                }}
+                QScrollBar::handle:vertical {{
+                    background: {COLORS['border_strong']};
+                    border-radius: 4px;
+                    min-height: 30px;
+                }}
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                    height: 0;
+                }}
+            """)
+            self.scroll_area.viewport().setStyleSheet(f"background: {COLORS['surface']}; border-radius: 18px;")
+        if hasattr(self, "sidebar_resize_overlay"):
+            self.sidebar_resize_overlay.setStyleSheet(f"""
+                QLabel {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text_secondary']};
+                    border: 1px dashed {COLORS['border']};
+                    border-radius: 18px;
+                    font-size: 13px;
+                    font-weight: 800;
+                    padding: 20px;
+                }}
+            """)
         if self.automation_composer is not None:
             self.automation_composer.setStyleSheet(f"""
                 QFrame {{
@@ -13760,11 +14417,23 @@ class ChatPage(QWidget):
                     border-radius: 18px;
                 }}
             """)
+        if self.automation_composer_input_column is not None:
+            self.automation_composer_input_column.setStyleSheet("""
+                QWidget#automationComposerInputColumn {
+                    background: transparent;
+                    border-radius: 14px;
+                }
+            """)
         if self.automation_input is not None:
             self.automation_input.setStyleSheet(self.automation_input_style())
+            self.automation_input.viewport().setStyleSheet("background: transparent; border-radius: 14px;")
+        if self.automation_context_mode_btn is not None:
+            self.update_automation_context_mode_button()
+        if self.automation_skill_btn is not None:
+            self.update_automation_skill_button()
         for idx in range(self.chat_layout.count()):
             widget = self.chat_layout.itemAt(idx).widget()
-            if isinstance(widget, (ChatBubble, ExecutionLogPanel)):
+            if isinstance(widget, (ChatBubble, ExecutionLogPanel, ChangeSummaryCard)):
                 widget.refresh_visual_settings()
                 continue
             if isinstance(widget, QLabel):
@@ -13784,9 +14453,30 @@ class ChatPage(QWidget):
                 ai_input = getattr(widget, "ai_input", None)
                 if ai_input is not None:
                     ai_input.setStyleSheet(self.ai_manual_input_style())
+        if hasattr(self, "terminal_panel"):
+            self.terminal_panel.apply_theme_style()
+        if hasattr(self, "terminal_resize_handle"):
+            self.terminal_resize_handle.apply_theme_style()
+        if hasattr(self, "status_bar"):
+            self.status_bar.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['terminal_panel']};
+                    color: {COLORS['terminal_text']};
+                    border: none;
+                    border-top: 1px solid {COLORS['border']};
+                    padding: 7px 16px;
+                    font-size: 12px;
+                    font-weight: 800;
+                    text-align: left;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS['surface_alt']};
+                }}
+            """)
         window = self.window()
         if isinstance(window, QMainWindow):
             window.setStyleSheet(f"QMainWindow {{ background: {COLORS['bg']}; }}")
+        self.apply_preferences_dialog_theme()
         self.update_automation_composer_state()
         if hasattr(self, "chat_column"):
             self.chat_column.adjustSize()
@@ -13805,22 +14495,87 @@ class ChatPage(QWidget):
         apply_theme_palette(next_theme)
         self.apply_chat_visual_settings()
 
-    def show_preferences_dialog(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("偏好设置")
-        dialog.setMinimumWidth(460)
+    def apply_preferences_dialog_theme(self):
+        dialog = self.preferences_dialog
+        if dialog is None:
+            return
         dialog.setStyleSheet(f"""
             QDialog {{
                 background: {COLORS['bg_top']};
                 color: {COLORS['text']};
             }}
         """)
+        for attr in ("preferences_title_label", "preferences_font_label", "preferences_language_label"):
+            label = getattr(dialog, attr, None)
+            if isinstance(label, QLabel):
+                label.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900;")
+        if hasattr(dialog, "preferences_title_label") and isinstance(dialog.preferences_title_label, QLabel):
+            dialog.preferences_title_label.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 15px; font-weight: 900;")
+        language_value = getattr(dialog, "preferences_language_value", None)
+        if isinstance(language_value, QLabel):
+            language_value.setStyleSheet(
+                f"color: {COLORS['text_secondary']}; background: {COLORS['surface_alt']}; "
+                f"border: 1px solid {COLORS['border']}; border-radius: 10px; padding: 9px 12px; font-size: 12px; font-weight: 800;"
+            )
+        theme_toggle = getattr(dialog, "preferences_theme_toggle", None)
+        if isinstance(theme_toggle, SettingsToggleRow):
+            theme_toggle.apply_style()
+        proxy_toggle = getattr(dialog, "preferences_proxy_toggle", None)
+        if isinstance(proxy_toggle, SettingsToggleRow):
+            proxy_toggle.apply_style()
+        font_buttons = getattr(dialog, "preferences_font_buttons", []) or []
+        for item in font_buttons:
+            if not isinstance(item, QPushButton):
+                continue
+            item.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['accent'] if item.isChecked() else COLORS['surface']};
+                    color: {'white' if item.isChecked() else COLORS['text']};
+                    border: 1px solid {COLORS['accent'] if item.isChecked() else COLORS['border']};
+                    border-radius: 10px;
+                    padding: 6px 12px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{ background: {COLORS['accent_dark'] if item.isChecked() else COLORS['surface_alt']}; }}
+            """)
+        close_btn = getattr(dialog, "preferences_close_btn", None)
+        if isinstance(close_btn, QPushButton):
+            close_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 10px;
+                    padding: 6px 18px;
+                    font-size: 12px;
+                    font-weight: 900;
+                }}
+                QPushButton:hover {{ background: {COLORS['surface_alt']}; }}
+            """)
+        dialog.update()
+
+    def show_preferences_dialog(self):
+        dialog = self.preferences_dialog
+        if dialog is not None:
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+
+        dialog = QDialog(self)
+        self.preferences_dialog = dialog
+        dialog.setWindowTitle("偏好设置")
+        dialog.setMinimumWidth(460)
+        dialog.setModal(False)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.finished.connect(lambda _code: setattr(self, "preferences_dialog", None))
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(12)
 
         title = QLabel("偏好设置")
-        title.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 15px; font-weight: 900;")
+        dialog.preferences_title_label = title
         layout.addWidget(title)
 
         theme_toggle = SettingsToggleRow(
@@ -13829,6 +14584,7 @@ class ChatPage(QWidget):
             app_theme_setting() == "dark",
             parent=dialog,
         )
+        dialog.preferences_theme_toggle = theme_toggle
         layout.addWidget(theme_toggle)
 
         proxy_toggle = SettingsToggleRow(
@@ -13837,10 +14593,11 @@ class ChatPage(QWidget):
             use_system_proxy_setting(),
             parent=dialog,
         )
+        dialog.preferences_proxy_toggle = proxy_toggle
         layout.addWidget(proxy_toggle)
 
         font_label = QLabel("对话字号")
-        font_label.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900;")
+        dialog.preferences_font_label = font_label
         layout.addWidget(font_label)
         font_row = QHBoxLayout()
         font_row.setSpacing(8)
@@ -13860,40 +14617,24 @@ class ChatPage(QWidget):
 
             btn.clicked.connect(choose_font)
             font_row.addWidget(btn, 1)
+        dialog.preferences_font_buttons = font_buttons
         layout.addLayout(font_row)
 
         language_label = QLabel("语言设置")
-        language_label.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 13px; font-weight: 900;")
+        dialog.preferences_language_label = language_label
         layout.addWidget(language_label)
         language_value = QLabel("简体中文")
-        language_value.setStyleSheet(f"color: {COLORS['text_secondary']}; background: {COLORS['surface_alt']}; border: 1px solid {COLORS['border']}; border-radius: 10px; padding: 9px 12px; font-size: 12px; font-weight: 800;")
+        dialog.preferences_language_value = language_value
         layout.addWidget(language_value)
 
-        def refresh_font_buttons():
-            for item in font_buttons:
-                item.setStyleSheet(f"""
-                    QPushButton {{
-                        background: {COLORS['accent'] if item.isChecked() else COLORS['surface']};
-                        color: {'white' if item.isChecked() else COLORS['text']};
-                        border: 1px solid {COLORS['accent'] if item.isChecked() else COLORS['border']};
-                        border-radius: 10px;
-                        padding: 6px 12px;
-                        font-size: 12px;
-                        font-weight: 900;
-                    }}
-                    QPushButton:hover {{ background: {COLORS['accent_dark'] if item.isChecked() else COLORS['surface_alt']}; }}
-                """)
-
         for btn in font_buttons:
-            btn.toggled.connect(lambda _checked=False: refresh_font_buttons())
-        refresh_font_buttons()
+            btn.toggled.connect(lambda _checked=False: self.apply_preferences_dialog_theme())
 
         def on_theme_toggled(enabled: bool):
             set_app_theme_setting("dark" if enabled else "light")
             apply_theme_palette(app_theme_setting())
             self.apply_chat_visual_settings()
-            dialog.close()
-            self.show_preferences_dialog()
+            self.apply_preferences_dialog_theme()
 
         theme_toggle.toggled.connect(on_theme_toggled)
 
@@ -13911,22 +14652,14 @@ class ChatPage(QWidget):
         row.addStretch()
         close_btn = QPushButton("关闭", cursor=Qt.CursorShape.PointingHandCursor)
         close_btn.setFixedHeight(34)
-        close_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['surface']};
-                color: {COLORS['text']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 10px;
-                padding: 6px 18px;
-                font-size: 12px;
-                font-weight: 900;
-            }}
-            QPushButton:hover {{ background: {COLORS['surface_alt']}; }}
-        """)
+        dialog.preferences_close_btn = close_btn
         close_btn.clicked.connect(dialog.close)
         row.addWidget(close_btn)
         layout.addLayout(row)
-        dialog.exec()
+        self.apply_preferences_dialog_theme()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def show_schedules_dialog(self):
         dialog = QDialog(self)
@@ -14953,7 +15686,7 @@ class ChatPage(QWidget):
         self.add_status_bubble(f"已导出长截图：{path}")
 
     def show_share_menu(self):
-        menu = QMenu(self)
+        menu = style_compact_popup_menu(QMenu(self))
         md_action = QAction("分享为 Markdown (.md)", self)
         md_action.triggered.connect(lambda: self.export_conversation_text("md"))
         menu.addAction(md_action)
@@ -15570,6 +16303,50 @@ class ChatPage(QWidget):
         if self.automation_composer is not None:
             self.automation_composer.setVisible(False)
 
+    def automation_send_button_style(self, busy: bool = False) -> str:
+        if busy:
+            return f"""
+                QToolButton {{
+                    background: #8b95aa;
+                    border: none;
+                    border-radius: 21px;
+                }}
+                QToolButton:hover {{
+                    background: #6f7788;
+                }}
+                QToolButton:pressed {{
+                    background: #626a7b;
+                }}
+            """
+        return f"""
+            QToolButton {{
+                background: {COLORS['accent']};
+                border: none;
+                border-radius: 21px;
+            }}
+            QToolButton:hover {{
+                background: {COLORS['accent_dark']};
+            }}
+            QToolButton:pressed {{
+                background: {COLORS['accent_dark']};
+            }}
+        """
+
+    def stop_provider_async(self, wait_timeout: float = 0.8, aggressive: bool = True):
+        if getattr(self, "_provider_stop_async_running", False):
+            return
+        self._provider_stop_async_running = True
+
+        def _runner():
+            try:
+                self.automation_manager.stop_provider_process(wait_timeout=wait_timeout, aggressive=aggressive)
+            except Exception:
+                logger.warning("Asynchronous provider stop failed.", exc_info=True)
+            finally:
+                self._provider_stop_async_running = False
+
+        threading.Thread(target=_runner, name="AgentQtStopProvider", daemon=True).start()
+
     def on_automation_input_text_changed(self):
         if (
             self.automation_input is not None
@@ -15593,29 +16370,11 @@ class ChatPage(QWidget):
         if busy:
             self.automation_input.setPlaceholderText("等待执行完成。现在可以输入草稿")
             self.automation_send_btn.setIcon(line_icon("pause", "#ffffff", 20))
-            self.automation_send_btn.setStyleSheet(f"""
-                QToolButton {{
-                    background: #8b95aa;
-                    border: none;
-                    border-radius: 21px;
-                }}
-                QToolButton:hover {{
-                    background: #6f7788;
-                }}
-            """)
+            self.automation_send_btn.setStyleSheet(self.automation_send_button_style(busy=True))
         else:
             self.automation_input.setPlaceholderText(self.automation_context_placeholder_text())
             self.automation_send_btn.setIcon(line_icon("send", "white", 20))
-            self.automation_send_btn.setStyleSheet(f"""
-                QToolButton {{
-                    background: {COLORS['accent']};
-                    border: none;
-                    border-radius: 21px;
-                }}
-                QToolButton:hover {{
-                    background: {COLORS['accent_dark']};
-                }}
-            """)
+            self.automation_send_btn.setStyleSheet(self.automation_send_button_style(busy=False))
 
     def on_automation_composer_action(self):
         if self.is_automation_busy():
@@ -15648,38 +16407,18 @@ class ChatPage(QWidget):
                 self.thread_id + "-context-compact",
             )
             context_worker.requestInterruption()
-            if context_worker.wait(2500):
-                pass
-            else:
-                self.automation_manager.stop_provider_process()
-                if context_worker.wait(2500):
-                    pass
-                else:
-                    context_worker.terminate()
-                    if context_worker.wait(1200):
-                        pass
-                    else:
-                        context_worker.finished.connect(context_worker.deleteLater)
+            context_worker.finished.connect(context_worker.deleteLater)
             if self.automation_context_worker is context_worker:
                 self.automation_context_worker = None
         worker = self.automation_worker
         self.automation_manager.cancel_generation(self.effective_automation_model(), self.thread_id)
         if worker is not None:
             worker.requestInterruption()
-            if worker.wait(2500):
-                pass
-            else:
-                self.automation_manager.stop_provider_process()
-                if worker.wait(2500):
-                    pass
-                else:
-                    worker.terminate()
-                    if worker.wait(1200):
-                        pass
-                    else:
-                        worker.finished.connect(worker.deleteLater)
+            worker.finished.connect(worker.deleteLater)
             if self.automation_worker is worker:
                 self.automation_worker = None
+        if context_worker is not None or worker is not None:
+            self.stop_provider_async(wait_timeout=0.8, aggressive=True)
         self.automation_active_messages = []
         self.automation_active_model = ""
         if self.is_execution_running() and self.worker is not None:
@@ -16430,6 +17169,8 @@ class ChatPage(QWidget):
                 messages,
                 provider_model,
                 self.thread_id,
+                thinking_enabled=automation_thinking_enabled(self.automation_model),
+                expert_mode_enabled=(self.automation_context_mode == "expert"),
             )
             self.automation_worker = worker
             worker.finished.connect(worker.deleteLater)
@@ -16972,7 +17713,7 @@ class ChatPage(QWidget):
             ):
                 if worker is not None:
                     worker.requestInterruption()
-            self.automation_manager.stop_provider_process()
+            self.automation_manager.stop_provider_process(wait_timeout=0.8, aggressive=True)
         except Exception:
             logger.warning("Failed to stop automation provider during app shutdown.", exc_info=True)
         if hasattr(self, "wechat_connector"):
@@ -17219,6 +17960,7 @@ class ChatPage(QWidget):
                 "\n".join(terminal_extension_triggers)
             )
             file_targets = extract_wechat_send_file_targets("\n".join(terminal_extension_triggers))
+            web_research_queries = extract_web_research_queries("\n".join(terminal_extension_triggers))
             has_schedule_directive = bool(schedule_payloads or schedule_actions or schedule_errors)
             if has_schedule_directive and not has_real_command:
                 created: List[str] = []
@@ -17240,6 +17982,12 @@ class ChatPage(QWidget):
                 display_text = schedule_extension_reply(created, action_replies, errors) or "已处理定时计划。"
                 terminal_extension_result_log = terminal_extension_execution_log(terminal_extension_triggers, display_text)
                 done_response = True
+            elif web_research_queries and not has_real_command:
+                display_text = stripped_display_text or "已切换为网页搜索，下一轮将先搜索再回答。"
+                terminal_extension_result_log = terminal_extension_execution_log(
+                    terminal_extension_triggers,
+                    web_research_extension_reply(web_research_queries),
+                )
             elif file_targets and not has_real_command:
                 display_text = wechat_trigger_summary(terminal_extension_triggers)
                 done_context_text = (display_text + "\n\n" + "\n".join(terminal_extension_triggers)).strip()
@@ -17333,6 +18081,18 @@ class ChatPage(QWidget):
             return
         
         if not commands:
+            if self.automation_loop_active and terminal_extension_triggers:
+                web_research_queries = extract_web_research_queries("\n".join(terminal_extension_triggers))
+                if web_research_queries:
+                    execution_text = terminal_extension_result_log or terminal_extension_execution_log(
+                        terminal_extension_triggers,
+                        web_research_extension_reply(web_research_queries),
+                    )
+                    context_content = build_execution_context_content(execution_text, [])
+                    self.add_execution_result_entry(execution_text, context_content=context_content)
+                    self.request_next_automation_step(context_content)
+                    self.scroll_to_bottom()
+                    return
             if self.automation_loop_active:
                 if looks_like_noop_plain_automation_response(display_text):
                     self.finish_active_schedule_success(display_text)
@@ -17631,7 +18391,7 @@ class ChatPage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Agent 控制台 v5.1")
+        self.setWindowTitle("Agent. QT智能体 · 你的编程办公调研实验远控助手")
         self.setMinimumSize(960, 680)
         self.resize(1120, 820)
         self.setStyleSheet(f"""
@@ -17676,6 +18436,8 @@ class MainWindow(QMainWindow):
         self.chat_page.shutdown()
 
     def closeEvent(self, event):
+        self.hide()
+        QApplication.processEvents()
         self.shutdown()
         super().closeEvent(event)
 
