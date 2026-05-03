@@ -467,6 +467,32 @@ def bundled_runtime_roots() -> List[str]:
     return roots
 
 
+def bundled_asset_roots() -> List[str]:
+    roots: List[str] = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        roots.extend([
+            os.path.join(exe_dir, "assets"),
+            os.path.join(exe_dir, "_internal", "assets"),
+            os.path.abspath(os.path.join(exe_dir, "..", "Resources", "assets")),
+        ])
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            roots.append(os.path.join(meipass, "assets"))
+    else:
+        source_dir = os.path.dirname(os.path.abspath(__file__))
+        roots.append(os.path.join(source_dir, "assets"))
+    return roots
+
+
+def find_bundled_asset(*relative_parts: str) -> str:
+    for root in bundled_asset_roots():
+        candidate = os.path.join(root, *relative_parts)
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return ""
+
+
 def find_existing_runtime_python() -> str:
     explicit = os.path.expanduser(os.environ.get("AGENT_QT_PYTHON", ""))
     candidates = [explicit] if explicit else []
@@ -18764,8 +18790,14 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setFont(QFont("PingFang SC", 13))
+    app_icon_path = find_bundled_asset("app_icon.png")
+    if app_icon_path:
+        app_icon = QIcon(app_icon_path)
+        app.setWindowIcon(app_icon)
     app.setStyleSheet(app_global_style())
     window = MainWindow()
+    if app_icon_path:
+        window.setWindowIcon(QIcon(app_icon_path))
     app.aboutToQuit.connect(window.shutdown)
     window.show()
     sys.exit(app.exec())
