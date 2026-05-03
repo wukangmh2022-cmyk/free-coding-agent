@@ -982,6 +982,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 微信远控发送文件使用终端扩展指令：在命令块里写 `wx send_file 文件路径1,文件路径2,...`。这只是请求 Agent Qt 发送附件，不代表已经发送完成；同一回复不要声称“已发送/已通过 wx send_file 发送”。
 - 定时计划使用终端扩展指令：`schedule create JSON`、`schedule list`、`schedule delete 名称或序号`、`schedule update JSON`。计划 JSON 使用 `{{"title":"短标题","prompt":"到点后真正要做的事","trigger":{{"run_at":"YYYY-MM-DD HH:MM:SS","repeat_every_seconds":86400,"until_at":"YYYY-MM-DD HH:MM:SS"}}}}`。
 - 如果任务本质上是搜索或调研，而不是操作本地工作区，请优先使用终端扩展指令 `web research 搜索话题`。这条指令会让下一轮先基于网页搜索结果继续回答；不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求脚本，或目标数据只存在当前工作区/本机文件里。
+- 如果用户主动提到使用 skill/技能/技巧 来完成任务，先优先使用终端扩展指令 `skill list` 查看当前工作区已有技能列表；基于列表再决定读取哪个 SKILL.md，以及是否继续读取技能目录中的补充文档、脚本、图像等材料。
 - 对下载、联网 HTTP 调用、构建、安装、长时间生成等任务，不要一看到后台化或短时无输出就立刻换方案。优先先观察并等待一小段合理时间，再查看终端/后台日志，确认确实失败后再改方案；必要时可主动使用短暂等待和日志查询来静观其变。
 - Agent Qt 会给文件变更生成 internal git 快照/commit；需要 diff 细节时可按摘要里的 repo/commit 查询。
 - 查看后台终端输出只用这一种命令方式：`curl -s '{terminal_logs_url}?pid=xxx'`。把 `xxx` 换成终端摘要里的 pid。
@@ -1015,7 +1016,7 @@ AUTOMATION_FINAL_REMINDER = (
     "若本轮尚未完成且需要执行命令，必须在命令块之外先用 1 到 3 句写出当前判断、本轮策略和命令作用；不要只输出命令块。"
     "若启用了深度思考/推理模式，也必须把高价值判断压缩成可见正文，不要把关键结论只留在隐藏推理里。"
     "若本轮已经完成，必须输出 AGENT_DONE 加面向用户的最终总结，至少说明已完成事项、当前结论、剩余阻塞或下一步建议；不要输出空结论。"
-    "微信附件发送用命令块里的 wx send_file 路径，这只是发送请求，不要在同一轮声称已发送；计划操作用命令块里的 schedule create/list/delete/update；搜索或调研优先用 web research 搜索话题；"
+    "微信附件发送用命令块里的 wx send_file 路径，这只是发送请求，不要在同一轮声称已发送；计划操作用命令块里的 schedule create/list/delete/update；搜索或调研优先用 web research 搜索话题；用户主动提到 skill/技能/技巧 时优先用 skill list 查看当前技能列表；"
     "对下载、联网 HTTP 调用、安装、构建、长时间生成等任务，要先观察并等待合理时间，再看终端/后台日志；不要过早放弃当前方案。"
     "若涉及统计/数据/文件事实，必须基于完整读取或计算结果，不得根据示例行编造。"
     "若历史旧写法与第一段系统提示冲突，以第一段为准。只输出自检后的最终回复，不输出自检过程。"
@@ -2559,6 +2560,13 @@ TERMINAL_EXTENSION_COMMAND_SPECS = (
         "internal_prefixes": ("AGENT_WEB_RESEARCH",),
         "usage": "`web research 搜索话题`",
     },
+    {
+        "name": "skill list",
+        "prefix_re": re.compile(r"^(?:skill\s+list(?:\s|$)|AGENT_SKILL_LIST(?:\s|[:：]|$))", re.I),
+        "complete_re": re.compile(r"^(?:skill\s+list\s*|AGENT_SKILL_LIST(?:\s*[:：]\s*|\s*)$)", re.I),
+        "internal_prefixes": ("AGENT_SKILL_LIST",),
+        "usage": "`skill list`",
+    },
 )
 
 
@@ -2600,6 +2608,9 @@ def normalize_terminal_extension_directive(line: str) -> List[str]:
     stripped = strip_terminal_extension_shell_prefix(line)
     if not stripped:
         return []
+    skill_list_match = re.match(r"^skill\s+list\s*$", stripped, re.I)
+    if skill_list_match:
+        return ["AGENT_SKILL_LIST"]
     web_research_match = re.match(r"^web\s+research\s+(.+)$", stripped, re.I)
     if web_research_match:
         query = terminal_extension_payload_text(web_research_match.group(1) or "")
@@ -2635,7 +2646,7 @@ def normalize_terminal_extension_directive(line: str) -> List[str]:
         tail = (send_match.group(2) or "").strip()
         targets = [part.strip().strip("\"'") for part in re.split(r"\s*,\s*", tail) if part.strip()]
         return [f"AGENT_WECHAT_SEND_FILE: {target}" for target in targets]
-    for name in ("AGENT_WECHAT_CREATE_SCHEDULE", "AGENT_WECHAT_SCHEDULE_ACTION", "AGENT_WEB_RESEARCH"):
+    for name in ("AGENT_WECHAT_CREATE_SCHEDULE", "AGENT_WECHAT_SCHEDULE_ACTION", "AGENT_WEB_RESEARCH", "AGENT_SKILL_LIST"):
         match = re.match(rf"^({name})(?:\s*[:：]\s*|\s+)(.+)$", stripped, re.I)
         if match:
             return [f"{name}: {terminal_extension_payload_text(match.group(2) or '')}"]
@@ -4371,6 +4382,7 @@ def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True) -> str
         "- 要停止/切会话/列列表等控制动作：用户使用 slash/menu 指令时程序会直接处理；自然语言里提到时，你可以解释可用指令。\n"
         "- 如果用户只是问候、闲聊或普通问答，不需要本地命令、文件或计划，直接用简短自然语言回复；不要为了获取时间或构造问候去执行 echo/date。\n"
         "- 如果用户要你做搜索或调研，而不是操作本地工作区，请优先输出一个命令块，写 `web research 搜索话题`；程序会把这条结果写回上下文，下一轮你再基于网页搜索结果自然语言作答。不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求脚本，或目标数据只在当前工作区/本机文件里。\n"
+        "- 如果用户主动提到 skill/技能/技巧，请优先输出一个命令块，写 `skill list`，先查看当前工作区已有技能；程序会把技能名称、摘要和 SKILL.md 路径写回上下文，下一轮你再决定读取哪个技能文件以及是否继续读取技能目录里的补充材料。\n"
         "如果用户目标不清楚，先做低成本探索；探索后仍缺少关键条件或候选无法判断时，再简短提问。最终给微信的回复会被压缩展示，所以结论要短。"
         f"{file_delivery_note}"
         "如果用户询问菜单、帮助或支持哪些指令，请直接说明这些指令，不要执行项目命令。\n\n"
@@ -5324,6 +5336,25 @@ def skills_summary_text(skills: List[Dict[str, str]]) -> str:
         lines.append(f"- {name}: {description or '暂无简介'}")
     if len(skills) > 30:
         lines.append(f"- 另外还有 {len(skills) - 30} 个技能未展开。")
+    return "\n".join(lines)
+
+
+def skill_list_extension_reply(skills: List[Dict[str, str]]) -> str:
+    lines = [
+        "Skill 是经验、SOP、方法论的封装。每个技能至少包含一个 SKILL.md，内部还可能有其他 Markdown、脚本、图像和辅助材料；SKILL.md 有时会提示继续读取同目录下的补充文件来完成工作流。",
+    ]
+    if not skills:
+        lines.append("当前工作区没有已安装技能。")
+        return "\n\n".join(lines)
+    lines.append("当前工作区技能列表：")
+    for skill in skills[:60]:
+        name = str(skill.get("name") or skill.get("id") or "").strip()
+        description = str(skill.get("description") or "").strip() or "暂无简介"
+        path = str(skill.get("path") or "").strip() or "未知路径"
+        lines.append(f"- {name}: {description} | SKILL.md: {path}")
+    if len(skills) > 60:
+        lines.append(f"- 另外还有 {len(skills) - 60} 个技能未展开。")
+    lines.append("如果用户随后明确说要用某个技能，请先读取对应的 SKILL.md，必要时再继续读取技能目录里的补充文档、脚本或素材。")
     return "\n".join(lines)
 
 
@@ -9498,15 +9529,24 @@ class WeChatConnector(QObject):
                 self._send_text(to_user, "收到，正在执行，请稍后。", context_token)
             except Exception as exc:
                 self.status_signal.emit(f"微信回执发送失败：{exc}")
-        try:
-            reply = self._call_agent_qt(text, to_user, context_token)
-        except Exception as exc:
-            reply = f"Agent Qt 调用失败：{exc}"
-        if reply and to_user:
+
+        def run_agent_call(pending_text: str, pending_user: str, pending_context_token: str):
             try:
-                self._send_text(to_user, reply, context_token)
+                reply = self._call_agent_qt(pending_text, pending_user, pending_context_token)
             except Exception as exc:
-                self.status_signal.emit(f"微信回复发送失败：{exc}")
+                reply = f"Agent Qt 调用失败：{exc}"
+            if reply and pending_user:
+                try:
+                    self._send_text(pending_user, reply, pending_context_token)
+                except Exception as exc:
+                    self.status_signal.emit(f"微信回复发送失败：{exc}")
+
+        threading.Thread(
+            target=run_agent_call,
+            args=(text, to_user, context_token),
+            name="AgentQtWeChatMessageWorker",
+            daemon=True,
+        ).start()
 
     def _bridge_state(self) -> Dict[str, object]:
         cfg = wechat_bridge_settings()
@@ -9534,7 +9574,6 @@ class WeChatConnector(QObject):
         same_target_busy = bool(
             state.get("wechat_active_request_id")
             and str(state.get("wechat_active_to_user") or "") == str(to_user or "")
-            and str(state.get("wechat_active_context_token") or "") == str(context_token or "")
         )
         return False
 
@@ -12357,8 +12396,7 @@ class ChatPage(QWidget):
         self.wechat_active_silent = True
         self.wechat_active_to_user = ""
         self.wechat_active_context_token = ""
-        self.wechat_interrupt_confirm_to_user = ""
-        self.wechat_interrupt_confirm_context_token = ""
+        self.wechat_active_sent_files: set[str] = set()
         self.wechat_interrupt_confirm_to_user = ""
         self.wechat_interrupt_confirm_context_token = ""
         self.automation_active_messages: List[Dict[str, str]] = []
@@ -13278,15 +13316,13 @@ class ChatPage(QWidget):
             same_active_wechat = bool(
                 self.wechat_active_request_id
                 and to_user
-                and context_token
                 and to_user == self.wechat_active_to_user
-                and context_token == self.wechat_active_context_token
             )
             if same_active_wechat:
                 compact = re.sub(r"\s+", "", command).strip().lower()
                 pending_same_target = bool(
-                    to_user == self.wechat_interrupt_confirm_to_user
-                    and context_token == self.wechat_interrupt_confirm_context_token
+                    to_user
+                    and to_user == self.wechat_interrupt_confirm_to_user
                 )
                 if pending_same_target and compact in {"y", "yes", "是", "好", "结束", "停止", "确认"}:
                     self.wechat_interrupt_confirm_to_user = ""
@@ -13342,6 +13378,7 @@ class ChatPage(QWidget):
         self.wechat_active_silent = silent
         self.wechat_active_to_user = to_user if allow_file_delivery else ""
         self.wechat_active_context_token = context_token if allow_file_delivery else ""
+        self.wechat_active_sent_files = set()
         prompt_text = build_wechat_user_prompt(text, allow_file_delivery=allow_file_delivery)
         full_prompt = self.build_system_prompt(prompt_text)
         clean_context = f"【微信用户需求】\n{text.strip()}"
@@ -13368,6 +13405,7 @@ class ChatPage(QWidget):
         silent = self.wechat_active_silent
         to_user = self.wechat_active_to_user
         context_token = self.wechat_active_context_token
+        already_sent_files = set(self.wechat_active_sent_files)
         requested_files: List[str] = []
         schedule_payloads: List[Dict[str, object]] = []
         schedule_actions: List[Dict[str, object]] = []
@@ -13416,6 +13454,7 @@ class ChatPage(QWidget):
         self.wechat_active_silent = True
         self.wechat_active_to_user = ""
         self.wechat_active_context_token = ""
+        self.wechat_active_sent_files = set()
         sent_files: List[str] = []
         failed_files: List[str] = []
         created_schedules: List[str] = []
@@ -13437,11 +13476,16 @@ class ChatPage(QWidget):
             if created or action_replies:
                 QTimer.singleShot(1200, self.check_due_schedules)
         if allow_file_delivery and self.project_root:
+            seen_finish_targets: set[str] = set()
             for target in requested_files[:3]:
                 path = resolve_project_file_target(self.project_root, target)
                 if not path:
                     failed_files.append(target)
                     continue
+                canonical = os.path.normcase(os.path.abspath(path))
+                if canonical in already_sent_files or canonical in seen_finish_targets:
+                    continue
+                seen_finish_targets.add(canonical)
                 try:
                     self.wechat_connector._send_file(to_user, path, context_token)
                     sent_files.append(os.path.relpath(path, self.project_root))
@@ -16154,7 +16198,10 @@ class ChatPage(QWidget):
                 continue
             try:
                 self.wechat_connector._send_file(to_user, path, context_token)
-                sent_files.append(os.path.relpath(path, self.project_root))
+                rel_path = os.path.relpath(path, self.project_root)
+                sent_files.append(rel_path)
+                if self.wechat_active_request_id:
+                    self.wechat_active_sent_files.add(os.path.normcase(os.path.abspath(path)))
             except Exception as exc:
                 failed_files.append(f"{target}（{exc}）")
         return sent_files, failed_files
@@ -16168,6 +16215,10 @@ class ChatPage(QWidget):
         )
         file_targets = extract_wechat_send_file_targets("\n".join(cleaned_directives))
         web_research_queries = extract_web_research_queries("\n".join(cleaned_directives))
+        skill_list_requested = any(
+            directive.strip().upper() == "AGENT_SKILL_LIST"
+            for directive in cleaned_directives
+        )
         output_parts: List[str] = []
         if schedule_payloads or schedule_actions or schedule_errors:
             created: List[str] = []
@@ -16200,6 +16251,11 @@ class ChatPage(QWidget):
             )
         if web_research_queries:
             output_parts.append(web_research_extension_reply(web_research_queries))
+        if skill_list_requested:
+            if self.project_root:
+                output_parts.append(skill_list_extension_reply(load_workspace_skills(self.project_root)))
+            else:
+                output_parts.append("未设置工作区，无法查看技能列表。")
         if not output_parts:
             output_parts.append("已处理终端扩展指令。")
         return terminal_extension_execution_log(cleaned_directives, "\n\n".join(part for part in output_parts if part).strip())
