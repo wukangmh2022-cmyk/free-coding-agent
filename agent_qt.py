@@ -620,7 +620,18 @@ def posix_join(args: List[str]) -> str:
     return " ".join(shlex.quote(str(arg)) for arg in args if str(arg))
 
 
-WINDOWS_PYTHON_INSTALLER_URL = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+WINDOWS_PYTHON_INSTALLER_URLS = [
+    "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe",
+    "https://mirrors.aliyun.com/python-release/windows/python-3.12.10-amd64.exe",
+    "https://mirrors.tuna.tsinghua.edu.cn/python/3.12.10/python-3.12.10-amd64.exe",
+    "https://mirrors.huaweicloud.com/python/3.12.10/python-3.12.10-amd64.exe",
+]
+WINDOWS_INSTALLER_PIP_SOURCE_MAP = [
+    ("www.python.org", OFFICIAL_PIP_INDEX_URL, "pypi.org files.pythonhosted.org"),
+    ("mirrors.aliyun.com", "https://mirrors.aliyun.com/pypi/simple", "mirrors.aliyun.com"),
+    ("mirrors.tuna.tsinghua.edu.cn", DEFAULT_PIP_INDEX_URL, "pypi.tuna.tsinghua.edu.cn"),
+    ("mirrors.huaweicloud.com", "https://mirrors.huaweicloud.com/repository/pypi/simple", "mirrors.huaweicloud.com"),
+]
 
 
 def ps_quote(value: str) -> str:
@@ -631,6 +642,15 @@ def ps_array(args: List[str]) -> str:
     return "@(" + ", ".join(ps_quote(str(arg)) for arg in args) + ")"
 
 
+def windows_python_installer_urls() -> List[str]:
+    raw = os.environ.get("AGENT_QT_WINDOWS_PYTHON_INSTALLER_URLS", "").strip()
+    if raw:
+        urls = [part.strip() for part in re.split(r"[;\n]+", raw) if part.strip()]
+        if urls:
+            return urls
+    return WINDOWS_PYTHON_INSTALLER_URLS
+
+
 def ps_pip_fallback_indexes() -> str:
     rows = []
     for label, url in FALLBACK_PIP_INDEXES:
@@ -639,11 +659,20 @@ def ps_pip_fallback_indexes() -> str:
     return "@(" + ", ".join(rows) + ")"
 
 
+def ps_installer_pip_source_map() -> str:
+    rows = []
+    for installer_host, index_url, trusted_hosts in WINDOWS_INSTALLER_PIP_SOURCE_MAP:
+        rows.append("@(" + ", ".join(ps_quote(part) for part in (installer_host, index_url, trusted_hosts)) + ")")
+    return "@(" + ", ".join(rows) + ")"
+
+
 def windows_python_bootstrap_powershell() -> str:
     base_python_dir = os.path.join(runtime_cache_root(), "python312")
     return f"""
 $BasePython = $null
 $BasePythonDir = {ps_quote(base_python_dir)}
+$PythonInstallerUrls = {ps_array(windows_python_installer_urls())}
+$PythonInstallerPipSourceMap = {ps_installer_pip_source_map()}
 
 function Test-AgentQtPython($Path) {{
     if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {{ return $false }}
@@ -657,6 +686,91 @@ function Use-AgentQtPython($Path) {{
         return $true
     }}
     return $false
+}}
+
+function Set-AgentQtPreferredPipSourceFromInstaller {{
+    param([string]$InstallerUrl)
+    if (-not $InstallerUrl -or -not $script:PythonInstallerPipSourceMap) {{ return }}
+    $installerHost = ''
+    try {{ $installerHost = ([Uri]$InstallerUrl).Host.ToLowerInvariant() }} catch {{ return }}
+    foreach ($row in $script:PythonInstallerPipSourceMap) {{
+        $host = ([string]$row[0]).ToLowerInvariant()
+        $indexUrl = [string]$row[1]
+        $trustedHosts = [string]$row[2]
+        if (-not $host -or -not $indexUrl) {{ continue }}
+        if ($installerHost -eq $host) {{
+            $args = @('-i', $indexUrl)
+            foreach ($trustedHost in ($trustedHosts -split '\\s+')) {{
+                if ($trustedHost) {{
+                    $args += @('--trusted-host', $trustedHost)
+                }}
+            }}
+            $script:PipIndexArgs = $args
+            Write-Host "根据 Python 安装器成功源，优先使用 pip 源: $indexUrl"
+            return
+        }}
+    }}
+}}
+
+function Invoke-AgentQtDownloadFile {{
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Urls,
+        [Parameter(Mandatory=$true)][string]$OutFile,
+        [int64]$MinimumBytes = 1048576
+    )
+    $attemptErrors = New-Object System.Collections.Generic.List[string]
+    try {{
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        if ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {{
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13
+        }}
+        [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+    }} catch {{ }}
+
+    foreach ($url in $Urls) {{
+        if (-not $url) {{ continue }}
+        Write-Host "下载 Python 安装器: $url"
+        Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+        $downloaded = $false
+        $methods = @('Invoke-WebRequest', 'WebClient', 'curl.exe', 'BitsTransfer')
+        foreach ($method in $methods) {{
+            if ($downloaded) {{ break }}
+            try {{
+                Write-Host "  尝试 $method..."
+                if ($method -eq 'Invoke-WebRequest') {{
+                    Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing -Headers @{{ 'User-Agent' = 'AgentQt-PythonBootstrap/1.0' }} -TimeoutSec 120
+                }} elseif ($method -eq 'WebClient') {{
+                    $client = New-Object System.Net.WebClient
+                    $client.Headers.Add('User-Agent', 'AgentQt-PythonBootstrap/1.0')
+                    $client.DownloadFile($url, $OutFile)
+                }} elseif ($method -eq 'curl.exe') {{
+                    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+                    if (-not $curl) {{ continue }}
+                    & curl.exe -L --fail --connect-timeout 20 --retry 2 --retry-delay 2 -A 'AgentQt-PythonBootstrap/1.0' -o $OutFile $url
+                    if ($LASTEXITCODE -ne 0) {{ throw "curl.exe 退出码: $LASTEXITCODE" }}
+                }} else {{
+                    $bits = Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue
+                    if (-not $bits) {{ continue }}
+                    Start-BitsTransfer -Source $url -Destination $OutFile -ErrorAction Stop
+                }}
+                $item = Get-Item -LiteralPath $OutFile -ErrorAction Stop
+                if ($item.Length -lt $MinimumBytes) {{
+                    throw "下载文件过小: $($item.Length) bytes"
+                }}
+                $downloaded = $true
+                $script:AgentQtPythonInstallerUrl = $url
+                Write-Host "  下载完成: $($item.Length) bytes"
+            }} catch {{
+                $message = "$method 失败: $($_.Exception.Message)"
+                Write-Host "  $message"
+                $attemptErrors.Add("$url -> $message") | Out-Null
+                Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+            }}
+        }}
+        if ($downloaded) {{ return }}
+    }}
+    $details = [string]::Join("`n", $attemptErrors.ToArray())
+    throw "无法下载 Python 安装器。已尝试官方源和国内镜像。详情:`n$details"
 }}
 
 $candidatePaths = @(
@@ -702,8 +816,8 @@ if (-not $BasePython) {{
     New-Item -ItemType Directory -Force -Path $BasePythonDir | Out-Null
     $installer = Join-Path $env:TEMP ("agent-qt-python-3.12-" + [guid]::NewGuid().ToString("N") + ".exe")
     try {{
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri {ps_quote(WINDOWS_PYTHON_INSTALLER_URL)} -OutFile $installer
+        Invoke-AgentQtDownloadFile -Urls $PythonInstallerUrls -OutFile $installer
+        Set-AgentQtPreferredPipSourceFromInstaller -InstallerUrl $script:AgentQtPythonInstallerUrl
         & $installer /quiet InstallAllUsers=0 TargetDir="$BasePythonDir" PrependPath=0 Include_pip=1 Include_launcher=0 Include_test=0
         $installExit = $LASTEXITCODE
         if ($installExit -ne 0 -and $installExit -ne 3010) {{
@@ -7689,6 +7803,7 @@ print("chromium ok")
                 "pip",
                 "install",
                 *pip_index_args(),
+                "ddgs",
                 "fastapi>=0.115.0",
                 "uvicorn[standard]>=0.34.0",
                 "pydantic>=2",
@@ -7738,6 +7853,7 @@ print("chromium ok")
         venv_dir = os.path.join(plugin_root, ".venv")
         python_bin = automation_venv_python(plugin_root)
         package_args = [
+            "ddgs",
             "fastapi>=0.115.0",
             "uvicorn[standard]>=0.34.0",
             "pydantic>=2",
@@ -7798,6 +7914,11 @@ if ($BrowserChannel) {{
     & $PythonBin -m playwright install chromium
     if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
 }}
+
+Write-Host ""
+Write-Host "验证 provider 依赖包..."
+& $PythonBin -c "import ddgs, fastapi, uvicorn, pydantic, jsonschema, langchain_core, playwright; print('provider packages OK')"
+if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
 
 Write-Host ""
 Write-Host "验证 provider 模块..."
