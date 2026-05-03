@@ -420,6 +420,19 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
         fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
     ),
+    "DeepSeekV4-simple-thinking": ModelSpec(
+        model_id="DeepSeekV4-simple-thinking",
+        profile_dir=DEERFLOW_PROFILE_DIR,
+        force_new_chat=DEERFLOW_FORCE_NEW_CHAT,
+        sticky_marker=DEERFLOW_STICKY_MARKER,
+        sticky_reanchor_messages=DEERFLOW_STICKY_REANCHOR_MESSAGES,
+        session_state_path=DEERFLOW_SESSION_STATE_PATH,
+        reuse_persisted_chat=False,
+        forced_thinking_enabled=True,
+        forced_expert_mode_enabled=False,
+        stable_poll_interval_ms=DEERFLOW_STABLE_POLL_INTERVAL_MS,
+        fast_new_chat=DEERFLOW_FAST_NEW_CHAT,
+    ),
     "xiaomi-mimo-v2.5-pro": ModelSpec(
         model_id="xiaomi-mimo-v2.5-pro",
         profile_dir=XIAOMI_MIMO_PROFILE_DIR,
@@ -2155,7 +2168,7 @@ async def resolve_provider_web_search(
             ]
         )
 
-        payload = await run_on_bridge_slot(
+        payload, _slot_timing = await run_on_bridge_slot(
             pool,
             spec=spec,
             request_id=request_id,

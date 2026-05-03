@@ -31,7 +31,7 @@ import logging
 import threading
 import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from datetime import datetime, timedelta
 
 from PySide6.QtWidgets import (
@@ -1121,8 +1121,9 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作“已生成/已写入/已验证/已发送”。执行后会有下一轮结果，再基于结果下结论。
 - 微信远控发送文件使用终端扩展指令：在命令块里写 `wx send_file 文件路径1,文件路径2,...`。这只是请求 Agent Qt 发送附件，不代表已经发送完成；同一回复不要声称“已发送/已通过 wx send_file 发送”。
 - 定时计划使用终端扩展指令：`schedule create JSON`、`schedule list`、`schedule delete 名称或序号`、`schedule update JSON`。计划 JSON 使用 `{{"title":"短标题","prompt":"到点后真正要做的事","trigger":{{"run_at":"YYYY-MM-DD HH:MM:SS","repeat_every_seconds":86400,"until_at":"YYYY-MM-DD HH:MM:SS"}}}}`。
-- 如果任务本质上是搜索或调研，而不是操作本地工作区，请优先使用终端扩展指令 `web research 搜索话题`。这条指令会让下一轮先基于网页搜索结果继续回答；不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求脚本，或目标数据只存在当前工作区/本机文件里。
-- 如果用户主动提到使用 skill/技能/技巧 来完成任务，先优先使用终端扩展指令 `skill list` 查看当前工作区已有技能列表；基于列表再决定读取哪个 SKILL.md，以及是否继续读取技能目录中的补充文档、脚本、图像等材料。
+- 如果任务本质上是搜索或调研，而不是操作本地工作区，请优先使用终端扩展指令 `web research 搜索话题`。程序会直接执行本地网页搜索，并把结果写回执行结果与上下文；不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求脚本，或目标数据只存在当前工作区/本机文件里。
+- `skill list` 是 Agent Qt 的内置终端扩展指令，用于查看当前工作区已有技能列表。skill 是一种经验、SOP、方法论的封装，至少包含一个 `SKILL.md`，目录里还可能有补充的 Markdown、脚本、图像等材料，可按需继续读取。
+- 如果用户主动提到 `skill`/技能/技巧，或询问“你有什么技能”“有哪些 skill”“介绍一下技能”“当前可用技能是什么”等与技能列表相关的问题，优先使用终端扩展指令 `skill list` 查看当前工作区已有技能列表；不要先主观回答“没有这种内置指令”或“没有加载任何技能包”。在拿到列表后，再基于技能名称、摘要和 `SKILL.md` 路径决定读取哪个技能文件，以及是否继续读取技能目录中的补充文档、脚本、图像等材料。
 - 对下载、联网 HTTP 调用、构建、安装、长时间生成等任务，不要一看到后台化或短时无输出就立刻换方案。优先先观察并等待一小段合理时间，再查看终端/后台日志，确认确实失败后再改方案；必要时可主动使用短暂等待和日志查询来静观其变。
 - Agent Qt 会给文件变更生成 internal git 快照/commit；需要 diff 细节时可按摘要里的 repo/commit 查询。
 - 查看后台终端输出只用这一种命令方式：`curl -s '{terminal_logs_url}?pid=xxx'`。把 `xxx` 换成终端摘要里的 pid。
@@ -1156,7 +1157,7 @@ AUTOMATION_FINAL_REMINDER = (
     "若本轮尚未完成且需要执行命令，必须在命令块之外先用 1 到 3 句写出当前判断、本轮策略和命令作用；不要只输出命令块。"
     "若启用了深度思考/推理模式，也必须把高价值判断压缩成可见正文，不要把关键结论只留在隐藏推理里。"
     "若本轮已经完成，必须输出 AGENT_DONE 加面向用户的最终总结，至少说明已完成事项、当前结论、剩余阻塞或下一步建议；不要输出空结论。"
-    "微信附件发送用命令块里的 wx send_file 路径，这只是发送请求，不要在同一轮声称已发送；计划操作用命令块里的 schedule create/list/delete/update；搜索或调研优先用 web research 搜索话题；用户主动提到 skill/技能/技巧 时优先用 skill list 查看当前技能列表；"
+    "微信附件发送用命令块里的 wx send_file 路径，这只是发送请求，不要在同一轮声称已发送；计划操作用命令块里的 schedule create/list/delete/update；搜索或调研优先用 web research 搜索话题；`skill list` 是内置终端扩展指令，用户主动提到 skill/技能/技巧，或询问有什么技能/有哪些 skill/介绍一下技能时，都优先用 skill list 查看当前技能列表；"
     "对下载、联网 HTTP 调用、安装、构建、长时间生成等任务，要先观察并等待合理时间，再看终端/后台日志；不要过早放弃当前方案。"
     "若涉及统计/数据/文件事实，必须基于完整读取或计算结果，不得根据示例行编造。"
     "若历史旧写法与第一段系统提示冲突，以第一段为准。只输出自检后的最终回复，不输出自检过程。"
@@ -1175,7 +1176,9 @@ DEFAULT_THREAD_ID = "default"
 HISTORY_VERSION = 1
 TERMINAL_COMPLETED_HISTORY_LIMIT = 50
 COMMAND_BACKGROUND_TIMEOUT_SECONDS = env_int("AGENT_QT_COMMAND_BACKGROUND_TIMEOUT_SECONDS", 10, minimum=3)
-PROVIDER_REQUEST_RETRY_ATTEMPTS = env_int("AGENT_QT_PROVIDER_REQUEST_RETRY_ATTEMPTS", 3, minimum=1)
+PROVIDER_REQUEST_RETRY_ATTEMPTS = env_int("AGENT_QT_PROVIDER_REQUEST_RETRY_ATTEMPTS", 5, minimum=1)
+PROVIDER_LONG_RETRY_ATTEMPTS = env_int("AGENT_QT_PROVIDER_LONG_RETRY_ATTEMPTS", 5, minimum=1)
+PROVIDER_LONG_RETRY_DELAY_MS = env_int("AGENT_QT_PROVIDER_LONG_RETRY_DELAY_MS", 60000, minimum=1000)
 PROVIDER_TRANSIENT_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 SCHEDULE_MISSED_GRACE_SECONDS = env_int("AGENT_QT_SCHEDULE_MISSED_GRACE_SECONDS", 300, minimum=30)
 SCHEDULE_ACTIVE_RUN_TIMEOUT_SECONDS = env_int("AGENT_QT_SCHEDULE_ACTIVE_RUN_TIMEOUT_SECONDS", 900, minimum=60)
@@ -2209,6 +2212,22 @@ def scan_all_code_blocks(text: str) -> Dict[str, List[str]]:
             blocks.setdefault(key, []).append(code.strip())
     return blocks
 
+
+def strip_single_outer_fenced_block(text: str, preferred_langs: Optional[set[str]] = None) -> str:
+    raw = str(text or "")
+    parts = split_markdown_fenced_blocks(raw)
+    if not parts:
+        return raw.strip()
+    code_parts = [part for part in parts if part.get("type") == "code"]
+    markdown_parts = [part for part in parts if part.get("type") == "markdown" and part.get("text", "").strip()]
+    if len(code_parts) != 1 or markdown_parts:
+        return raw.strip()
+    code_part = code_parts[0]
+    lang = (code_part.get("lang") or "").strip().lower()
+    if preferred_langs and lang and lang not in preferred_langs:
+        return raw.strip()
+    return (code_part.get("text") or "").strip()
+
 def placeholder_line_key(match: re.Match) -> str:
     lang = (
         match.group("html")
@@ -2250,13 +2269,13 @@ def reject_unfenced_file_placeholder_payload(
         return
 
     def opening_fence(line: str) -> Optional[re.Match]:
-        return re.match(r"^\s*(`{3,}|~{3,})", line)
+        return re.match(r"^\s{0,3}([`~]{3,})([^\r\n]*)\s*$", line.rstrip("\n\r"))
 
     def is_closing_fence(line: str) -> bool:
         if not in_code:
             return False
-        stripped = line.strip()
-        return stripped.startswith(fence_char * fence_len)
+        pattern = rf"^\s{{0,3}}{re.escape(fence_char)}{{{fence_len},}}\s*$"
+        return re.match(pattern, line.rstrip("\n\r")) is not None
 
     for index, line in enumerate(lines):
         if in_code:
@@ -2812,19 +2831,57 @@ def web_research_extension_reply(queries: List[str]) -> str:
     items = [str(item or "").strip() for item in queries if str(item or "").strip()]
     if not items:
         return (
-            "网页搜索请求已接收。下一轮不要再次输出 `web research` 命令；"
-            "请直接使用网页搜索能力补齐所需事实，再基于搜索结果自然语言回答用户。"
+            "网页搜索请求已接收。程序会尝试直接执行本地网页搜索，并把结果写回执行结果与上下文。"
+            "如果本轮搜索失败，请检查网络或更换搜索话题后再继续。"
         )
     if len(items) == 1:
         return (
-            f"网页搜索请求已接收。下一轮不要再次输出 `web research` 命令；"
-            f"请直接使用网页搜索能力搜索“{items[0]}”，再基于搜索结果自然语言回答用户。"
+            f"网页搜索请求已接收。程序会直接搜索“{items[0]}”，并把结果写回执行结果与上下文。"
         )
     joined = "；".join(f"“{item}”" for item in items[:3])
     return (
-        "网页搜索请求已接收。下一轮不要再次输出 `web research` 命令；"
-        f"请直接使用网页搜索能力依次搜索以下话题，再基于搜索结果自然语言回答用户：{joined}。"
+        "网页搜索请求已接收。程序会依次执行以下本地网页搜索，并把结果写回执行结果与上下文："
+        f"{joined}。"
     )
+
+
+def summarize_web_research_response(payload: dict) -> str:
+    output_items = payload.get("output")
+    if not isinstance(output_items, list):
+        return ""
+    text_parts: List[str] = []
+    sources: List[str] = []
+    seen_urls: set[str] = set()
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type == "message":
+            for content_item in item.get("content") or []:
+                if not isinstance(content_item, dict):
+                    continue
+                content_type = str(content_item.get("type") or "")
+                if content_type in {"output_text", "text"}:
+                    text = str(content_item.get("text") or "").strip()
+                    if text:
+                        text_parts.append(text)
+        elif item_type == "web_search_call":
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            for source in action.get("sources") or []:
+                if not isinstance(source, dict):
+                    continue
+                title = str(source.get("title") or "").strip()
+                url = str(source.get("url") or "").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                label = title or url
+                sources.append(f"- {label}: {url}")
+    body = "\n\n".join(part for part in text_parts if part).strip()
+    if sources:
+        source_block = "参考来源：\n" + "\n".join(sources[:5])
+        body = (body + "\n\n" + source_block).strip() if body else source_block
+    return body
 
 
 def looks_like_incomplete_terminal_extension_command(command_text: str) -> bool:
@@ -3943,18 +4000,21 @@ CHAT_HISTORY_INITIAL_RENDER_ENTRIES = env_int("AGENT_QT_HISTORY_INITIAL_RENDER_E
 
 def iter_non_fenced_lines(text: str):
     in_fence = False
-    fence_marker = ""
+    fence_char = ""
+    fence_len = 0
     for line in str(text or "").splitlines():
         stripped = line.lstrip()
-        fence_match = re.match(r"(```+|~~~+)", stripped)
+        fence_match = re.match(r"^([`~]{3,})(?:[^\r\n]*)?$", stripped)
         if fence_match:
             marker = fence_match.group(1)
             if not in_fence:
                 in_fence = True
-                fence_marker = marker[:3]
-            elif marker.startswith(fence_marker):
+                fence_char = marker[0]
+                fence_len = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_len:
                 in_fence = False
-                fence_marker = ""
+                fence_char = ""
+                fence_len = 0
             continue
         if not in_fence:
             yield line
@@ -3975,18 +4035,21 @@ def strip_automation_done_marker(text: str) -> str:
     marker_re = re.compile(rf"(?i)^\s*{marker_pattern}\b\s*:?\s*")
     lines: List[str] = []
     in_fence = False
-    fence_marker = ""
+    fence_char = ""
+    fence_len = 0
     for line in raw.splitlines():
         stripped = line.lstrip()
-        fence_match = re.match(r"(```+|~~~+)", stripped)
+        fence_match = re.match(r"^([`~]{3,})(?:[^\r\n]*)?$", stripped)
         if fence_match:
             marker = fence_match.group(1)
             if not in_fence:
                 in_fence = True
-                fence_marker = marker[:3]
-            elif marker.startswith(fence_marker):
+                fence_char = marker[0]
+                fence_len = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_len:
                 in_fence = False
-                fence_marker = ""
+                fence_char = ""
+                fence_len = 0
             lines.append(line)
             continue
         if not in_fence and marker_re.match(line):
@@ -3996,7 +4059,6 @@ def strip_automation_done_marker(text: str) -> str:
             continue
         lines.append(line)
     return "\n".join(lines).strip()
-
 
 def looks_like_automation_context_payload(text: str) -> bool:
     content = str(text or "").strip()
@@ -4256,6 +4318,70 @@ def quiet_automation_error_message(error: str) -> str:
     return ""
 
 
+def looks_like_web_session_busy_error(error: str) -> bool:
+    content = str(error or "").strip().lower()
+    if not content:
+        return False
+    markers = (
+        "web_session_busy",
+        "有消息正在生成，请稍后再试",
+        "deepseek web 当前会话仍有消息正在生成",
+        "message is being generated",
+        "response is being generated",
+    )
+    return any(marker in content for marker in markers)
+
+
+def looks_like_web_session_busy_text(text: str) -> bool:
+    content = str(text or "").strip().lower()
+    if not content or len(content) > 120:
+        return False
+    markers = (
+        "有消息正在生成，请稍后再试",
+        "message is being generated",
+        "response is being generated",
+        "please try again later",
+    )
+    return any(marker in content for marker in markers)
+
+
+def provider_retry_status_message(path: str, attempt: int, attempts: int, detail: str = "") -> str:
+    target = "网页搜索" if "/v1/responses" in str(path or "") else "AI 回复"
+    content = str(detail or "").strip()
+    if looks_like_web_session_busy_error(content) or looks_like_web_session_busy_text(content):
+        reason = "网页端当前会话仍在生成，正在等待后重试"
+    elif "timeout" in content.lower() or "timed out" in content.lower():
+        reason = "请求超时，正在重试"
+    else:
+        reason = "请求波动，正在重试"
+    return f"{target}第 {attempt}/{attempts} 次重试：{reason}"
+
+
+def looks_like_provider_transient_error(error: str) -> bool:
+    content = str(error or "").strip()
+    lowered = content.lower()
+    if looks_like_timeout_error(content) or looks_like_web_session_busy_error(content):
+        return True
+    transient_markers = (
+        "provider 网络请求失败",
+        "connection refused",
+        "connection reset",
+        "temporarily unavailable",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "http 408",
+        "http 409",
+        "http 425",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    )
+    return any(marker in lowered for marker in transient_markers)
+
+
 def sanitize_automation_prompt_material(text: str) -> str:
     value = str(text or "")
     replacements = {
@@ -4293,9 +4419,15 @@ def build_automation_feedback_prompt(
     log_text = str(execution_log or "")
     if "web research " in log_text.lower() or "AGENT_WEB_RESEARCH" in log_text:
         web_research_followup_note = (
-            "\n- 如果上一轮本地执行结果显示网页搜索请求已接收，说明 `web research` 已经触发。"
-            " 下一轮不要再次输出 `web research` 命令，也不要重复解释扩展指令是否生效；"
-            "请直接使用网页搜索能力搜索对应话题，并基于搜索结果自然语言回答用户。"
+            "\n- 如果上一轮本地执行结果里已经出现 `网页搜索：` 开头的结果，说明 `web research` 已经真的执行完了。"
+            " 下一轮不要再次输出 `web research` 命令，也不要解释网页搜索工具协议；"
+            "请直接把这些搜索结果当作中间线索，继续完成最初用户任务。"
+            "默认把这一步视为“搜索后的继续执行阶段”，而不是完成阶段。"
+            "除非用户最初的原话明确只是在让你搜索、调研、整理或解释信息，否则这一轮不要直接输出 AGENT_DONE。"
+            "如果你认为搜索结果已经足够，请先用自然语言把当前判断、证据和接下来的完成动作说清楚，再继续原始任务。"
+            "只要原始用户需求里还包含下载、生成、修改、保存、发送、验证、运行、安装、整理文件、写脚本、产出文档或任何本地工作区动作，"
+            "就必须把任务视为“未完成”，继续输出下一步命令块；不能仅凭搜索结果就结束。"
+            "换句话说，搜索只负责提供线索，不代表目标文件、目标脚本、目标文档或目标产物已经真的落到工作区。"
         )
     wechat_completion_note = ""
     if wechat_file_delivery:
@@ -4351,7 +4483,7 @@ def build_automation_feedback_prompt(
 - 如果执行结果提示“命令块不完整”“未闭合的 shell 引号”“unmatched quote”或 shell 语法不完整，优先判断为上一轮输出被截断；重新输出完整命令块即可。多行 `python -c "..."` 是支持的，不要仅因这类错误改写成单行脚本。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作已完成、已生成、已验证或已发送。
 - 涉及统计、表格、数据查找或文件事实时，必须完整读取/计算后再下结论；示例行只能用于判断结构，不能据此编造定量结论、模型结论或总体判断。
-- 如果当前任务本质上是搜索或调研，而不是操作本地项目文件，请优先在命令块里写 `web research 搜索话题`，由下一轮先触发网页搜索再自然语言作答；不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求你写脚本，或目标数据只存在当前工作区/本机文件里。
+- 如果当前任务需要先上网查资料、找下载线索、核对公开事实或做调研，请优先在命令块里写 `web research 搜索话题`。程序会直接执行本地网页搜索，并把搜索结果写回执行结果；后续轮次可以直接基于这些结果继续完成用户任务。不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求你写脚本，或目标数据只存在当前工作区/本机文件里。
 - 后台安装/构建/拉取不要当作完成；启动常驻命令时不要加 `&`/`nohup`，等执行结果给出 `Terminal processes:` 摘要后，再使用 `curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'` 查询控制台输出。
 - 对下载、联网 HTTP 调用、安装、构建、长时间生成等任务，如果已经转入后台或暂时无输出，不要立刻换方案。优先先等待一小段合理时间，并主动查看终端/后台日志；必要时可以使用短暂等待后再查询日志，确认失败后再换方案。
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
@@ -4521,8 +4653,9 @@ def build_wechat_user_prompt(text: str, allow_file_delivery: bool = True) -> str
         "- 要查看、删除或修改时间计划：输出命令块。查看写 `schedule list`；删除写 `schedule delete 计划名称、序号或 id`；修改写 `schedule update JSON`，JSON 结构：{\"target\":\"计划名称、序号或 id\",\"enabled\":true,\"trigger\":{\"run_at\":\"YYYY-MM-DD HH:MM:SS\",\"repeat_every_seconds\":3600,\"until_at\":\"YYYY-MM-DD HH:MM:SS\"},\"prompt\":\"可选的新计划内容\",\"title\":\"可选的新标题\"}。`enabled:false` 表示暂停；`enabled:true` 且不带 `trigger` 表示开启并立即安排执行一次；如果只想恢复到未来某个时间，必须同时给 `trigger.run_at`。修改时只写需要变化的字段。如果目标不明确，先简短追问，不要猜。\n"
         "- 要停止/切会话/列列表等控制动作：用户使用 slash/menu 指令时程序会直接处理；自然语言里提到时，你可以解释可用指令。\n"
         "- 如果用户只是问候、闲聊或普通问答，不需要本地命令、文件或计划，直接用简短自然语言回复；不要为了获取时间或构造问候去执行 echo/date。\n"
-        "- 如果用户要你做搜索或调研，而不是操作本地工作区，请优先输出一个命令块，写 `web research 搜索话题`；程序会把这条结果写回上下文，下一轮你再基于网页搜索结果自然语言作答。不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求脚本，或目标数据只在当前工作区/本机文件里。\n"
-        "- 如果用户主动提到 skill/技能/技巧，请优先输出一个命令块，写 `skill list`，先查看当前工作区已有技能；程序会把技能名称、摘要和 SKILL.md 路径写回上下文，下一轮你再决定读取哪个技能文件以及是否继续读取技能目录里的补充材料。\n"
+        "- 如果用户要你做搜索或调研，而不是操作本地工作区，请优先输出一个命令块，写 `web research 搜索话题`；程序会直接执行本地网页搜索，把结果写回上下文，下一轮你再基于这些搜索结果自然语言作答。不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求脚本，或目标数据只在当前工作区/本机文件里。\n"
+        "- `skill list` 是内置终端扩展指令，用于查看当前工作区已有技能。skill 是一种经验、SOP、方法论的封装，至少包含一个 `SKILL.md`，目录里还可能有补充的 Markdown、脚本、图像等材料，可按需继续读取。\n"
+        "- 如果用户主动提到 skill/技能/技巧，或询问“你有什么技能”“有哪些 skill”“介绍一下技能”“当前可用技能是什么”等与技能列表相关的问题，请优先输出一个命令块，写 `skill list`，先查看当前工作区已有技能；程序会把技能名称、摘要和 SKILL.md 路径写回上下文，下一轮你再决定读取哪个技能文件以及是否继续读取技能目录里的补充材料。不要先主观回答没有这种内置指令或没有加载技能。\n"
         "如果用户目标不清楚，先做低成本探索；探索后仍缺少关键条件或候选无法判断时，再简短提问。最终给微信的回复会被压缩展示，所以结论要短。"
         f"{file_delivery_note}"
         "如果用户询问菜单、帮助或支持哪些指令，请直接说明这些指令，不要执行项目命令。\n\n"
@@ -4541,10 +4674,7 @@ def unwrap_provider_text(text: str) -> str:
     """Recover the actual assistant text if a provider still returns a JSON envelope."""
     current = (text or "").strip()
     for _ in range(3):
-        candidate = current
-        fence_match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.S | re.I)
-        if fence_match:
-            candidate = fence_match.group(1).strip()
+        candidate = strip_single_outer_fenced_block(current, preferred_langs={"json", ""}).strip()
         if not candidate.startswith("{"):
             return current
         try:
@@ -5525,9 +5655,7 @@ def safe_skill_id(name: str) -> str:
 
 
 def strip_markdown_code_fence(text: str) -> str:
-    content = str(text or "").strip()
-    match = re.fullmatch(r"```(?:markdown|md)?\s*(.*?)\s*```", content, flags=re.S | re.I)
-    return match.group(1).strip() if match else content
+    return strip_single_outer_fenced_block(text, preferred_langs={"markdown", "md", ""})
 
 
 def parse_skill_frontmatter(markdown_text: str) -> Dict[str, str]:
@@ -7448,14 +7576,66 @@ class ExecuteWorker(QThread):
             self.output_signal.emit(outputs[-1])
         self.finished_signal.emit('\n\n'.join(outputs))
 
+
+class WebResearchWorker(QThread):
+    finished_signal = Signal(str, str)
+    status_signal = Signal(str)
+
+    def __init__(
+        self,
+        manager: "AutomationProviderManager",
+        directives: List[str],
+        queries: List[str],
+        model: str,
+        thread_id: str,
+        *,
+        thinking_enabled: Optional[bool] = None,
+        expert_mode_enabled: Optional[bool] = None,
+    ):
+        super().__init__()
+        self.manager = manager
+        self.directives = [str(item or "").strip() for item in directives if str(item or "").strip()]
+        self.queries = [str(item or "").strip() for item in queries if str(item or "").strip()]
+        self.model = model
+        self.thread_id = thread_id
+        self.thinking_enabled = thinking_enabled
+        self.expert_mode_enabled = expert_mode_enabled
+
+    def run(self):
+        try:
+            search_outputs: List[str] = []
+            for query in self.queries[:3]:
+                if self.isInterruptionRequested():
+                    search_outputs.append(f"网页搜索：{query}\n已停止后续搜索。")
+                    break
+                try:
+                    summary = self.manager.web_research(
+                        query,
+                        self.model,
+                        self.thread_id,
+                        thinking_enabled=self.thinking_enabled,
+                        expert_mode_enabled=self.expert_mode_enabled,
+                        retry_callback=self.status_signal.emit,
+                    )
+                    search_outputs.append(f"网页搜索：{query}\n{summary}".strip())
+                except Exception as exc:
+                    search_outputs.append(f"网页搜索：{query}\n搜索失败：{exc}".strip())
+            output_text = "\n\n".join(part for part in search_outputs if part).strip() or "网页搜索未返回结果。"
+            self.finished_signal.emit(
+                terminal_extension_execution_log(self.directives, output_text),
+                "",
+            )
+        except Exception as exc:
+            self.finished_signal.emit("", str(exc))
+
 # ============================================================
 # 可选网页 Provider 自动化插件
 # ============================================================
 AUTOMATION_MODELS = [
     ("DeepSeek V4", "DeepSeekV4"),
     ("DeepSeek V4 Thinking", "DeepSeekV4-thinking"),
-    ("MiMo V2.5 Pro", "xiaomi-mimo-v2.5-pro"),
-    ("MiMo V2.5", "xiaomi-mimo-v2.5"),
+    ("DeepSeek V4 Simple Thinking", "DeepSeekV4-simple-thinking"),
+    ("DeepSeek V4 Simple", "DeepSeekV4-simple"),
 ]
 AUTOMATION_DEFAULT_MODEL = "DeepSeekV4"
 AUTOMATION_CONTEXT_MODES = [
@@ -7465,13 +7645,15 @@ AUTOMATION_CONTEXT_MODES = [
 AUTOMATION_CONTEXT_PRESETS = [
     {"label": "DeepSeek PRO web", "mode": "expert", "model": "DeepSeekV4"},
     {"label": "DeepSeek PRO web thinking", "mode": "expert", "model": "DeepSeekV4-thinking"},
-    {"label": "DeepSeek Flash web", "mode": "simple", "model": "xiaomi-mimo-v2.5"},
-    {"label": "DeepSeek Flash web thinking", "mode": "simple", "model": "xiaomi-mimo-v2.5-pro"},
+    {"label": "DeepSeek Flash web", "mode": "simple", "model": "DeepSeekV4-simple"},
+    {"label": "DeepSeek Flash web thinking", "mode": "simple", "model": "DeepSeekV4-simple-thinking"},
 ]
 AUTOMATION_SIMPLE_MODEL_BY_MODEL = {
     "DeepSeekV4": "DeepSeekV4-simple",
+    "DeepSeekV4-thinking": "DeepSeekV4-simple-thinking",
 }
 AUTOMATION_REQUIRED_MODULES = (
+    "ddgs",
     "fastapi",
     "uvicorn",
     "playwright",
@@ -8010,6 +8192,7 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         payload: Optional[dict] = None,
         timeout: int = 30,
         attempts: int = 1,
+        retry_callback: Optional[Callable[[str], None]] = None,
     ) -> dict:
         started = time.perf_counter()
         encode_started = time.perf_counter()
@@ -8060,6 +8243,11 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
                         "请在设置里点击“打开网页登录”，完成登录后保持页面在聊天界面，再重新发送。"
                     )
                 if exc.code in PROVIDER_TRANSIENT_HTTP_CODES and attempt < attempts:
+                    if retry_callback is not None:
+                        try:
+                            retry_callback(provider_retry_status_message(path, attempt + 1, attempts, message))
+                        except Exception:
+                            pass
                     logger.warning(
                         "Provider transient HTTP error method=%s path=%s code=%s attempt=%d/%d message=%s",
                         method,
@@ -8069,11 +8257,16 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
                         attempts,
                         message[:300],
                     )
-                    time.sleep(min(5.0, 0.8 * attempt))
+                    time.sleep(min(15.0, 5.0 * attempt))
                     continue
                 raise RuntimeError(f"HTTP {exc.code}: {message}") from exc
             except (TimeoutError, urllib.error.URLError, ConnectionError) as exc:
                 if attempt < attempts:
+                    if retry_callback is not None:
+                        try:
+                            retry_callback(provider_retry_status_message(path, attempt + 1, attempts, str(exc)))
+                        except Exception:
+                            pass
                     logger.warning(
                         "Provider transient network error method=%s path=%s attempt=%d/%d error=%s",
                         method,
@@ -8082,7 +8275,7 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
                         attempts,
                         str(exc)[:300],
                     )
-                    time.sleep(min(5.0, 0.8 * attempt))
+                    time.sleep(min(15.0, 5.0 * attempt))
                     continue
                 raise RuntimeError(f"provider 网络请求失败（已重试 {attempts} 次）: {exc}") from exc
         raise RuntimeError("provider 请求失败。")
@@ -8257,6 +8450,7 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         *,
         thinking_enabled: Optional[bool] = None,
         expert_mode_enabled: Optional[bool] = None,
+        retry_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
         self.start_provider()
         payload = self.request_json(
@@ -8278,11 +8472,54 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
             },
             timeout=900,
             attempts=PROVIDER_REQUEST_RETRY_ATTEMPTS,
+            retry_callback=retry_callback,
         )
         try:
             return unwrap_provider_text(str(payload["choices"][0]["message"].get("content") or ""))
         except Exception as exc:
             raise RuntimeError(f"provider 返回格式异常: {payload}") from exc
+
+    def web_research(
+        self,
+        query: str,
+        model: str,
+        thread_id: str,
+        *,
+        thinking_enabled: Optional[bool] = None,
+        expert_mode_enabled: Optional[bool] = None,
+        max_results: int = 5,
+        retry_callback: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        self.start_provider()
+        payload = self.request_json(
+            "POST",
+            "/v1/responses",
+            {
+                "model": model,
+                "input": query,
+                "user": thread_id,
+                "stream": False,
+                "thinking_enabled": thinking_enabled,
+                "expert_mode_enabled": expert_mode_enabled,
+                "instructions": (
+                    "请先执行网页搜索，再基于搜索结果用中文给出简洁但有用的回答。"
+                    "优先提炼用户真正需要的事实、链接线索和下一步建议，不要解释工具协议。"
+                ),
+                "tools": [
+                    {
+                        "type": "web_search_preview",
+                        "max_results": max(1, int(max_results or 5)),
+                    }
+                ],
+            },
+            timeout=900,
+            attempts=PROVIDER_REQUEST_RETRY_ATTEMPTS,
+            retry_callback=retry_callback,
+        )
+        summary = summarize_web_research_response(payload)
+        if summary:
+            return summary
+        raise RuntimeError(f"provider 网页搜索返回格式异常: {payload}")
 
     def response_preview(self, model: str, thread_id: str) -> dict:
         # Preview polling is observational. The chat worker owns provider startup;
@@ -8386,6 +8623,7 @@ class PythonRuntimeSetupWorker(QThread):
 
 class AutomationChatWorker(QThread):
     finished_signal = Signal(str, str)
+    status_signal = Signal(str)
 
     def __init__(
         self,
@@ -8414,6 +8652,7 @@ class AutomationChatWorker(QThread):
                 self.thread_id,
                 thinking_enabled=self.thinking_enabled,
                 expert_mode_enabled=self.expert_mode_enabled,
+                retry_callback=self.status_signal.emit,
             )
             logger.warning(
                 "Automation chat worker done elapsed_ms=%d message_chars=%d response_chars=%d thinking_enabled=%s expert_mode_enabled=%s",
@@ -8652,15 +8891,17 @@ class HistorySaveWorker(QThread):
 
 
 def wechat_strip_markdown_code(text: str, keep_summary: bool = False) -> str:
-    text = str(text or "")
-
-    def replace(match: re.Match) -> str:
-        lang = (match.group(1) or "code").strip() or "code"
-        code = match.group(2) or ""
-        summary = code_block_summary(lang, code)
-        return f"[{lang} 代码块：{summary}]" if keep_summary else ""
-
-    text = re.sub(r"```([^\n`]*)\n(.*?)```", replace, text, flags=re.S)
+    parts = split_markdown_fenced_blocks(str(text or ""))
+    rebuilt: List[str] = []
+    for part in parts:
+        if part.get("type") == "code":
+            lang = (part.get("lang") or "code").strip() or "code"
+            code = part.get("text") or ""
+            summary = code_block_summary(lang, code)
+            rebuilt.append(f"[{lang} 代码块：{summary}]" if keep_summary else "")
+        else:
+            rebuilt.append(part.get("text") or "")
+    text = "".join(rebuilt)
     text = re.sub(r"<!--\s*[A-Za-z0-9_ -]+ block \d+\s*-->", "", text)
     text = strip_wechat_send_file_markers(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -9234,6 +9475,8 @@ class WeChatConnector(QObject):
         self.monitor_thread: Optional[threading.Thread] = None
         self.login_thread: Optional[threading.Thread] = None
         self._running_lock = threading.Lock()
+        self._login_state_lock = threading.Lock()
+        self._active_qr_url = ""
         self._direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def is_running(self) -> bool:
@@ -9252,10 +9495,19 @@ class WeChatConnector(QObject):
     def login_async(self):
         thread = self.login_thread
         if thread and thread.is_alive():
-            self.status_signal.emit("微信扫码登录已在进行中。")
+            current_qr = self.current_qr_url()
+            if current_qr:
+                self.qr_signal.emit(current_qr)
+                self.status_signal.emit("微信扫码登录已在进行中，已重新显示当前二维码。")
+            else:
+                self.status_signal.emit("微信扫码登录已在进行中，请稍候。")
             return
         self.login_thread = threading.Thread(target=self._login_loop, name="AgentQtWeChatLogin", daemon=True)
         self.login_thread.start()
+
+    def current_qr_url(self) -> str:
+        with self._login_state_lock:
+            return self._active_qr_url
 
     def start(self):
         with self._running_lock:
@@ -9334,6 +9586,8 @@ class WeChatConnector(QObject):
             qrcode_url = str(qr.get("qrcode_img_content") or "")
             if not qrcode or not qrcode_url:
                 raise RuntimeError("微信服务器没有返回二维码。")
+            with self._login_state_lock:
+                self._active_qr_url = qrcode_url
             self.qr_signal.emit(qrcode_url)
             self.status_signal.emit("二维码已生成，请用微信扫码并在手机上确认。")
             poll_base = self.DEFAULT_BASE_URL
@@ -9369,6 +9623,8 @@ class WeChatConnector(QObject):
                     )
                     qrcode = str(qr.get("qrcode") or "")
                     qrcode_url = str(qr.get("qrcode_img_content") or "")
+                    with self._login_state_lock:
+                        self._active_qr_url = qrcode_url
                     self.qr_signal.emit(qrcode_url)
                     self.status_signal.emit("二维码已刷新，请重新扫码。")
                 elif state == "confirmed":
@@ -9392,6 +9648,9 @@ class WeChatConnector(QObject):
             raise RuntimeError("微信扫码登录超时。")
         except Exception as exc:
             self.status_signal.emit(f"微信扫码登录失败：{exc}")
+        finally:
+            with self._login_state_lock:
+                self._active_qr_url = ""
 
     def _monitor_loop(self):
         account = self.account()
@@ -12538,6 +12797,11 @@ class ChatPage(QWidget):
         self.wechat_connector.status_signal.connect(self.handle_wechat_connector_status)
         self.wechat_connector.qr_signal.connect(self.show_wechat_qr_dialog)
         self.wechat_qr_image_workers: List[WeChatQrImageWorker] = []
+        self.wechat_qr_dialog: Optional[QDialog] = None
+        self.wechat_qr_image_label: Optional[QLabel] = None
+        self.wechat_qr_link_edit: Optional[QPlainTextEdit] = None
+        self.wechat_qr_open_btn: Optional[QPushButton] = None
+        self.wechat_qr_current_url = ""
         self.wechat_active_request_id = ""
         self.wechat_active_start_index = 0
         self.wechat_active_silent = True
@@ -12553,6 +12817,7 @@ class ChatPage(QWidget):
         self.automation_context_mode = automation_context_mode_setting()
         self.automation_context_worker: Optional[AutomationContextBuildWorker] = None
         self.automation_worker: Optional[AutomationChatWorker] = None
+        self.web_research_worker: Optional[WebResearchWorker] = None
         self.thread_automation_context_workers: Dict[str, AutomationContextBuildWorker] = {}
         self.thread_automation_workers: Dict[str, AutomationChatWorker] = {}
         self.automation_request_serial = 0
@@ -12593,6 +12858,8 @@ class ChatPage(QWidget):
         self.automation_loop_max_rounds = AUTOMATION_LOOP_MAX_ROUNDS
         self.automation_loop_goal = ""
         self.automation_loop_force_final_summary = False
+        self.automation_retry_context = ""
+        self.automation_retry_attempts = 0
         self.active_schedule_id = ""
         self.active_schedule_notify: Dict[str, str] = {}
         self.active_schedule_started_at = 0.0
@@ -13709,6 +13976,7 @@ class ChatPage(QWidget):
         return bool(
             (self.automation_context_worker and self.automation_context_worker.isRunning())
             or (self.automation_worker and self.automation_worker.isRunning())
+            or (self.web_research_worker and self.web_research_worker.isRunning())
         )
 
     def is_automation_busy(self) -> bool:
@@ -13883,6 +14151,8 @@ class ChatPage(QWidget):
     def selected_skills_context(self) -> str:
         chunks: List[str] = []
         for skill in self.selected_skills():
+            name = str(skill.get("name") or skill.get("id") or "未命名技能")
+            description = str(skill.get("description") or "").strip()
             path = str(skill.get("path") or "")
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -13890,7 +14160,13 @@ class ChatPage(QWidget):
             except OSError:
                 continue
             if content:
-                chunks.append(f"【手动选择的 Skill: {skill.get('name') or skill.get('id')}】\n{content}")
+                header_lines = [f"【手动选择的 Skill: {name}】"]
+                if description:
+                    header_lines.append(f"摘要：{description}")
+                if path:
+                    header_lines.append(f"SKILL.md 路径：{path}")
+                header = "\n".join(header_lines)
+                chunks.append(f"{header}\n{content}")
         return "\n\n".join(chunks).strip()
 
     def create_automation_skill_menu(self) -> QMenu:
@@ -15575,98 +15851,124 @@ class ChatPage(QWidget):
         self.wechat_connector.stop()
 
     def show_wechat_qr_dialog(self, qr_url: str):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("微信扫码登录")
-        dialog.setMinimumWidth(520)
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-        title = QLabel("用微信扫描二维码链接")
-        title.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 15px; font-weight: 900;")
-        layout.addWidget(title)
-        hint = QLabel("如果没有直接显示二维码，点“打开二维码链接”，用微信扫码后在手机上确认。")
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px;")
-        layout.addWidget(hint)
-        image_label = QLabel("二维码加载中...")
-        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        image_label.setFixedSize(260, 260)
-        image_label.setStyleSheet(f"""
-            QLabel {{
-                background: {COLORS['surface']};
-                color: {COLORS['text_secondary']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 14px;
-                padding: 10px;
-                font-size: 12px;
-            }}
-        """)
-        image_row = QHBoxLayout()
-        image_row.addStretch()
-        image_row.addWidget(image_label)
-        image_row.addStretch()
-        layout.addLayout(image_row)
-        success_hint = QLabel("如果扫码成功，微信已创建 ClawBot，可关闭此页面。")
-        success_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        success_hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px; font-weight: 800;")
-        layout.addWidget(success_hint)
-        link = QPlainTextEdit()
-        link.setReadOnly(True)
-        link.setPlainText(qr_url)
-        link.setFixedHeight(90)
-        link.setStyleSheet(f"""
-            QPlainTextEdit {{
-                background: {COLORS['surface_alt']};
-                color: {COLORS['text']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 10px;
-                padding: 10px;
-                font-size: 12px;
-            }}
-        """)
-        layout.addWidget(link)
-        row = QHBoxLayout()
-        row.addStretch()
-        open_btn = QPushButton("打开二维码链接", cursor=Qt.CursorShape.PointingHandCursor)
-        copy_btn = QPushButton("复制链接", cursor=Qt.CursorShape.PointingHandCursor)
-        close_btn = QPushButton("关闭", cursor=Qt.CursorShape.PointingHandCursor)
-        for btn in (open_btn, copy_btn, close_btn):
-            btn.setFixedHeight(34)
-            btn.setStyleSheet(f"""
-                QPushButton {{
+        self.wechat_qr_current_url = str(qr_url or "").strip()
+        dialog = self.wechat_qr_dialog
+        if dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("微信扫码登录")
+            dialog.setMinimumWidth(520)
+            dialog.setModal(False)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+            title = QLabel("用微信扫描二维码链接")
+            title.setStyleSheet(f"color: {COLORS['text']}; background: transparent; font-size: 15px; font-weight: 900;")
+            layout.addWidget(title)
+            hint = QLabel("如果没有直接显示二维码，点“打开二维码链接”，用微信扫码后在手机上确认。")
+            hint.setWordWrap(True)
+            hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px;")
+            layout.addWidget(hint)
+            image_label = QLabel("二维码加载中...")
+            image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            image_label.setFixedSize(260, 260)
+            image_label.setStyleSheet(f"""
+                QLabel {{
                     background: {COLORS['surface']};
+                    color: {COLORS['text_secondary']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 14px;
+                    padding: 10px;
+                    font-size: 12px;
+                }}
+            """)
+            image_row = QHBoxLayout()
+            image_row.addStretch()
+            image_row.addWidget(image_label)
+            image_row.addStretch()
+            layout.addLayout(image_row)
+            success_hint = QLabel("如果扫码成功，微信已创建 ClawBot，可关闭此页面。")
+            success_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            success_hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px; font-weight: 800;")
+            layout.addWidget(success_hint)
+            link = QPlainTextEdit()
+            link.setReadOnly(True)
+            link.setFixedHeight(90)
+            link.setStyleSheet(f"""
+                QPlainTextEdit {{
+                    background: {COLORS['surface_alt']};
                     color: {COLORS['text']};
                     border: 1px solid {COLORS['border']};
                     border-radius: 10px;
-                    padding: 6px 16px;
+                    padding: 10px;
                     font-size: 12px;
-                    font-weight: 900;
                 }}
-                QPushButton:hover {{ background: {COLORS['surface_alt']}; }}
             """)
-            row.addWidget(btn)
-        open_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(qr_url)))
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(qr_url))
-        close_btn.clicked.connect(dialog.close)
-        layout.addLayout(row)
+            layout.addWidget(link)
+            row = QHBoxLayout()
+            row.addStretch()
+            open_btn = QPushButton("打开二维码链接", cursor=Qt.CursorShape.PointingHandCursor)
+            copy_btn = QPushButton("复制链接", cursor=Qt.CursorShape.PointingHandCursor)
+            close_btn = QPushButton("关闭", cursor=Qt.CursorShape.PointingHandCursor)
+            for btn in (open_btn, copy_btn, close_btn):
+                btn.setFixedHeight(34)
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {COLORS['surface']};
+                        color: {COLORS['text']};
+                        border: 1px solid {COLORS['border']};
+                        border-radius: 10px;
+                        padding: 6px 16px;
+                        font-size: 12px;
+                        font-weight: 900;
+                    }}
+                    QPushButton:hover {{ background: {COLORS['surface_alt']}; }}
+                """)
+                row.addWidget(btn)
+            open_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.wechat_qr_current_url)))
+            copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self.wechat_qr_current_url))
+            close_btn.clicked.connect(dialog.close)
+            layout.addLayout(row)
+            self.wechat_qr_dialog = dialog
+            self.wechat_qr_image_label = image_label
+            self.wechat_qr_link_edit = link
+            self.wechat_qr_open_btn = open_btn
 
-        worker = WeChatQrImageWorker(qr_url)
+        image_label = self.wechat_qr_image_label
+        link = self.wechat_qr_link_edit
+        if image_label is not None:
+            image_label.setPixmap(QPixmap())
+            image_label.setText("二维码加载中...")
+        if link is not None:
+            link.setPlainText(self.wechat_qr_current_url)
+
+        worker = WeChatQrImageWorker(self.wechat_qr_current_url)
         self.wechat_qr_image_workers.append(worker)
 
         def on_loaded(url: str, data: bytes, error: str):
+            current_label = self.wechat_qr_image_label
+            if current_label is None:
+                return
+            if url != self.wechat_qr_current_url:
+                try:
+                    self.wechat_qr_image_workers.remove(worker)
+                except ValueError:
+                    pass
+                worker.deleteLater()
+                return
             if error or not data:
-                image_label.setText("二维码图片加载失败\n请打开或复制下方链接")
+                current_label.setText("二维码图片加载失败\n请打开或复制下方链接")
             else:
                 pixmap = QPixmap()
                 if pixmap.loadFromData(QByteArray(data)):
-                    target_size = QSize(max(1, image_label.width() - 20), max(1, image_label.height() - 20))
-                    image_label.setPixmap(pixmap.scaled(
+                    target_size = QSize(max(1, current_label.width() - 20), max(1, current_label.height() - 20))
+                    current_label.setPixmap(pixmap.scaled(
                         target_size,
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     ))
                 else:
-                    image_label.setText("二维码图片解析失败\n请打开或复制下方链接")
+                    current_label.setText("二维码图片解析失败\n请打开或复制下方链接")
             try:
                 self.wechat_qr_image_workers.remove(worker)
             except ValueError:
@@ -15675,7 +15977,9 @@ class ChatPage(QWidget):
 
         worker.loaded.connect(on_loaded)
         worker.start()
-        dialog.exec()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def show_wechat_config_dialog(self):
         cfg = wechat_bridge_settings()
@@ -16353,6 +16657,42 @@ class ChatPage(QWidget):
                 failed_files.append(f"{target}（{exc}）")
         return sent_files, failed_files
 
+    def run_web_research_responsive(self, query: str, provider_model: str) -> str:
+        if QApplication.instance() is None or QThread.currentThread() is not QApplication.instance().thread():
+            return self.automation_manager.web_research(
+                query,
+                provider_model,
+                self.thread_id,
+                thinking_enabled=automation_thinking_enabled(self.automation_model),
+                expert_mode_enabled=(self.automation_context_mode == "expert"),
+            )
+        result: Dict[str, object] = {"done": False, "summary": "", "error": None}
+
+        def _worker():
+            try:
+                result["summary"] = self.automation_manager.web_research(
+                    query,
+                    provider_model,
+                    self.thread_id,
+                    thinking_enabled=automation_thinking_enabled(self.automation_model),
+                    expert_mode_enabled=(self.automation_context_mode == "expert"),
+                )
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                result["done"] = True
+
+        thread = threading.Thread(target=_worker, name="AgentQtWebResearch", daemon=True)
+        thread.start()
+        while not bool(result.get("done")):
+            QApplication.processEvents()
+            time.sleep(0.03)
+        error = result.get("error")
+        if error:
+            raise error
+        return str(result.get("summary") or "")
+
+
     def execute_terminal_extension_directives(self, directives: List[str]) -> str:
         cleaned_directives = [str(item or "").strip() for item in directives if str(item or "").strip()]
         if not cleaned_directives:
@@ -16397,7 +16737,15 @@ class ChatPage(QWidget):
                 (wechat_trigger_summary(cleaned_directives) + "\n\n" + "\n".join(delivery_parts or ["未发送附件。"])).strip()
             )
         if web_research_queries:
-            output_parts.append(web_research_extension_reply(web_research_queries))
+            provider_model = self.effective_automation_model()
+            search_outputs: List[str] = []
+            for query in web_research_queries[:3]:
+                try:
+                    summary = self.run_web_research_responsive(query, provider_model)
+                    search_outputs.append(f"网页搜索：{query}\n{summary}".strip())
+                except Exception as exc:
+                    search_outputs.append(f"网页搜索：{query}\n搜索失败：{exc}".strip())
+            output_parts.append("\n\n".join(part for part in search_outputs if part).strip())
         if skill_list_requested:
             if self.project_root:
                 output_parts.append(skill_list_extension_reply(load_workspace_skills(self.project_root)))
@@ -16406,6 +16754,96 @@ class ChatPage(QWidget):
         if not output_parts:
             output_parts.append("已处理终端扩展指令。")
         return terminal_extension_execution_log(cleaned_directives, "\n\n".join(part for part in output_parts if part).strip())
+
+    def start_web_research_extension_run(self, directives: List[str]):
+        cleaned_directives = [str(item or "").strip() for item in directives if str(item or "").strip()]
+        queries = extract_web_research_queries("\n".join(cleaned_directives))
+        if not cleaned_directives or not queries:
+            return
+        placeholder_lines = [
+            "⏳ 网页搜索进行中...",
+            "",
+            "Commands:",
+        ] + [f"$ {directive}" for directive in cleaned_directives]
+        result_bubble = ExecutionLogPanel(
+            "\n".join(placeholder_lines),
+            parent=self.chat_container,
+            max_content_height=210,
+            title="执行结果",
+        )
+        self.add_chat_widget(result_bubble, animate=True)
+        self.update_automation_composer_state()
+        self.scroll_to_bottom()
+
+        def start_worker(long_retry_round: int = 0):
+            worker = WebResearchWorker(
+                self.automation_manager,
+                cleaned_directives,
+                queries,
+                self.effective_automation_model(),
+                self.thread_id,
+                thinking_enabled=automation_thinking_enabled(self.automation_model),
+                expert_mode_enabled=(self.automation_context_mode == "expert"),
+            )
+            self.web_research_worker = worker
+            self.update_automation_composer_state()
+
+            def on_status(message: str):
+                if self.web_research_worker is worker:
+                    self.set_status_bar_override(message, duration_ms=12000)
+
+            def on_finished(execution_text: str, error: str):
+                if self.web_research_worker is not worker:
+                    return
+                self.web_research_worker = None
+                worker.deleteLater()
+                self.update_automation_composer_state()
+                if error and looks_like_provider_transient_error(error) and long_retry_round < PROVIDER_LONG_RETRY_ATTEMPTS:
+                    retry_round = long_retry_round + 1
+                    wait_seconds = max(1, int(PROVIDER_LONG_RETRY_DELAY_MS / 1000))
+                    retry_message = f"网页搜索短重试仍未恢复，{wait_seconds} 秒后进行第 {retry_round}/{PROVIDER_LONG_RETRY_ATTEMPTS} 轮后台重试…"
+                    self.set_status_bar_override(retry_message, duration_ms=min(PROVIDER_LONG_RETRY_DELAY_MS + 8000, 180000))
+                    result_bubble.update_content(
+                        "\n".join(
+                            placeholder_lines
+                            + [
+                                "",
+                                f"Status:",
+                                retry_message,
+                            ]
+                        )
+                    )
+                    if self.automation_loop_active:
+                        QTimer.singleShot(PROVIDER_LONG_RETRY_DELAY_MS, lambda rr=retry_round: start_worker(rr))
+                    return
+                final_text = execution_text.strip()
+                if error:
+                    final_text = terminal_extension_execution_log(
+                        cleaned_directives,
+                        f"网页搜索失败：{error}",
+                    )
+                result_bubble.update_content(final_text)
+                context_content = build_execution_context_content(final_text, [])
+                self.append_history({
+                    "type": "result",
+                    "content": final_text,
+                    "context_content": context_content,
+                    "changes": [],
+                    "undone": False,
+                })
+                if self.automation_loop_active:
+                    QTimer.singleShot(0, lambda cc=context_content: self.request_next_automation_step(cc))
+                elif self.automation_enabled:
+                    self.show_automation_composer(focus=False)
+                else:
+                    self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
+                self.scroll_to_bottom()
+
+            worker.status_signal.connect(on_status)
+            worker.finished_signal.connect(on_finished)
+            worker.start()
+
+        start_worker()
 
     def schedule_execution_prompt(self, schedule_item: Dict[str, object]) -> str:
         title = str(schedule_item.get("title") or "定时计划").strip()
@@ -16855,7 +17293,13 @@ class ChatPage(QWidget):
             worker.finished.connect(worker.deleteLater)
             if self.automation_worker is worker:
                 self.automation_worker = None
-        if context_worker is not None or worker is not None:
+        web_research_worker = self.web_research_worker
+        if web_research_worker is not None:
+            web_research_worker.requestInterruption()
+            web_research_worker.finished.connect(web_research_worker.deleteLater)
+            if self.web_research_worker is web_research_worker:
+                self.web_research_worker = None
+        if context_worker is not None or worker is not None or web_research_worker is not None:
             self.stop_provider_async(wait_timeout=0.8, aggressive=True)
         self.automation_active_messages = []
         self.automation_active_model = ""
@@ -17140,6 +17584,9 @@ class ChatPage(QWidget):
         if text:
             if looks_like_automation_context_payload(text):
                 return
+            if looks_like_web_session_busy_text(text):
+                self.set_status_bar_override("网页端当前消息仍在生成，正在自动重试…", duration_ms=12000)
+                return
             if text != self.automation_preview_pending_text:
                 self.automation_preview_pending_text = text
                 self.schedule_automation_preview_render()
@@ -17171,14 +17618,24 @@ class ChatPage(QWidget):
         raw_prompt = user_text.strip()
         marker_prompt = raw_prompt if marker_user_text is None else str(marker_user_text or "").strip()
         prompt = raw_prompt or "请根据当前工作区创建或修改项目，并输出可直接执行的完整指令。"
-        return SYSTEM_PROMPT.format(
+        base_prompt = SYSTEM_PROMPT.format(
             project_root=self.project_root,
             user_prompt=prompt,
             done_marker=AUTOMATION_DONE_MARKER,
             terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
             terminal_logs_url=(self.wechat_bridge.url().rstrip("/") + "/terminallogs") if hasattr(self, "wechat_bridge") else "http://127.0.0.1:8798/terminallogs",
             **runtime_environment(),
-        ) + f"\n{PROMPT_BUBBLE_MARKER}{base64.b64encode(marker_prompt.encode('utf-8')).decode('ascii')} -->"
+        )
+        skills_context = self.selected_skills_context()
+        skills_text = (
+            "\n\n【本轮手动启用的技能】\n"
+            "以下技能由用户在界面中手动勾选，已经作为本轮对话的已载入技能加入提示词。"
+            "它们是本轮第一优先级：开始处理任务前，必须先阅读并遵循这些 SKILL.md；"
+            "只有在这些已选技能不足以覆盖任务时，才考虑自主探索其他技能或方案。"
+            "不要先否认自己没有技能；如果用户询问当前上下文里有哪些技能，也应基于这里直接回答。\n"
+            f"{skills_context}"
+        ) if skills_context else ""
+        return base_prompt + skills_text + f"\n{PROMPT_BUBBLE_MARKER}{base64.b64encode(marker_prompt.encode('utf-8')).decode('ascii')} -->"
 
     def build_automation_system_text(self) -> str:
         return SYSTEM_PROMPT.format(
@@ -17237,7 +17694,8 @@ class ChatPage(QWidget):
         skills_context = self.selected_skills_context()
         skills_text = (
             "\n\n【本轮手动启用的技能】\n"
-            "以下 SKILL.md 由用户手动选择，只在本轮提示词中作为约束和流程参考；不要自行寻找或猜测其他技能。\n"
+            "以下 SKILL.md 由用户手动选择，是本轮第一优先级。开始处理任务前，必须先阅读并遵循这些已载入技能；"
+            "只有在这些技能不足以覆盖任务时，才考虑自主探索其他技能或方案。不要先否认自己没有技能。\n"
             f"{skills_context}"
         ) if skills_context else ""
         return self.build_automation_system_text() + skills_text + (
@@ -17600,7 +18058,7 @@ class ChatPage(QWidget):
         context_worker.finished.connect(context_worker.deleteLater)
         self.update_automation_composer_state()
 
-        def start_chat_worker(messages: List[Dict[str, str]]):
+        def start_chat_worker(messages: List[Dict[str, str]], long_retry_round: int = 0):
             provider_model = self.effective_automation_model()
             worker = AutomationChatWorker(
                 self.automation_manager,
@@ -17617,6 +18075,10 @@ class ChatPage(QWidget):
             self.update_automation_composer_state()
             self.start_automation_preview()
 
+            def on_status(message: str):
+                if request_serial == self.automation_request_serial and self.automation_worker is worker:
+                    self.set_status_bar_override(message, duration_ms=12000)
+
             def on_finished(text: str, error: str):
                 if request_serial != self.automation_request_serial or self.automation_worker is not worker:
                     return
@@ -17626,6 +18088,15 @@ class ChatPage(QWidget):
                     copy_btn.setEnabled(True)
                     copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
                 if error:
+                    if looks_like_provider_transient_error(error) and long_retry_round < PROVIDER_LONG_RETRY_ATTEMPTS:
+                        retry_round = long_retry_round + 1
+                        wait_seconds = max(1, int(PROVIDER_LONG_RETRY_DELAY_MS / 1000))
+                        retry_message = f"短重试仍未恢复，{wait_seconds} 秒后进行第 {retry_round}/{PROVIDER_LONG_RETRY_ATTEMPTS} 轮后台重试…"
+                        self.set_status_bar_override(retry_message, duration_ms=min(PROVIDER_LONG_RETRY_DELAY_MS + 8000, 180000))
+                        self.stop_automation_preview(remove_bubble=False)
+                        if self.automation_loop_active:
+                            QTimer.singleShot(PROVIDER_LONG_RETRY_DELAY_MS, lambda m=copy.deepcopy(messages), rr=retry_round: start_chat_worker(m, rr))
+                            return
                     partial_text = (
                         self.automation_preview_pending_text
                         or self.automation_preview_last_rendered_text
@@ -17681,6 +18152,7 @@ class ChatPage(QWidget):
                     self.automation_active_model = ""
                     preview_bubble = self.finalize_automation_preview_bubble(text)
                     self.handle_ai_response_text(text, existing_bubble=preview_bubble, provider_io=provider_io)
+            worker.status_signal.connect(on_status)
             worker.finished_signal.connect(on_finished)
             worker.start()
 
@@ -18320,6 +18792,7 @@ class ChatPage(QWidget):
         done_context_text = ""
         terminal_extension_triggers: List[str] = []
         terminal_extension_result_log = ""
+        web_research_directives: List[str] = []
         if self.automation_loop_active:
             terminal_extension_triggers = terminal_extension_directives_from_text(display_text)
         else:
@@ -18423,11 +18896,8 @@ class ChatPage(QWidget):
                 terminal_extension_result_log = terminal_extension_execution_log(terminal_extension_triggers, display_text)
                 done_response = True
             elif web_research_queries and not has_real_command:
-                display_text = stripped_display_text or "已切换为网页搜索，下一轮将先搜索再回答。"
-                terminal_extension_result_log = terminal_extension_execution_log(
-                    terminal_extension_triggers,
-                    web_research_extension_reply(web_research_queries),
-                )
+                self.set_status_bar_override("网页搜索进行中，正在等待结果…", duration_ms=15000)
+                web_research_directives = list(terminal_extension_triggers)
             elif file_targets and not has_real_command:
                 display_text = wechat_trigger_summary(terminal_extension_triggers)
                 done_context_text = (display_text + "\n\n" + "\n".join(terminal_extension_triggers)).strip()
@@ -18492,6 +18962,11 @@ class ChatPage(QWidget):
             self.stop_automation_loop("", ensure_manual_entry=True)
             self.scroll_to_bottom()
             return
+
+        if web_research_directives:
+            self.start_web_research_extension_run(web_research_directives)
+            self.scroll_to_bottom()
+            return
         
         blocks = scan_all_code_blocks(display_text)
         try:
@@ -18522,6 +18997,11 @@ class ChatPage(QWidget):
         
         if not commands:
             if terminal_extension_triggers:
+                web_research_queries = extract_web_research_queries("\n".join(terminal_extension_triggers))
+                if web_research_queries:
+                    self.start_web_research_extension_run(terminal_extension_triggers)
+                    self.scroll_to_bottom()
+                    return
                 execution_text = terminal_extension_result_log or self.execute_terminal_extension_directives(
                     terminal_extension_triggers
                 )
@@ -18532,18 +19012,6 @@ class ChatPage(QWidget):
                         self.request_next_automation_step(context_content)
                     else:
                         self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
-                    self.scroll_to_bottom()
-                    return
-            if self.automation_loop_active and terminal_extension_triggers:
-                web_research_queries = extract_web_research_queries("\n".join(terminal_extension_triggers))
-                if web_research_queries:
-                    execution_text = terminal_extension_result_log or terminal_extension_execution_log(
-                        terminal_extension_triggers,
-                        web_research_extension_reply(web_research_queries),
-                    )
-                    context_content = build_execution_context_content(execution_text, [])
-                    self.add_execution_result_entry(execution_text, context_content=context_content)
-                    self.request_next_automation_step(context_content)
                     self.scroll_to_bottom()
                     return
             if self.automation_loop_active:
