@@ -1834,6 +1834,8 @@ def split_markdown_fenced_blocks(text: str) -> List[Dict[str, str]]:
     code_lang = ""
     fence_char = ""
     fence_len = 0
+    markdown_outer_fence = False
+    nested_markdown_fence_depth = 1
 
     def flush_markdown():
         nonlocal buffer
@@ -1842,7 +1844,7 @@ def split_markdown_fenced_blocks(text: str) -> List[Dict[str, str]]:
             buffer = []
 
     def flush_code():
-        nonlocal code_buffer, code_lang, fence_char, fence_len
+        nonlocal code_buffer, code_lang, fence_char, fence_len, markdown_outer_fence, nested_markdown_fence_depth
         parts.append({
             "type": "code",
             "lang": code_lang.strip(),
@@ -1852,6 +1854,8 @@ def split_markdown_fenced_blocks(text: str) -> List[Dict[str, str]]:
         code_lang = ""
         fence_char = ""
         fence_len = 0
+        markdown_outer_fence = False
+        nested_markdown_fence_depth = 1
 
     def opening_fence(line: str) -> Optional[re.Match]:
         return re.match(r"^\s{0,3}([`~]{3,})([^\r\n]*)\s*$", line.rstrip("\n\r"))
@@ -1862,10 +1866,42 @@ def split_markdown_fenced_blocks(text: str) -> List[Dict[str, str]]:
         pattern = rf"^\s{{0,3}}{re.escape(fence_char)}{{{fence_len},}}\s*$"
         return re.match(pattern, line.rstrip("\n\r")) is not None
 
+    def matching_fence_candidate(line: str) -> Optional[re.Match]:
+        match = opening_fence(line)
+        if not match:
+            return None
+        fence = match.group(1)
+        if not fence_char or fence[0] != fence_char or len(fence) < fence_len:
+            return None
+        return match
+
+    def has_future_matching_fence(start_index: int) -> bool:
+        lookahead = start_index
+        while lookahead < len(lines):
+            if matching_fence_candidate(lines[lookahead]):
+                return True
+            lookahead += 1
+        return False
+
     index = 0
     while index < len(lines):
         line = lines[index]
         if in_code:
+            if markdown_outer_fence:
+                fence_match = matching_fence_candidate(line)
+                if fence_match:
+                    if nested_markdown_fence_depth <= 1 and not has_future_matching_fence(index + 1):
+                        flush_code()
+                        in_code = False
+                        index += 1
+                        continue
+                    if nested_markdown_fence_depth <= 1:
+                        nested_markdown_fence_depth = 2
+                    else:
+                        nested_markdown_fence_depth -= 1
+                    code_buffer.append(line)
+                    index += 1
+                    continue
             if is_closing_fence(line):
                 flush_code()
                 in_code = False
@@ -1889,6 +1925,8 @@ def split_markdown_fenced_blocks(text: str) -> List[Dict[str, str]]:
             fence_char = fence[0]
             fence_len = len(fence)
             code_lang = (match.group(2) or "").strip().split(maxsplit=1)[0] if (match.group(2) or "").strip() else ""
+            markdown_outer_fence = code_lang.lower() in {"markdown", "md"}
+            nested_markdown_fence_depth = 1
             index += 1
             continue
         buffer.append(line)
@@ -2171,46 +2209,11 @@ def scan_all_code_blocks(text: str) -> Dict[str, List[str]]:
     """扫描所有 Markdown 代码块，返回 {lang: [code1, code2, ...]}"""
     blocks: Dict[str, List[str]] = {}
     lines = (text or "").splitlines(keepends=True)
-    in_code = False
-    fence_char = ""
-    fence_len = 0
-    lang = ""
-    lang_index = 0
     pending_placeholder_lang = ""
     pending_placeholder_index = 0
-    code_lines: List[str] = []
-
-    def opening_fence(line: str) -> Optional[re.Match]:
-        return re.match(r"^\s{0,3}([`~]{3,})([^\r\n]*)\s*$", line.rstrip("\n\r"))
-
-    def is_closing_fence(line: str) -> bool:
-        if not fence_char or fence_len <= 0:
-            return False
-        pattern = rf"^\s{{0,3}}{re.escape(fence_char)}{{{fence_len},}}\s*$"
-        return re.match(pattern, line.rstrip("\n\r")) is not None
 
     for line in lines:
-        if in_code:
-            if is_closing_fence(line):
-                code = "".join(code_lines)
-                key = canonical_lang(lang)
-                if lang_index > 0:
-                    values = blocks.setdefault(key, [])
-                    while len(values) < lang_index:
-                        values.append("")
-                    values[lang_index - 1] = code.strip()
-                else:
-                    blocks.setdefault(key, []).append(code.strip())
-                in_code = False
-                fence_char = ""
-                fence_len = 0
-                lang = ""
-                lang_index = 0
-                code_lines = []
-            else:
-                code_lines.append(line)
-            continue
-        match = opening_fence(line)
+        match = re.match(r"^\s{0,3}([`~]{3,})([^\r\n]*)\s*$", line.rstrip("\n\r"))
         if not match:
             stripped = line.strip()
             placeholder_match = NUMBERED_HTML_PLACEHOLDER_RE.fullmatch(stripped)
@@ -2221,30 +2224,26 @@ def scan_all_code_blocks(text: str) -> Dict[str, List[str]]:
                 pending_placeholder_lang = ""
                 pending_placeholder_index = 0
             continue
-        fence = match.group(1)
-        raw_info = (match.group(2) or "").strip()
-        lang = raw_info.split(maxsplit=1)[0] if raw_info else ""
+    for part in split_markdown_fenced_blocks(text or ""):
+        if part.get("type") != "code":
+            continue
+        lang = canonical_lang(part.get("lang") or "")
+        code = part.get("text", "").strip()
         if not lang and pending_placeholder_lang:
             lang = pending_placeholder_lang
             lang_index = pending_placeholder_index
+            pending_placeholder_lang = ""
+            pending_placeholder_index = 0
         else:
             lang_index = 0
-        fence_char = fence[0]
-        fence_len = len(fence)
-        in_code = True
-        code_lines = []
-        pending_placeholder_lang = ""
-        pending_placeholder_index = 0
-    if in_code:
-        code = "".join(code_lines)
         key = canonical_lang(lang)
         if lang_index > 0:
             values = blocks.setdefault(key, [])
             while len(values) < lang_index:
                 values.append("")
-            values[lang_index - 1] = code.strip()
+            values[lang_index - 1] = code
         else:
-            blocks.setdefault(key, []).append(code.strip())
+            blocks.setdefault(key, []).append(code)
     return blocks
 
 
