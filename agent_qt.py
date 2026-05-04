@@ -1112,17 +1112,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 【占位符协议】：替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。不要把替换符当作待办、摘要、计划、说明或普通正文输出；命令块未引用的替换符没有意义。
 - 替换符语言必须和后续文件内容代码块语言一致；写 HTML 就用 `<!-- HTML block 1 -->` 并提供 ```html 代码块，写 SVG 就用 `<!-- SVG block 1 -->` 并提供 ```svg 代码块。不要用 `Game block`、`File block` 这类泛化名称。
 - 占位符正例：命令块只放 shell 和占位符，真实文件内容放在后续同编号同语言 fenced 代码块里：
-  ```bash
-  cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'
-  <!-- Python block 1 -->
-  PYEOF
-  python /Users/pippo/Desktop/my-project/hello.py
-  ```
-  ```python
-  # <desc 打印问候>
-  print("hello from file")
-  ```
-  说明：`<!-- Python block 1 -->` 不会写进文件；真正写入的是后面的第 1 个 `python` 代码块内容。
+{placeholder_example}
 - 命令块保持短小；不要在命令块内直接嵌入超过 10 行的文件正文，如果要写入超过 10 行的文件内容时，必须拆分为终端指令里使用占位符协议 + 后续md格式的fenced 代码块。
 - 代码块首行可用本语言注释写摘要，供界面折叠展示：如 `# <desc 写入配置>`、`// <desc 前端逻辑>`、`/* <desc 样式> */`、`<!-- <desc SVG 图像> -->`；没有也可以，界面会自动截断首行生成摘要。
 - 不要在非写文件场景使用替换符；不要把替换符写进文件内容代码块；输出了替换符就必须在同一回复提供对应 fenced 文件内容代码块。
@@ -2085,6 +2075,20 @@ def runtime_environment() -> Dict[str, str]:
             "执行 .exe 或带路径的命令优先用调用运算符 &，例如 & $env:AGENT_QT_RUNTIME_PYTHON script.py；"
             "切换目录用 Set-Location -LiteralPath；路径使用 C:\\... 或 Join-Path。"
         )
+        placeholder_example = (
+            "  ```powershell\n"
+            "  $py = Join-Path (Get-Location) 'hello.py'\n"
+            "  Set-Content -LiteralPath $py -Encoding UTF8 -Value @'\n"
+            "  <!-- Python block 1 -->\n"
+            "  '@\n"
+            "  & $env:AGENT_QT_RUNTIME_PYTHON $py\n"
+            "  ```\n"
+            "  ```python\n"
+            "  # <desc 打印问候>\n"
+            "  print(\"hello from file\")\n"
+            "  ```\n"
+            "  说明：`<!-- Python block 1 -->` 不会写进文件；真正写入的是后面的第 1 个 `python` 代码块内容。"
+        )
     else:
         command_block_lang = "bash"
         command_shell_name = os.environ.get("SHELL") or "/bin/sh"
@@ -2092,6 +2096,19 @@ def runtime_environment() -> Dict[str, str]:
         command_rules = (
             "macOS/Linux 环境必须输出一个 ```bash 代码块，内容使用 POSIX shell/bash 语法。"
             "不要输出 Windows cmd/PowerShell 专用语法。"
+        )
+        placeholder_example = (
+            "  ```bash\n"
+            "  cat > /Users/pippo/Desktop/my-project/hello.py <<'PYEOF'\n"
+            "  <!-- Python block 1 -->\n"
+            "  PYEOF\n"
+            "  python /Users/pippo/Desktop/my-project/hello.py\n"
+            "  ```\n"
+            "  ```python\n"
+            "  # <desc 打印问候>\n"
+            "  print(\"hello from file\")\n"
+            "  ```\n"
+            "  说明：`<!-- Python block 1 -->` 不会写进文件；真正写入的是后面的第 1 个 `python` 代码块内容。"
         )
     return {
         "os_name": system,
@@ -2103,6 +2120,7 @@ def runtime_environment() -> Dict[str, str]:
         "command_shell_name": command_shell_name,
         "command_execution": command_execution,
         "command_rules": command_rules,
+        "placeholder_example": placeholder_example,
     }
 
 LANG_ALIASES = {
