@@ -2082,6 +2082,7 @@ def runtime_environment() -> Dict[str, str]:
             "Windows 环境必须输出一个 ```powershell 代码块，内容使用 Windows PowerShell 5.1 兼容语法。"
             "不要输出 bash/sh 语法，不要使用 cat <<EOF/heredoc、chmod、rm -rf、export、source、nohup、& 后台符号或 POSIX 路径。"
             "写文件优先使用 New-Item -ItemType Directory -Force、Set-Content -Encoding UTF8、PowerShell here-string；"
+            "执行 .exe 或带路径的命令优先用调用运算符 &，例如 & $env:AGENT_QT_RUNTIME_PYTHON script.py；"
             "切换目录用 Set-Location -LiteralPath；路径使用 C:\\... 或 Join-Path。"
         )
     else:
@@ -4506,6 +4507,24 @@ def build_automation_feedback_prompt(
             "就必须把任务视为“未完成”，继续输出下一步命令块；不能仅凭搜索结果就结束。"
             "换句话说，搜索只负责提供线索，不代表目标文件、目标脚本、目标文档或目标产物已经真的落到工作区。"
         )
+    windows_file_protocol_note = ""
+    if command_block_lang == "powershell":
+        windows_file_protocol_note = (
+            "\n- Windows 写入超过 10 行的 Python/JSON/HTML 等文件时，使用下面这种固定占位符写法；"
+            "不要把 Python/JSON 原文直接放进 powershell 命令块里执行，也不要写 `<!-- Powershell block 1 -->`：\n"
+            "```powershell\n"
+            "$py = Join-Path (Get-Location) 'script.py'\n"
+            "Set-Content -LiteralPath $py -Encoding UTF8 -Value @'\n"
+            "<!-- Python block 1 -->\n"
+            "'@\n"
+            "& $env:AGENT_QT_RUNTIME_PYTHON $py\n"
+            "```\n"
+            "```python\n"
+            "print('hello')\n"
+            "```\n"
+            "- Windows 执行 Python 优先用 `& $env:AGENT_QT_RUNTIME_PYTHON script.py`；"
+            "不要用多行 `python -c \"...\"` 承载复杂脚本。"
+        )
     wechat_completion_note = ""
     if wechat_file_delivery:
         wechat_completion_note = (
@@ -4565,6 +4584,7 @@ def build_automation_feedback_prompt(
 - 对下载、联网 HTTP 调用、安装、构建、长时间生成等任务，如果已经转入后台或暂时无输出，不要立刻换方案。优先先等待一小段合理时间，并主动查看终端/后台日志；必要时可以使用短暂等待后再查询日志，确认失败后再换方案。
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
 {web_research_followup_note}
+{windows_file_protocol_note}
 {wechat_completion_note}
 {final_round_note}
 """
@@ -7633,6 +7653,12 @@ class ExecuteWorker(QThread):
                     out += "\n" + r.stderr.strip()
                 if r.returncode != 0:
                     out += f"\n[退出码: {r.returncode}]"
+                elif platform.system() == "Windows" and out:
+                    out += "\n[退出码: 0]"
+                elif platform.system() == "Windows":
+                    out = "(stdout/stderr 无输出)\n[退出码: 0]"
+                if platform.system() == "Windows" and "已省略" in display_cmd:
+                    out = "注：上方省略的是命令内容，不是命令输出。\n" + out
                 outputs.append(f"[{i}] 💻 {display_cmd}\n📤 {out or '(无输出)'}")
             except BackgroundProcessStarted as exc:
                 info = dict(exc.info)
@@ -7685,6 +7711,8 @@ class WebResearchWorker(QThread):
                     search_outputs.append(f"网页搜索：{query}\n已停止后续搜索。")
                     break
                 try:
+                    if platform.system() == "Windows":
+                        self.status_signal.emit(f"网页搜索进行中：{query}")
                     summary = self.manager.web_research(
                         query,
                         self.model,

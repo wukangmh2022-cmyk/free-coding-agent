@@ -2847,38 +2847,57 @@ async def responses(request: ResponsesRequest):
         request_thinking_enabled,
     )
 
-    try:
-        payload, _slot_timing = await run_on_bridge_slot(
-            pool,
-            spec=spec,
-            request_id=request_id,
-            route="/v1/responses",
-            operation=lambda bridge, slot_spec: bridge_call_with_spec(
-                bridge,
-                spec=slot_spec,
-                messages=request_messages,
-                tools=bridge_tools,
-                thinking_enabled=request_thinking_enabled,
-                expert_mode_enabled=request_expert_mode_enabled,
-                output_protocol="openai",
-            ),
+    direct_web_search = bool(os.name == "nt" and request_web_search_tools and not request_tools)
+    if direct_web_search:
+        query = _latest_user_text(request_messages)
+        payload = {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": f"call_{uuid.uuid4().hex}",
+                    "name": PROVIDER_WEB_SEARCH_TOOL_NAME,
+                    "arguments": {"query": query},
+                }
+            ] if query else [],
+        }
+        logger.warning(
+            "provider[%s] /v1/responses direct web-search query=%r",
+            request_id,
+            query[:160],
         )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("provider[%s] /v1/responses bridge.call failed", request_id)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    else:
+        try:
+            payload, _slot_timing = await run_on_bridge_slot(
+                pool,
+                spec=spec,
+                request_id=request_id,
+                route="/v1/responses",
+                operation=lambda bridge, slot_spec: bridge_call_with_spec(
+                    bridge,
+                    spec=slot_spec,
+                    messages=request_messages,
+                    tools=bridge_tools,
+                    thinking_enabled=request_thinking_enabled,
+                    expert_mode_enabled=request_expert_mode_enabled,
+                    output_protocol="openai",
+                ),
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("provider[%s] /v1/responses bridge.call failed", request_id)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    raw_text = payload.get("raw_text", "")
-    logger.warning(
-        "provider[%s] /v1/responses bridge.call done content_chars=%d raw_text_chars=%d tool_calls=%s parse_error=%s retries=%s",
-        request_id,
-        len(payload.get("content", "") or ""),
-        len(raw_text) if isinstance(raw_text, str) else 0,
-        summarize_tool_calls(payload.get("tool_calls")),
-        payload.get("parse_error"),
-        payload.get("protocol_retry_count", 0),
-    )
+        raw_text = payload.get("raw_text", "")
+        logger.warning(
+            "provider[%s] /v1/responses bridge.call done content_chars=%d raw_text_chars=%d tool_calls=%s parse_error=%s retries=%s",
+            request_id,
+            len(payload.get("content", "") or ""),
+            len(raw_text) if isinstance(raw_text, str) else 0,
+            summarize_tool_calls(payload.get("tool_calls")),
+            payload.get("parse_error"),
+            payload.get("protocol_retry_count", 0),
+        )
 
     raise_if_web_busy_payload(payload, request_id, "/v1/responses")
     payload, web_search_items, search_results = await resolve_provider_web_search(
