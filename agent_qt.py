@@ -4275,6 +4275,66 @@ def looks_like_submit_idle_error(text: str) -> bool:
     )
 
 
+def looks_like_web_login_required_error(text: str) -> bool:
+    content = str(text or "").strip()
+    lowered = content.lower()
+    markers = (
+        "尚未登录",
+        "请先登录",
+        "网页登录还没有准备好",
+        "input box not found",
+        "please login",
+        "please log in",
+        "login required",
+        "sign in to continue",
+    )
+    return any(marker in content or marker in lowered for marker in markers)
+
+
+def looks_like_attention_status(text: str) -> bool:
+    content = str(text or "").strip()
+    lowered = content.lower()
+    markers = (
+        "重试",
+        "失败",
+        "异常",
+        "超时",
+        "错误",
+        "未登录",
+        "retry",
+        "failed",
+        "error",
+        "timeout",
+    )
+    return any(marker in content or marker in lowered for marker in markers)
+
+
+def terminal_status_label_style(*, attention: bool = False) -> str:
+    color = COLORS["danger"] if attention else COLORS["terminal_muted"]
+    weight = "900" if attention else "700"
+    return f"color: {color}; font-size: 11px; font-weight: {weight}; background: transparent;"
+
+
+def collapsed_status_bar_style(*, attention: bool = False) -> str:
+    color = COLORS["danger"] if attention else COLORS["terminal_text"]
+    weight = "900" if attention else "800"
+    return f"""
+        QPushButton {{
+            background: {COLORS['terminal_panel']};
+            color: {color};
+            border: none;
+            border-top: 1px solid {COLORS['border']};
+            padding: 7px 16px;
+            font-size: 12px;
+            font-weight: {weight};
+            text-align: left;
+        }}
+        QPushButton:hover {{
+            background: {COLORS['surface_alt']};
+        }}
+    """
+
+
 def looks_like_incomplete_plain_response(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", str(text or "").strip()).lower()
     return normalized in {"text", "plaintext", "markdown"}
@@ -4375,6 +4435,8 @@ def provider_retry_status_message(path: str, attempt: int, attempts: int, detail
 def looks_like_provider_transient_error(error: str) -> bool:
     content = str(error or "").strip()
     lowered = content.lower()
+    if looks_like_web_login_required_error(content):
+        return False
     if looks_like_timeout_error(content) or looks_like_web_session_busy_error(content):
         return True
     transient_markers = (
@@ -7051,9 +7113,7 @@ class TerminalPanel(QWidget):
         self.header_status_label.setFixedHeight(22)
         self.header_status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.header_status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.header_status_label.setStyleSheet(
-            f"color: {COLORS['terminal_muted']}; font-size: 11px; background: transparent;"
-        )
+        self.header_status_label.setStyleSheet(terminal_status_label_style())
         self.header_status_label.setVisible(False)
         self.title_label = title
         self.collapse_btn = QPushButton("─")
@@ -7145,7 +7205,7 @@ class TerminalPanel(QWidget):
         """)
         for label, style in (
             (self.count_label, f"color: {COLORS['terminal_muted']}; font-size: 11px; background: transparent;"),
-            (self.header_status_label, f"color: {COLORS['terminal_muted']}; font-size: 11px; background: transparent;"),
+            (self.header_status_label, terminal_status_label_style(attention=looks_like_attention_status(self.header_status_label.text()))),
         ):
             label.setStyleSheet(style)
         self.title_label.setStyleSheet(f"color: {COLORS['terminal_text']}; font-weight: 800; font-size: 12px; background: transparent;")
@@ -7490,6 +7550,7 @@ class TerminalPanel(QWidget):
     def set_header_status(self, text: str):
         message = str(text or "").strip()
         self.header_status_label.setText(message)
+        self.header_status_label.setStyleSheet(terminal_status_label_style(attention=looks_like_attention_status(message)))
         self.header_status_label.setVisible(bool(message))
 
 # ============================================================
@@ -8252,12 +8313,13 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
                         message = str(payload_detail["detail"])
                 except Exception:
                     pass
-                if "input box not found" in message.lower() or "please login" in message.lower():
+                login_required = looks_like_web_login_required_error(message)
+                if login_required:
                     message = (
-                        "网页登录还没有准备好，provider 没找到聊天输入框。\n\n"
+                        "网页登录还没有准备好，当前 DeepSeek Web 尚未登录或不在聊天页。\n\n"
                         "请在设置里点击“打开网页登录”，完成登录后保持页面在聊天界面，再重新发送。"
                     )
-                if exc.code in PROVIDER_TRANSIENT_HTTP_CODES and attempt < attempts:
+                if exc.code in PROVIDER_TRANSIENT_HTTP_CODES and attempt < attempts and not login_required:
                     if retry_callback is not None:
                         try:
                             retry_callback(provider_retry_status_message(path, attempt + 1, attempts, message))
@@ -13244,21 +13306,7 @@ class ChatPage(QWidget):
         layout.addWidget(self.terminal_panel)
         
         self.status_bar = QPushButton("", clicked=self.terminal_panel.toggle, cursor=Qt.PointingHandCursor,
-                                      styleSheet=f"""
-                                          QPushButton {{
-                                              background: {COLORS['terminal_panel']};
-                                              color: {COLORS['terminal_text']};
-                                              border: none;
-                                              border-top: 1px solid {COLORS['border']};
-                                              padding: 7px 16px;
-                                              font-size: 12px;
-                                              font-weight: 800;
-                                              text-align: left;
-                                          }}
-                                          QPushButton:hover {{
-                                              background: {COLORS['surface_alt']};
-                                          }}
-        """)
+                                      styleSheet=collapsed_status_bar_style())
         layout.addWidget(self.status_bar)
         self.update_status_bar()
         self.update_prompt_tools_responsive()
@@ -18281,6 +18329,7 @@ class ChatPage(QWidget):
         override_active = bool(self._status_bar_override_text and time.time() < self._status_bar_override_until)
         if is_collapsed:
             self.status_bar.setText(self._status_bar_override_text if override_active else f"终端 · {n} 个进程")
+            self.status_bar.setStyleSheet(collapsed_status_bar_style(attention=override_active and looks_like_attention_status(self._status_bar_override_text)))
             self.status_bar.setVisible(True)
             self.terminal_resize_handle.setVisible(False)
         else:
