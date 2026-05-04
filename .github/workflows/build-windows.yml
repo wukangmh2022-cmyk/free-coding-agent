@@ -40,6 +40,20 @@ jobs:
         run: |
           @'
           import agent_qt
+          import re
+
+          def assert_no_readonly_automatic_variable_assignments(script):
+              readonly = {
+                  "host", "home", "pid", "pshome", "executioncontext", "error",
+                  "foreach", "input", "matches", "myinvocation", "profile",
+                  "pscmdlet", "psitem", "sender", "shellid", "stacktrace", "this",
+              }
+              assigned = {
+                  name.lower()
+                  for name in re.findall(r"(?im)^\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*=", script)
+              }
+              hits = sorted(assigned & readonly)
+              assert not hits, f"PowerShell script assigns read-only automatic variables: {hits}"
 
           runtime_cmd = agent_qt.build_python_runtime_install_command()
           assert runtime_cmd.startswith(agent_qt.POWERSHELL_COMMAND_PREFIX), runtime_cmd[:120]
@@ -48,6 +62,7 @@ jobs:
           assert 'TargetDir="$BasePythonDir"' in runtime_cmd, runtime_cmd
           assert "& $BasePython -m venv $VenvDir" in runtime_cmd, runtime_cmd
           assert "Scripts" in runtime_cmd and "python.exe" in runtime_cmd, runtime_cmd
+          assert_no_readonly_automatic_variable_assignments(runtime_cmd)
 
           manager = agent_qt.AutomationProviderManager()
           plugin_cmd = manager.install_dependencies_command()
@@ -59,6 +74,7 @@ jobs:
           assert "& $BasePython -m venv $VenvDir" in plugin_cmd, plugin_cmd
           assert "playwright install chromium" in plugin_cmd, plugin_cmd
           assert "Playwright browser OK" in plugin_cmd, plugin_cmd
+          assert_no_readonly_automatic_variable_assignments(plugin_cmd)
           shell, args = agent_qt.shell_launch_for_command(agent_qt.POWERSHELL_COMMAND_PREFIX + "Write-Host ok", script_path=r"C:\Temp\agent_qt_test.ps1")
           assert args[:4] == ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"], (shell, args)
           shell, args = agent_qt.shell_launch_for_command(r"C:\Temp\agent_qt_test.cmd", script_path=r"C:\Temp\agent_qt_test.cmd")

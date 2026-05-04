@@ -803,8 +803,11 @@ if (-not $BasePython) {{
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {{
         & winget install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements
-        $candidate = (& py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2>$null).Trim()
-        if ($candidate) {{ Use-AgentQtPython $candidate | Out-Null }}
+        $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+        if ($pyLauncher) {{
+            $candidate = (& py -3 -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2>$null).Trim()
+            if ($candidate) {{ Use-AgentQtPython $candidate | Out-Null }}
+        }}
         if (-not $BasePython) {{
             Use-AgentQtPython (Join-Path $env:LOCALAPPDATA 'Programs\\Python\\Python312\\python.exe') | Out-Null
         }}
