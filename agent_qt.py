@@ -818,12 +818,24 @@ if (-not $BasePython) {{
     Write-Host "winget 不可用或安装后仍未定位到 Python，安装独立 Python 到缓存目录..."
     New-Item -ItemType Directory -Force -Path $BasePythonDir | Out-Null
     $installer = Join-Path $env:TEMP ("agent-qt-python-3.12-" + [guid]::NewGuid().ToString("N") + ".exe")
+    $installerLog = Join-Path $env:TEMP ("agent-qt-python-install-" + [guid]::NewGuid().ToString("N") + ".log")
     try {{
         Invoke-AgentQtDownloadFile -Urls $PythonInstallerUrls -OutFile $installer
         Set-AgentQtPreferredPipSourceFromInstaller -InstallerUrl $script:AgentQtPythonInstallerUrl
-        & $installer /quiet InstallAllUsers=0 TargetDir="$BasePythonDir" PrependPath=0 Include_pip=1 Include_launcher=0 Include_test=0
-        $installExit = $LASTEXITCODE
-        if ($installExit -ne 0 -and $installExit -ne 3010) {{
+        $installerArgs = "/quiet InstallAllUsers=0 TargetDir=`"$BasePythonDir`" PrependPath=0 Include_pip=1 Include_launcher=0 Include_test=0 /log `"$installerLog`""
+        Write-Host "运行 Python 安装器..."
+        $installProcess = Start-Process -FilePath $installer -ArgumentList $installerArgs -Wait -PassThru
+        $installExit = $installProcess.ExitCode
+        if ($null -eq $installExit) {{
+            Write-Host "Python 安装器未返回退出码，改为检查目标 python.exe。"
+        }} elseif ($installExit -ne 0 -and $installExit -ne 3010) {{
+            $logTail = ""
+            if (Test-Path -LiteralPath $installerLog -PathType Leaf) {{
+                $logTail = (Get-Content -LiteralPath $installerLog -Tail 40 -ErrorAction SilentlyContinue) -join "`n"
+            }}
+            if ($logTail) {{
+                throw "Python 安装器失败，退出码: $installExit`n安装日志尾部:`n$logTail"
+            }}
             throw "Python 安装器失败，退出码: $installExit"
         }}
     }} finally {{
