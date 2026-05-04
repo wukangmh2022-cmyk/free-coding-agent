@@ -1111,7 +1111,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 终端命令只写当前平台命令，不写 JSON/tool_calls；需要写文件占位符时可以继续提供后续文件内容 fenced 代码块。{command_rules}
 - 命令块内只能写真实要执行的 shell 代码，或 Agent Qt 终端扩展指令；不要把执行结果、文件变更摘要、结论、`AGENT_DONE` 或任何聊天正文写进命令块。
 - 【占位符协议】：替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。不要把替换符当作待办、摘要、计划、说明或普通正文输出；命令块未引用的替换符没有意义。
-- 替换符语言必须和后续文件内容代码块语言一致；写 HTML 就用 `<!-- HTML block 1 -->` 并提供 ```html 代码块，写 SVG 就用 `<!-- SVG block 1 -->` 并提供 ```svg 代码块。不要用 `Game block`、`File block` 这类泛化名称。
+- 替换符语言必须和后续文件内容代码块语言一致；编号按“语言”分别从 1 开始，不是按所有文件全局排序。写 1 个 HTML + 1 个 CSS + 1 个 JavaScript 时应分别用 `<!-- HTML block 1 -->`、`<!-- CSS block 1 -->`、`<!-- JavaScript block 1 -->`，不要写成 HTML 1 / CSS 2 / JavaScript 3。不要用 `Game block`、`File block` 这类泛化名称。
 - 占位符正例：命令块只放 shell 和占位符，真实文件内容放在后续同编号同语言 fenced 代码块里：
 {placeholder_example}
 - 命令块保持短小；不要在命令块内直接嵌入超过 10 行的文件正文，如果要写入超过 10 行的文件内容时，必须拆分为终端指令里使用占位符协议 + 后续md格式的fenced 代码块。
@@ -2456,7 +2456,8 @@ def resolve_all_placeholders(bash_text: str, blocks: Dict[str, List[str]]) -> st
         )
         raise ValueError(
             f"缺少占位符对应的代码块：{unique_missing}（缺少 {missing_counts}）。"
-            "请确认占位符编号没有超过对应语言代码块数量，例如 <!-- Python block 1 --> 引用第 1 个 python 代码块。"
+            "请确认占位符编号没有超过对应语言代码块数量；编号按语言分别从 1 开始，不是全局排序。"
+            "例如 1 个 html、1 个 css、1 个 javascript 文件都应该使用各自的 block 1。"
             "为避免覆盖文件，本轮已停止执行。"
         )
     if placeholder_pattern.search(resolved):
@@ -4554,6 +4555,8 @@ def build_automation_feedback_prompt(
             "```\n"
             "- Windows 执行 Python 优先用 `& $env:AGENT_QT_RUNTIME_PYTHON script.py`；"
             "不要用多行 `python -c \"...\"` 承载复杂脚本。"
+            "如果同一轮写多个不同语言文件，HTML/CSS/JavaScript/Python 等每种语言的占位符编号都从 1 开始，"
+            "不要按文件全局顺序写成 HTML block 1、CSS block 2、JavaScript block 3。"
         )
     wechat_completion_note = ""
     if wechat_file_delivery:
