@@ -10721,6 +10721,7 @@ class ChatBubble(QFrame):
         self.markdown_part_signatures: List[tuple] = []
         self.stabilize_markdown_height = False
         self.async_markdown_render = False
+        self.prevent_markdown_code_shrink = False
         self._markdown_render_seq = 0
         self._markdown_render_worker: Optional[MarkdownRenderWorker] = None
         self._markdown_render_pending = False
@@ -10797,6 +10798,23 @@ class ChatBubble(QFrame):
         copy_btn.setFixedSize(32, 32)
         copy_btn.setToolTip(self.copy_text)
         copy_btn.setStyleSheet(self.copy_icon_button_style())
+
+    def ensure_copy_button(self, copy_text: str = "复制"):
+        self.show_copy = True
+        self.copy_text = copy_text
+        copy_btn = getattr(self, "copy_btn", None)
+        if isinstance(copy_btn, QPushButton):
+            self.apply_copy_button_visuals()
+            return
+        layout = self.layout()
+        header = layout.itemAt(0).layout() if layout is not None and layout.count() > 0 else None
+        if header is None:
+            return
+        self.copy_btn = QPushButton("")
+        self.copy_btn.setCursor(Qt.PointingHandCursor)
+        self.apply_copy_button_visuals()
+        self.copy_btn.clicked.connect(self.copy_content)
+        header.addWidget(self.copy_btn)
     
     def setup_ui(self):
         self.setObjectName("chatBubblePlainSystemLog" if self.plain_system_log else "chatBubble")
@@ -11393,7 +11411,18 @@ class ChatBubble(QFrame):
 
     def render_markdown_parts(self, layout: Optional[QVBoxLayout] = None):
         split_started = time.perf_counter()
-        parts = split_markdown_fenced_blocks(self.visible_content())
+        source_parts = split_markdown_fenced_blocks(self.visible_content())
+        parts: List[Dict[str, str]] = []
+        for part in source_parts:
+            if part.get("type") == "code":
+                parts.append(part)
+            else:
+                markdown_text = part.get("text", "")
+                parts.append({
+                    "type": "markdown",
+                    "text": markdown_text,
+                    "html": markdown_with_pipe_tables_to_html(markdown_text),
+                })
         split_ms = int((time.perf_counter() - split_started) * 1000)
         signatures = [
             (part["type"], (part.get("lang", "") if part["type"] == "code" else ""))
@@ -11420,6 +11449,11 @@ class ChatBubble(QFrame):
 
     def apply_async_markdown_render(self, request_id: int, text: str, parts: List[Dict[str, str]], signatures: List[tuple], stats: Dict[str, int]):
         if request_id == self._markdown_render_seq and text == self.visible_content():
+            if self.prevent_markdown_code_shrink:
+                current_code_parts = len(self.markdown_code_widgets)
+                next_code_parts = sum(1 for part in parts if part.get("type") == "code")
+                if current_code_parts > 0 and next_code_parts < current_code_parts:
+                    return
             self.render_precomputed_markdown_parts(parts, signatures, stats=stats)
 
     def finish_async_markdown_render(self, worker: MarkdownRenderWorker):
@@ -11723,6 +11757,9 @@ class ExecutionLogPanel(QFrame):
         super().__init__(parent)
         self.content = mask_low_value_context_markers_for_display(content)
         self.max_content_height = max_content_height
+        self.auto_follow_enabled = False
+        self.auto_follow_interval_ms = 2500
+        self._last_auto_follow_at = 0.0
         self.setObjectName("executionLogPanel")
         self.setStyleSheet("QFrame#executionLogPanel { background: transparent; border: none; margin: 0; }")
         layout = QVBoxLayout(self)
@@ -11785,6 +11822,7 @@ class ExecutionLogPanel(QFrame):
         """)
         layout.addWidget(self.editor)
         self.adjust_content_height()
+        self.scroll_to_bottom_now()
 
     def visible_content(self) -> str:
         return self.content or self.editor.toPlainText() or " "
@@ -11806,6 +11844,27 @@ class ExecutionLogPanel(QFrame):
     def update_content(self, text: str):
         self.content = mask_low_value_context_markers_for_display(text)
         self.editor.setPlainText(self.content)
+        self.adjust_content_height()
+        self.maybe_auto_scroll_to_bottom()
+
+    def scroll_to_bottom_now(self):
+        bar = self.editor.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def maybe_auto_scroll_to_bottom(self):
+        if not self.auto_follow_enabled:
+            return
+        now = time.time()
+        if now - self._last_auto_follow_at < self.auto_follow_interval_ms / 1000.0:
+            return
+        self._last_auto_follow_at = now
+        QTimer.singleShot(0, self.scroll_to_bottom_now)
+
+    def set_auto_follow(self, enabled: bool):
+        self.auto_follow_enabled = bool(enabled)
+        if enabled:
+            self._last_auto_follow_at = 0.0
+            self.maybe_auto_scroll_to_bottom()
         self.adjust_content_height()
 
     def refresh_visual_settings(self):
@@ -12210,23 +12269,6 @@ class ChangeSummaryCard(QFrame):
             self.undo_btn.clicked.disconnect()
             self.undo_btn.clicked.connect(lambda: self.undo_requested.emit(self))
 
-
-class ElasticSpacer(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._elastic_height = 0
-        self.setStyleSheet("background: transparent; border: none;")
-        self.setFixedHeight(0)
-
-    def get_elastic_height(self) -> int:
-        return self._elastic_height
-
-    def set_elastic_height(self, value: int):
-        self._elastic_height = max(0, int(value))
-        self.setFixedHeight(self._elastic_height)
-        self.updateGeometry()
-
-    elasticHeight = Property(int, get_elastic_height, set_elastic_height)
 
 # ============================================================
 # 侧栏
@@ -13640,15 +13682,10 @@ class ChatPage(QWidget):
         self.history_expand_insert_index = 0
         self.history_expand_pending = False
         self.history_trim_notice: Optional[QPushButton] = None
-        self.chat_scrollbar_visible = False
+        self.chat_scrollbar_visible = True
         self.chat_scrollbar_fade_timer = QTimer(self)
         self.chat_scrollbar_fade_timer.setSingleShot(True)
         self.chat_scrollbar_fade_timer.timeout.connect(self.hide_chat_scrollbar)
-        self.chat_overscroll_limit = 56
-        self.chat_overscroll_release_timer = QTimer(self)
-        self.chat_overscroll_release_timer.setSingleShot(True)
-        self.chat_overscroll_release_timer.timeout.connect(self.release_chat_overscroll)
-        self.chat_overscroll_animation: Optional[QPropertyAnimation] = None
         self.pending_delete_thread_ids: set[str] = set()
         self.deleted_thread_save_generations: Dict[str, int] = {}
         self.delete_thread_workers: List[DeleteThreadWorker] = []
@@ -13684,6 +13721,7 @@ class ChatPage(QWidget):
         self.chat_scroll_user_controlled = False
         self.chat_scroll_programmatic = False
         self.chat_scroll_bottom_tolerance = 12
+        self.sidebar_resize_scroll_state: Optional[Dict[str, object]] = None
         self.automation_composer: Optional[QFrame] = None
         self.automation_composer_input_column: Optional[QWidget] = None
         self.automation_input: Optional[QTextEdit] = None
@@ -13913,7 +13951,7 @@ class ChatPage(QWidget):
         path_bar.addWidget(self.settings_btn)
         right_layout.addLayout(path_bar)
         
-        self.scroll_area = QScrollArea(widgetResizable=True, styleSheet=self.chat_scroll_area_style(False))
+        self.scroll_area = QScrollArea(widgetResizable=True, styleSheet=self.chat_scroll_area_style(True))
         self.chat_container = QWidget()
         self.chat_container.setStyleSheet("background: transparent; border: none;")
         self.chat_layout = QVBoxLayout(self.chat_container)
@@ -13921,9 +13959,6 @@ class ChatPage(QWidget):
         self.chat_root_layout.setAlignment(Qt.AlignTop)
         self.chat_root_layout.setSpacing(0)
         self.chat_layout.setContentsMargins(0, 0, 0, 0)
-        self.chat_top_overscroll = ElasticSpacer(self.chat_container)
-        self.chat_bottom_overscroll = ElasticSpacer(self.chat_container)
-        self.chat_root_layout.addWidget(self.chat_top_overscroll)
         self.chat_column = QWidget()
         self.chat_column.setStyleSheet("background: transparent; border: none;")
         self.chat_column.setMaximumWidth(self.chat_column_max_width)
@@ -13933,7 +13968,6 @@ class ChatPage(QWidget):
         self.chat_column_layout.setSpacing(10)
         self.chat_column_layout.setContentsMargins(14, 14, 14, 14)
         self.chat_root_layout.addWidget(self.chat_column, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        self.chat_root_layout.addWidget(self.chat_bottom_overscroll)
         self.chat_layout = self.chat_column_layout
         self.scroll_area.setWidget(self.chat_container)
         self.scroll_area.viewport().setStyleSheet("background: transparent; border: none;")
@@ -14111,91 +14145,9 @@ class ChatPage(QWidget):
                 if event.type() == QEvent.Type.Resize:
                     self.update_chat_column_width()
                     self.update_sidebar_resize_overlay_geometry()
-                elif event.type() == QEvent.Type.Wheel and self.handle_chat_overscroll_wheel(event):
-                    return True
         except RuntimeError:
             return False
         return super().eventFilter(watched, event)
-
-    def handle_chat_overscroll_wheel(self, event) -> bool:
-        if not hasattr(self, "scroll_area"):
-            return False
-        phase = event.phase() if getattr(event, "phase", None) is not None else Qt.ScrollPhase.NoScrollPhase
-        if phase == Qt.ScrollPhase.ScrollEnd:
-            if self.current_chat_overscroll_height() > 0:
-                self.release_chat_overscroll()
-                return True
-            return False
-        bar = self.scroll_area.verticalScrollBar()
-        pixel_delta = event.pixelDelta().y() if hasattr(event, "pixelDelta") else 0
-        angle_delta = event.angleDelta().y() if hasattr(event, "angleDelta") else 0
-        delta = pixel_delta or angle_delta
-        if delta == 0:
-            return False
-        top_active = getattr(self, "chat_top_overscroll", None) is not None and self.chat_top_overscroll.get_elastic_height() > 0
-        bottom_active = getattr(self, "chat_bottom_overscroll", None) is not None and self.chat_bottom_overscroll.get_elastic_height() > 0
-        at_top = bar.value() <= bar.minimum() or top_active
-        at_bottom = bar.value() >= bar.maximum() or bottom_active
-        phased_scroll = phase != Qt.ScrollPhase.NoScrollPhase or bool(pixel_delta)
-        release_delay_ms = None if phased_scroll else 200
-        if delta > 0 and at_top:
-            self.apply_chat_overscroll("top", delta, bool(pixel_delta), release_delay_ms)
-            return True
-        if delta < 0 and at_bottom:
-            self.apply_chat_overscroll("bottom", delta, bool(pixel_delta), release_delay_ms)
-            return True
-        if (top_active and delta < 0) or (bottom_active and delta > 0):
-            self.release_chat_overscroll()
-        return False
-
-    def current_chat_overscroll_height(self) -> int:
-        top = getattr(getattr(self, "chat_top_overscroll", None), "elasticHeight", 0) or 0
-        bottom = getattr(getattr(self, "chat_bottom_overscroll", None), "elasticHeight", 0) or 0
-        return max(int(top), int(bottom))
-
-    def apply_chat_overscroll(self, edge: str, delta: int, pixel_delta: bool, release_delay_ms: Optional[int]):
-        spacer = self.chat_top_overscroll if edge == "top" else self.chat_bottom_overscroll
-        opposite = self.chat_bottom_overscroll if edge == "top" else self.chat_top_overscroll
-        opposite.set_elastic_height(0)
-        if self.chat_overscroll_animation is not None:
-            self.chat_overscroll_animation.stop()
-            self.chat_overscroll_animation = None
-        step = abs(delta) * (0.32 if pixel_delta else 0.12)
-        step = max(5, min(18, int(step)))
-        target = min(self.chat_overscroll_limit, spacer.get_elastic_height() + step)
-        spacer.set_elastic_height(target)
-        if edge == "top":
-            self.scroll_area.verticalScrollBar().setValue(0)
-        else:
-            self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
-            QTimer.singleShot(0, self.force_scroll_to_bottom_once)
-        if release_delay_ms is not None:
-            self.chat_overscroll_release_timer.start(release_delay_ms)
-
-    def release_chat_overscroll(self):
-        spacers = [
-            spacer for spacer in (
-                getattr(self, "chat_top_overscroll", None),
-                getattr(self, "chat_bottom_overscroll", None),
-            )
-            if spacer is not None and spacer.get_elastic_height() > 0
-        ]
-        if not spacers:
-            return
-        if self.chat_overscroll_animation is not None:
-            self.chat_overscroll_animation.stop()
-        spacer = max(spacers, key=lambda item: item.get_elastic_height())
-        bottom_release = spacer is getattr(self, "chat_bottom_overscroll", None)
-        animation = QPropertyAnimation(spacer, b"elasticHeight", self)
-        animation.setDuration(210)
-        animation.setStartValue(spacer.get_elastic_height())
-        animation.setEndValue(0)
-        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        if bottom_release:
-            animation.valueChanged.connect(lambda _value: self.force_scroll_to_bottom_once())
-        animation.finished.connect(lambda: setattr(self, "chat_overscroll_animation", None))
-        self.chat_overscroll_animation = animation
-        animation.start()
 
     def update_chat_column_width(self):
         if not hasattr(self, "chat_column") or not hasattr(self, "scroll_area"):
@@ -14342,6 +14294,7 @@ class ChatPage(QWidget):
         self.sidebar_resize_overlay.setGeometry(viewport.rect())
 
     def begin_sidebar_resize_feedback(self):
+        self.sidebar_resize_scroll_state = self.capture_chat_scroll_state() if hasattr(self, "scroll_area") else None
         if hasattr(self, "chat_column"):
             self.chat_column.setVisible(False)
         self.update_sidebar_resize_overlay_geometry()
@@ -14356,6 +14309,30 @@ class ChatPage(QWidget):
             self.chat_column.setVisible(True)
             self.chat_column.adjustSize()
         QTimer.singleShot(0, self.update_chat_column_width)
+        for delay in (0, 40, 120):
+            QTimer.singleShot(delay, self.restore_sidebar_resize_scroll_state)
+
+    def restore_sidebar_resize_scroll_state(self):
+        state = self.sidebar_resize_scroll_state
+        if not state or not hasattr(self, "scroll_area"):
+            return
+        bar = self.scroll_area.verticalScrollBar()
+        old_value = int(state.get("value") or 0)
+        old_maximum = int(state.get("maximum") or 0)
+        old_bottom_gap = int(state.get("bottom_gap") or 0)
+        if bool(state.get("at_bottom")):
+            target = bar.maximum()
+        elif old_maximum > 0 and old_value >= old_maximum:
+            target = bar.maximum()
+        elif old_bottom_gap > 0 and old_maximum > old_value:
+            target = max(0, bar.maximum() - old_bottom_gap)
+        else:
+            target = min(old_value, bar.maximum())
+        self.chat_scroll_programmatic = True
+        try:
+            bar.setValue(max(bar.minimum(), min(target, bar.maximum())))
+        finally:
+            QTimer.singleShot(0, self.clear_programmatic_chat_scroll)
     
     def scroll_to_bottom(self):
         if not self.should_auto_follow_chat_scroll():
@@ -14388,16 +14365,13 @@ class ChatPage(QWidget):
     def show_chat_scrollbar_temporarily(self):
         if not hasattr(self, "scroll_area"):
             return
-        if not self.chat_scrollbar_visible:
-            self.chat_scrollbar_visible = True
-            self.scroll_area.setStyleSheet(self.chat_scroll_area_style(True))
-        self.chat_scrollbar_fade_timer.start(900)
+        if self.chat_scrollbar_fade_timer.isActive():
+            self.chat_scrollbar_fade_timer.stop()
 
     def hide_chat_scrollbar(self):
         if not hasattr(self, "scroll_area"):
             return
-        self.chat_scrollbar_visible = False
-        self.scroll_area.setStyleSheet(self.chat_scroll_area_style(False))
+        self.chat_scrollbar_fade_timer.stop()
 
     def clear_programmatic_chat_scroll(self):
         self.chat_scroll_programmatic = False
@@ -14961,7 +14935,7 @@ class ChatPage(QWidget):
             self.chat_scroll_user_controlled = True
 
     def on_chat_scroll_range_changed(self, _minimum: int, _maximum: int):
-        if self.history_render_cursor > 0 or time.time() <= self.history_force_bottom_until:
+        if time.time() <= self.history_force_bottom_until:
             self.force_scroll_to_bottom_once()
 
     def schedule_ensure_ai_response_entry(self):
@@ -17557,7 +17531,14 @@ class ChatPage(QWidget):
         self.add_chat_widget(bubble, animate=True)
         self.scroll_to_bottom()
 
-    def set_status_bar_override(self, text: str, duration_ms: int = 12000):
+    def set_status_bar_override(self, text: str, duration_ms: int = 12000, *, mirror_to_terminal: bool = True):
+        if not mirror_to_terminal:
+            if self._status_bar_override_text:
+                self._status_bar_override_text = ""
+                self._status_bar_override_until = 0.0
+                self.terminal_panel.set_header_status("")
+                self.update_status_bar()
+            return
         self._status_bar_override_text = str(text or "").strip()
         self._status_bar_override_until = time.time() + max(1, int(duration_ms)) / 1000.0 if self._status_bar_override_text else 0.0
         self.terminal_panel.set_header_status(self._status_bar_override_text)
@@ -17773,7 +17754,7 @@ class ChatPage(QWidget):
                     if message:
                         progress_lines.append(message)
                         result_bubble.update_content(render_web_research_progress())
-                        self.set_status_bar_override(message, duration_ms=12000)
+                        self.set_status_bar_override(message, duration_ms=12000, mirror_to_terminal=False)
 
             def on_finished(execution_text: str, error: str):
                 if self.web_research_worker is not worker:
@@ -17785,7 +17766,7 @@ class ChatPage(QWidget):
                     retry_round = long_retry_round + 1
                     wait_seconds = max(1, int(PROVIDER_LONG_RETRY_DELAY_MS / 1000))
                     retry_message = f"网页搜索短重试仍未恢复，{wait_seconds} 秒后进行第 {retry_round}/{PROVIDER_LONG_RETRY_ATTEMPTS} 轮后台重试…"
-                    self.set_status_bar_override(retry_message, duration_ms=min(PROVIDER_LONG_RETRY_DELAY_MS + 8000, 180000))
+                    self.set_status_bar_override(retry_message, duration_ms=min(PROVIDER_LONG_RETRY_DELAY_MS + 8000, 180000), mirror_to_terminal=False)
                     result_bubble.update_content(
                         render_web_research_progress([retry_message])
                     )
@@ -17816,7 +17797,7 @@ class ChatPage(QWidget):
                     "undone": False,
                 })
                 if self.automation_loop_active:
-                    self.set_status_bar_override("网页搜索已完成，正在衔接下一轮处理…", duration_ms=5000)
+                    self.set_status_bar_override("网页搜索已完成，正在衔接下一轮处理…", duration_ms=5000, mirror_to_terminal=False)
                     QTimer.singleShot(80, lambda cc=context_content: self.schedule_next_automation_step(cc))
                 elif self.automation_enabled:
                     self.show_automation_composer(focus=False)
@@ -18385,8 +18366,9 @@ class ChatPage(QWidget):
             flat=True,
             max_content_height=560,
         )
-        frame.async_markdown_render = False
+        frame.async_markdown_render = True
         frame.stabilize_markdown_height = True
+        frame.prevent_markdown_code_shrink = True
         role_label = frame.findChild(QLabel)
         if role_label is not None:
             role_label.setText("AI 正在回复")
@@ -18423,12 +18405,12 @@ class ChatPage(QWidget):
                 worker.preview_signal.disconnect(self.update_automation_preview)
             except (RuntimeError, TypeError):
                 pass
-            if worker.wait(1500):
-                worker.deleteLater()
-            else:
+            if worker.isRunning():
                 self.automation_preview_retired_workers.append(worker)
                 worker.finished.connect(lambda worker=worker: self.cleanup_retired_preview_worker(worker))
                 worker.finished.connect(worker.deleteLater)
+            else:
+                worker.deleteLater()
             self.automation_preview_worker = None
         self.automation_preview_render_timer.stop()
         self.automation_preview_dots_timer.stop()
@@ -18555,11 +18537,6 @@ class ChatPage(QWidget):
         text = self.automation_preview_pending_text
         if not text or text == self.automation_preview_last_rendered_text:
             return
-        if self.automation_preview_last_rendered_text:
-            previous_code_blocks = markdown_fenced_code_block_count(self.automation_preview_last_rendered_text)
-            next_code_blocks = markdown_fenced_code_block_count(text)
-            if previous_code_blocks > next_code_blocks:
-                return
         scroll_state = self.capture_chat_scroll_state()
         try:
             bubble.update_content(text)
@@ -18596,7 +18573,7 @@ class ChatPage(QWidget):
             if looks_like_automation_context_payload(text):
                 return
             if looks_like_web_session_busy_text(text):
-                self.set_status_bar_override("网页端当前消息仍在生成，正在自动重试…", duration_ms=12000)
+                self.set_status_bar_override("网页端当前消息仍在生成，正在自动重试…", duration_ms=12000, mirror_to_terminal=False)
                 return
             if text != self.automation_preview_pending_text:
                 self.automation_preview_pending_text = text
@@ -19090,7 +19067,7 @@ class ChatPage(QWidget):
 
             def on_status(message: str):
                 if request_serial == self.automation_request_serial and self.automation_worker is worker:
-                    self.set_status_bar_override(message, duration_ms=12000)
+                    self.set_status_bar_override(message, duration_ms=12000, mirror_to_terminal=False)
 
             def on_finished(text: str, error: str):
                 if request_serial != self.automation_request_serial or self.automation_worker is not worker:
@@ -19106,7 +19083,7 @@ class ChatPage(QWidget):
                         retry_round = long_retry_round + 1
                         wait_seconds = max(1, int(PROVIDER_LONG_RETRY_DELAY_MS / 1000))
                         retry_message = f"短重试仍未恢复，{wait_seconds} 秒后进行第 {retry_round}/{PROVIDER_LONG_RETRY_ATTEMPTS} 轮后台重试…"
-                        self.set_status_bar_override(retry_message, duration_ms=min(PROVIDER_LONG_RETRY_DELAY_MS + 8000, 180000))
+                        self.set_status_bar_override(retry_message, duration_ms=min(PROVIDER_LONG_RETRY_DELAY_MS + 8000, 180000), mirror_to_terminal=False)
                         self.stop_automation_preview(remove_bubble=False)
                         if self.automation_loop_active:
                             QTimer.singleShot(PROVIDER_LONG_RETRY_DELAY_MS, lambda m=copy.deepcopy(messages), rr=retry_round: start_chat_worker(m, rr))
@@ -19470,7 +19447,6 @@ class ChatPage(QWidget):
                     self.show_automation_composer(focus=False)
                 else:
                     self.ensure_initial_prompt_bubble()
-                self.force_scroll_to_bottom()
                 return
             self.hide_empty_state()
             render_entries = self.history_entries[-CHAT_HISTORY_INITIAL_RENDER_ENTRIES:]
@@ -19509,7 +19485,6 @@ class ChatPage(QWidget):
             self.setUpdatesEnabled(True)
         self.history_render_cursor = start_index
         self.history_render_index = len(self.history_render_entries) - self.history_render_cursor
-        self.force_scroll_to_bottom()
         if self.history_render_cursor <= 0:
             self.finish_history_render()
             return
@@ -19524,7 +19499,6 @@ class ChatPage(QWidget):
             self.show_automation_composer(focus=False)
         elif any(entry.get("type") != "prompt" for entry in self.history_entries):
             self.ensure_ai_response_entry(focus=False, animate=False, keep_visible=False)
-        self.force_scroll_to_bottom()
         elapsed_ms = int((time.perf_counter() - self.history_render_started_at) * 1000) if self.history_render_started_at else 0
         if elapsed_ms >= 250:
             logger.warning(
@@ -19956,6 +19930,7 @@ class ChatPage(QWidget):
         role_label = bubble.findChild(QLabel)
         if role_label is not None:
             role_label.setText("AI")
+        bubble.ensure_copy_button("复制 AI 输出")
         bubble.update_content(text)
         self.stabilize_chat_scroll_after_update(scroll_state)
         self.automation_preview_bubble = None
@@ -20085,7 +20060,7 @@ class ChatPage(QWidget):
                 terminal_extension_result_log = terminal_extension_execution_log(terminal_extension_triggers, display_text)
                 done_response = True
             elif web_research_queries and not has_real_command:
-                self.set_status_bar_override("网页搜索进行中，正在等待结果…", duration_ms=15000)
+                self.set_status_bar_override("网页搜索进行中，正在等待结果…", duration_ms=15000, mirror_to_terminal=False)
                 web_research_directives = list(terminal_extension_triggers)
             elif file_targets and not has_real_command:
                 display_text = wechat_trigger_summary(terminal_extension_triggers)
@@ -20251,6 +20226,7 @@ class ChatPage(QWidget):
             max_content_height=210,
             title="执行结果",
         )
+        self.result_bubble.set_auto_follow(True)
         self.add_chat_widget(self.result_bubble, animate=True)
         
         self.cmd_outputs = []
@@ -20414,6 +20390,7 @@ class ChatPage(QWidget):
                 full_log = (full_log + "\n\n" + terminal_extension_log).strip()
         context_content = build_execution_context_content(full_log, change_records, long_running_launches, terminal_launches)
         self.result_bubble.update_content(log_with_changes)
+        self.result_bubble.set_auto_follow(False)
         if change_records:
             change_card = ChangeSummaryCard(change_records, parent=self.chat_container)
             change_card.undo_requested.connect(self.undo_changes)
