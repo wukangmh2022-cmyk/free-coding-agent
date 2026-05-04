@@ -171,12 +171,18 @@ jobs:
             --windowed \
             --name AgentQT \
             --add-data "plugins:plugins" \
+            --add-data "assets:assets" \
+            --icon "assets/icon-windowed.icns" \
             agent_qt.py
 
       - name: Prepare DMG
         run: |
           mkdir -p release
           cp -R dist/AgentQT.app release/AgentQT.app
+          cp assets/icon-windowed.icns release/.VolumeIcon.icns
+          if command -v SetFile >/dev/null 2>&1; then
+            SetFile -a C release
+          fi
           cp README.md release/README.md
           cp LICENSE release/LICENSE
           cat > release/MACOS-README.txt <<'EOF'
