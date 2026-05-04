@@ -1,16 +1,16 @@
 # AgentQT / Agent Qt
 
-**AgentQT** (also written as **Agent Qt**) is a free local desktop coding agent with a Codex-like UI for web AI providers. The repository name is **free-coding-agent**.
+**AgentQT** (also written as **Agent Qt**) is a totally free local desktop coding agent with a Codex-like UI. It is built around web AI providers, so you can use model websites directly at near-native page speed without paying for API tokens, while still keeping ordinary API-based providers as an option. The repository name is **free-coding-agent**.
 
-Keywords: AgentQT, Agent Qt, free-coding-agent, coding agent, AI coding agent, Codex UI, desktop agent, PySide6, Python, web AI provider, local automation.
+Keywords: AgentQT, Agent Qt, free-coding-agent, free coding agent, Codex-like UI, desktop AI coding agent, web AI provider, API provider, local automation, PySide6, Python.
 
 ![Agent Qt 开屏图](docs/images/agent-qt-hero.png)
 
-一个本地桌面智能体：把大模型的 Markdown 输出变成本地可执行的工程动作，支持自动写文件、执行命令、展示 diff、管理后台终端、沉淀技能，并通过微信和定时计划把工作流延伸到桌面之外。
+AgentQT 是一个带 Codex-like UI 的免费本地桌面 AI 工作空间：以 Web Provider 为核心，免 API Token、接近原生网页速度，同时兼容 API Provider 和手动模式。
 
-最早的形态是“复制提示词、粘贴 AI 回复、本地安全执行”。现在它更接近一个国内模型可用的 Codex 桌面壳：能用网页 Provider 自动循环执行，也能保留手动复制粘贴模式；能在工作区里维护技能、会话、终端、文件变更和定时计划；还能通过微信发送自然语言让电脑继续干活。
+它不只面向写代码，也适合日常办公和调研：可以帮你写材料、整理文档、搜索调研信息、下载和归档散落资料，也可以自动写文件、执行命令、查看结果、展示 diff、管理后台终端。你可以像使用 Codex 一样描述需求、观察变更、回滚文件；也可以把常用流程沉淀成 Skill、设置 schedule 定时执行，或通过类似 OpenClaw 的微信远控能力让电脑在你离开桌面时继续工作。
 
-> 当前版本仍以个人工作站为中心：它会真实写入文件、启动进程、调用网页模型和本地服务。请只在你理解风险的工作区里使用。
+> 免责声明：AgentQT 是一个本地自动化工具，可能会根据模型输出写入文件、启动进程或访问第三方网页服务。请自行确认模型输出和工作区内容的安全性；因使用本项目产生的文件变更、服务调用或第三方账号风险由使用者自行承担。重要项目建议配合 Git 或其他备份机制。
 
 ## 截图
 
