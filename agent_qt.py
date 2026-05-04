@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-Agent 控制台 v5.1
-- 支持所有常见代码块占位符（CSS/JS/SVG/JSON/YAML...）
-- 优化提示词：解释协议 + 避免重复 Bash
-- 首页 + 对话双界面
+AgentQT
+
 """
 
 import sys
@@ -42,8 +40,8 @@ from PySide6.QtWidgets import (
     QGridLayout, QSizePolicy, QGraphicsOpacityEffect, QAbstractItemView,
     QSpacerItem, QWidgetAction, QAbstractButton, QDialog, QCheckBox, QComboBox
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, Property, QObject
-from PySide6.QtGui import QFont, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QKeySequence, QTextDocument, QImage
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, QPointF, Property, QObject
+from PySide6.QtGui import QFont, QFontMetricsF, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPainterPath, QPen, QColor, QKeySequence, QTextDocument, QImage, QLinearGradient, QRadialGradient, QBrush
 from PySide6.QtCore import QUrl
 
 try:
@@ -78,6 +76,10 @@ def ai_border_color() -> str:
 
 def soft_accent_border_color() -> str:
     return "#d8d0ff" if app_theme_setting() == "light" else COLORS["border"]
+
+
+def sidebar_divider_color() -> str:
+    return "#d5dbe7" if app_theme_setting() == "light" else "#3a3a3a"
 
 
 def subprocess_no_window_kwargs(extra_creationflags: int = 0) -> Dict[str, object]:
@@ -1200,7 +1202,7 @@ LIGHT_COLORS = {
     "bg_top": "#fbfcff",
     "surface": "#ffffff",
     "surface_alt": "#f0f3fb",
-    "sidebar_bg": "#f3f5fb",
+    "sidebar_bg": "#eef2f9",
     "card_user": "#eef4ff",
     "card_ai": "#f4f0ff",
     "card_system": "#f6f9fc",
@@ -1232,7 +1234,7 @@ DARK_COLORS = {
     "bg_top": "#151a25",
     "surface": "#171d29",
     "surface_alt": "#202838",
-    "sidebar_bg": "#121824",
+    "sidebar_bg": "#171717",
     "card_user": "#16263a",
     "card_ai": "#221d34",
     "card_system": "#182231",
@@ -1265,6 +1267,89 @@ COLORS = dict(DARK_COLORS if app_theme_setting() == "dark" else LIGHT_COLORS)
 def apply_theme_palette(theme: str):
     COLORS.clear()
     COLORS.update(DARK_COLORS if str(theme).strip().lower() == "dark" else LIGHT_COLORS)
+
+
+def color_tuple_from_hex(value: str) -> tuple[float, float, float, float]:
+    text = str(value or "").strip().lstrip("#")
+    if len(text) != 6:
+        return (1.0, 1.0, 1.0, 1.0)
+    try:
+        red = int(text[0:2], 16) / 255.0
+        green = int(text[2:4], 16) / 255.0
+        blue = int(text[4:6], 16) / 255.0
+    except ValueError:
+        return (1.0, 1.0, 1.0, 1.0)
+    return (red, green, blue, 1.0)
+
+
+def apply_macos_titlebar_theme(widget: QWidget):
+    if platform.system() != "Darwin" or widget is None:
+        return
+    try:
+        import ctypes
+        import ctypes.util
+
+        objc_path = ctypes.util.find_library("objc")
+        if not objc_path:
+            return
+        objc = ctypes.cdll.LoadLibrary(objc_path)
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        def selector(name: str):
+            return objc.sel_registerName(name.encode("utf-8"))
+
+        def msg_id(receiver: int, name: str) -> int:
+            objc.objc_msgSend.restype = ctypes.c_void_p
+            objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            return int(objc.objc_msgSend(ctypes.c_void_p(receiver), selector(name)) or 0)
+
+        def msg_void_bool(receiver: int, name: str, value: bool):
+            objc.objc_msgSend.restype = None
+            objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+            objc.objc_msgSend(ctypes.c_void_p(receiver), selector(name), bool(value))
+
+        def msg_void_id(receiver: int, name: str, value: int):
+            objc.objc_msgSend.restype = None
+            objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            objc.objc_msgSend(ctypes.c_void_p(receiver), selector(name), ctypes.c_void_p(value))
+
+        def msg_color(receiver: int, red: float, green: float, blue: float, alpha: float) -> int:
+            objc.objc_msgSend.restype = ctypes.c_void_p
+            objc.objc_msgSend.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+            ]
+            return int(
+                objc.objc_msgSend(
+                    ctypes.c_void_p(receiver),
+                    selector("colorWithCalibratedRed:green:blue:alpha:"),
+                    float(red),
+                    float(green),
+                    float(blue),
+                    float(alpha),
+                )
+                or 0
+            )
+
+        ns_view = int(widget.winId())
+        ns_window = msg_id(ns_view, "window")
+        if not ns_window:
+            return
+        red, green, blue, alpha = color_tuple_from_hex(COLORS["bg"])
+        ns_color_class = int(objc.objc_getClass(b"NSColor") or 0)
+        ns_color = msg_color(ns_color_class, red, green, blue, alpha) if ns_color_class else 0
+        if ns_color:
+            msg_void_id(ns_window, "setBackgroundColor:", ns_color)
+        msg_void_bool(ns_window, "setTitlebarAppearsTransparent:", True)
+    except Exception:
+        return
 
 
 def message_box_style() -> str:
@@ -1530,6 +1615,10 @@ def estimate_wrapped_text_height(text: str, metrics, available_width: int, max_v
     return visual_lines * max(1, metrics.lineSpacing()) + 36
 
 PIPE_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
+HTML_FONT_SIZE_STYLE_RE = re.compile(r"(?i)(^|;)\s*font-size\s*:\s*[^;\"']*;?")
+HTML_FONT_TAG_SIZE_RE = re.compile(r"(?i)(<font\b[^>]*?)\s+size\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)")
+HTML_HEADING_OPEN_RE = re.compile(r"(?i)<h[1-6]\b([^>]*)>")
+HTML_HEADING_CLOSE_RE = re.compile(r"(?i)</h[1-6]>")
 
 def is_pipe_table_row(line: str) -> bool:
     stripped = (line or "").strip()
@@ -1551,12 +1640,19 @@ def looks_like_pipe_table(lines: List[str], start: int) -> bool:
         return False
     return is_pipe_table_row(lines[start]) and is_pipe_table_separator(lines[start + 1])
 
+def normalize_plain_markdown_html(html_text: str) -> str:
+    html_text = HTML_HEADING_OPEN_RE.sub(r"<p\1><strong>", str(html_text or ""))
+    html_text = HTML_HEADING_CLOSE_RE.sub("</strong></p>", html_text)
+    html_text = HTML_FONT_SIZE_STYLE_RE.sub(r"\1", html_text)
+    html_text = HTML_FONT_TAG_SIZE_RE.sub(r"\1", html_text)
+    return html_text
+
 def render_markdown_inline_html(text: str) -> str:
     doc = QTextDocument()
-    doc.setMarkdown(text or "")
+    doc.setMarkdown(str(text or "").lstrip("\r\n"))
     body = doc.toHtml()
     match = re.search(r"<body[^>]*>(.*?)</body>", body, re.S | re.I)
-    return match.group(1).strip() if match else body
+    return normalize_plain_markdown_html(match.group(1).strip() if match else body)
 
 def markdown_table_to_html(table_lines: List[str]) -> str:
     if len(table_lines) < 2:
@@ -1581,7 +1677,7 @@ def markdown_table_to_html(table_lines: List[str]) -> str:
 
     table_style = (
         "border-collapse:collapse; margin:8px 0 10px 0; width:100%; "
-        f"color:{COLORS['text']};"
+        f"color:{COLORS['text']}; font-size:{scaled_font_px(14)}px;"
     )
     header_style = (
         f"border:1px solid {COLORS['border_strong']}; padding:6px 8px; "
@@ -1612,6 +1708,7 @@ def markdown_table_to_html(table_lines: List[str]) -> str:
     return "".join(parts)
 
 def markdown_with_pipe_tables_to_html(markdown_text: str) -> str:
+    markdown_text = str(markdown_text or "").lstrip("\r\n")
     lines = (markdown_text or "").splitlines()
     if not any(looks_like_pipe_table(lines, index) for index in range(max(0, len(lines) - 1))):
         return render_markdown_inline_html(markdown_text)
@@ -1778,7 +1875,7 @@ class SettingsToggleRow(QWidget):
         self.setStyleSheet(f"""
             QWidget {{
                 background: {COLORS['surface']};
-                border-radius: 12px;
+                border-radius: 10px;
             }}
             QWidget:hover {{
                 background: {COLORS['surface_alt']};
@@ -2024,6 +2121,11 @@ def line_icon(kind: str, color: str = "#172033", size: int = 18) -> QIcon:
     elif kind == "plus":
         painter.drawLine(int(size / 2), 4, int(size / 2), size - 4)
         painter.drawLine(4, int(size / 2), size - 4, int(size / 2))
+    elif kind == "copy":
+        painter.drawRoundedRect(5, 8, size - 11, size - 11, 3, 3)
+        painter.drawLine(8, 5, size - 8, 5)
+        painter.drawLine(size - 8, 5, size - 8, size - 9)
+        painter.drawLine(8, 5, 8, 8)
     elif kind == "send":
         cx = size / 2
         painter.drawLine(int(cx), size - 4, int(cx), 4)
@@ -4082,6 +4184,7 @@ AUTOMATION_CONTEXT_COMPACT_SUMMARY_TOKENS = env_int("AGENT_QT_AUTOMATION_COMPACT
 AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY_CHARS", 16000, minimum=1200)
 AUTOMATION_CONTEXT_PROVIDER_PAYLOAD_BYTES = env_int("AGENT_QT_AUTOMATION_PROVIDER_PAYLOAD_BYTES", 175000, minimum=50000)
 CHAT_HISTORY_INITIAL_RENDER_ENTRIES = env_int("AGENT_QT_HISTORY_INITIAL_RENDER_ENTRIES", 40, minimum=10)
+CHAT_HISTORY_RENDER_BATCH_SIZE = env_int("AGENT_QT_HISTORY_RENDER_BATCH_SIZE", 7, minimum=1)
 
 
 def iter_non_fenced_lines(text: str):
@@ -6475,20 +6578,26 @@ class SidebarResizeHandle(QFrame):
     def __init__(self, sidebar: "Sidebar", parent=None):
         super().__init__(parent)
         self.sidebar = sidebar
+        self.setObjectName("sidebarResizeHandle")
         self._dragging = False
         self._start_x = 0
         self._start_width = 0
-        self.setFixedWidth(24)
+        self.setFixedWidth(14)
         self.setCursor(Qt.CursorShape.SizeHorCursor)
         self.setStyleSheet(f"""
-            QFrame {{
-                background: {COLORS['bg']};
+            QFrame#sidebarResizeHandle {{
+                background: transparent;
                 border: none;
             }}
-            QFrame:hover {{
-                background: {COLORS['surface_alt']};
+            QFrame#sidebarResizeHandle:hover {{
+                background: transparent;
+                border: none;
             }}
         """)
+        self.divider = QFrame(self)
+        self.divider.setObjectName("sidebarDividerLine")
+        self.divider.setFixedWidth(1)
+        self.divider.setStyleSheet(f"background: {sidebar_divider_color()}; border: none;")
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
@@ -6509,14 +6618,17 @@ class SidebarResizeHandle(QFrame):
 
     def apply_theme_style(self):
         self.setStyleSheet(f"""
-            QFrame {{
-                background: {COLORS['bg']};
+            QFrame#sidebarResizeHandle {{
+                background: transparent;
                 border: none;
             }}
-            QFrame:hover {{
-                background: {COLORS['surface_alt']};
+            QFrame#sidebarResizeHandle:hover {{
+                background: transparent;
+                border: none;
             }}
         """)
+        if hasattr(self, "divider"):
+            self.divider.setStyleSheet(f"background: {sidebar_divider_color()}; border: none;")
         if hasattr(self, "grip"):
             self.grip.setStyleSheet(f"""
                 QFrame {{
@@ -6533,6 +6645,50 @@ class SidebarResizeHandle(QFrame):
     def set_grip_visible(self, visible: bool):
         self.grip.setFixedHeight(72 if visible else 0)
         self.grip.setVisible(visible)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "divider"):
+            inset = 18
+            height = max(0, self.height() - inset * 2)
+            self.divider.setGeometry(self.width() - 1, inset, 1, height)
+            self.divider.raise_()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        fill = QColor(COLORS["sidebar_bg"])
+        rect = QRectF(0, 0, self.width(), self.height())
+        radius = min(14.0, rect.width(), rect.height() / 2)
+        path = QPainterPath()
+        path.moveTo(rect.left(), rect.top())
+        path.lineTo(rect.right() - radius, rect.top())
+        path.quadTo(rect.right(), rect.top(), rect.right(), rect.top() + radius)
+        path.lineTo(rect.right(), rect.bottom() - radius)
+        path.quadTo(rect.right(), rect.bottom(), rect.right() - radius, rect.bottom())
+        path.lineTo(rect.left(), rect.bottom())
+        path.closeSubpath()
+        painter.fillPath(path, fill)
+        outline = QPainterPath()
+        right = self.width() - 0.5
+        bottom = self.height() - 0.5
+        outline.moveTo(0.0, 0.5)
+        outline.lineTo(right - radius, 0.5)
+        outline.quadTo(right, 0.5, right, 0.5 + radius)
+        outline.lineTo(right, bottom - radius)
+        outline.quadTo(right, bottom, right - radius, bottom)
+        painter.setPen(QPen(QColor(sidebar_divider_color()), 1))
+        painter.drawPath(outline)
+        painter.end()
+        super().paintEvent(event)
+
+    def enterEvent(self, event):
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.update()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton and not self.sidebar._collapsed:
@@ -6747,7 +6903,7 @@ class ManagedProcess(QWidget):
                 background: {COLORS['terminal_card']};
                 color: {COLORS['terminal_text']};
                 border: 1px solid {COLORS['border']};
-                border-radius: 12px;
+                border-radius: 10px;
                 font-family: 'SF Mono', 'Menlo', monospace;
                 font-size: 11px;
                 padding: 8px;
@@ -6769,26 +6925,33 @@ class ManagedProcess(QWidget):
         """)
         layout.addWidget(self.output)
 
-        self.copy_btn = QPushButton("复制日志", self.output)
+        self.copy_btn = QPushButton("", self.output)
         self.copy_btn.setCursor(Qt.PointingHandCursor)
-        self.copy_btn.setFixedHeight(24)
+        self.copy_btn.setFixedSize(32, 32)
+        self.copy_btn.setToolTip("复制日志")
+        copy_icon_path = find_bundled_asset("copy-transparent.png")
+        if copy_icon_path:
+            self.copy_btn.setIcon(QIcon(copy_icon_path))
+            self.copy_btn.setIconSize(QSize(18, 18))
+        else:
+            self.copy_btn.setIcon(line_icon("copy", "#9ca3af", 20))
+            self.copy_btn.setIconSize(QSize(18, 18))
         self.copy_btn.clicked.connect(self.copy_output)
         self.copy_btn.setStyleSheet(f"""
             QPushButton {{
-                background: {COLORS['surface']};
-                color: {COLORS['accent_dark']};
-                border: 1px solid {soft_accent_border_color()};
+                background: transparent;
+                border: 1px solid transparent;
                 border-radius: 8px;
-                padding: 3px 10px;
-                font-size: 11px;
-                font-weight: 800;
+                padding: 5px;
             }}
             QPushButton:hover {{
-                background: {COLORS['accent_light']};
-                border-color: {COLORS['accent']};
+                background: {COLORS['surface_alt']};
+                border-color: {COLORS['border']};
+            }}
+            QPushButton:pressed {{
+                background: {COLORS['border']};
             }}
         """)
-        self.copy_btn.adjustSize()
         self.position_copy_button()
 
     def refresh_visual_settings(self):
@@ -6818,19 +6981,28 @@ class ManagedProcess(QWidget):
                 height: 0;
             }}
         """)
+        copy_icon_path = find_bundled_asset("copy-transparent.png")
+        if copy_icon_path:
+            self.copy_btn.setIcon(QIcon(copy_icon_path))
+            self.copy_btn.setIconSize(QSize(18, 18))
+        else:
+            self.copy_btn.setIcon(line_icon("copy", "#9ca3af", 20))
+            self.copy_btn.setIconSize(QSize(18, 18))
+        self.copy_btn.setFixedSize(32, 32)
+        self.copy_btn.setToolTip("复制日志")
         self.copy_btn.setStyleSheet(f"""
             QPushButton {{
-                background: {COLORS['surface']};
-                color: {COLORS['accent_dark']};
-                border: 1px solid {soft_accent_border_color()};
+                background: transparent;
+                border: 1px solid transparent;
                 border-radius: 8px;
-                padding: 3px 10px;
-                font-size: 11px;
-                font-weight: 800;
+                padding: 5px;
             }}
             QPushButton:hover {{
-                background: {COLORS['accent_light']};
-                border-color: {COLORS['accent']};
+                background: {COLORS['surface_alt']};
+                border-color: {COLORS['border']};
+            }}
+            QPushButton:pressed {{
+                background: {COLORS['border']};
             }}
         """)
         self.position_copy_button()
@@ -9093,7 +9265,7 @@ class AutomationPreviewWorker(QThread):
 
 
 class HistorySaveWorker(QThread):
-    finished_signal = Signal(int, bool, str)
+    finished_signal = Signal(int, str, bool, str)
 
     def __init__(self, root: str, thread_id: str, entries: List[Dict[str, object]], generation: int):
         super().__init__()
@@ -9118,7 +9290,49 @@ class HistorySaveWorker(QThread):
             ok = True
         except OSError:
             ok = False
-        self.finished_signal.emit(self.generation, ok, tmp_path)
+        self.finished_signal.emit(self.generation, self.thread_id, ok, tmp_path)
+
+
+class HistoryLoadWorker(QThread):
+    finished_signal = Signal(int, str, list, str)
+
+    def __init__(self, root: str, thread_id: str, serial: int):
+        super().__init__()
+        self.root = root
+        self.thread_id = thread_id
+        self.serial = serial
+
+    def run(self):
+        error = ""
+        entries: List[Dict[str, object]] = []
+        try:
+            entries = load_workspace_history(self.root, self.thread_id)
+        except Exception as exc:
+            error = str(exc)
+            entries = []
+        self.finished_signal.emit(self.serial, self.thread_id, entries, error)
+
+
+class DeleteThreadWorker(QThread):
+    finished_signal = Signal(str, bool, str)
+
+    def __init__(self, root: str, thread_id: str, threads: List[Dict[str, object]]):
+        super().__init__()
+        self.root = root
+        self.thread_id = safe_thread_id(thread_id)
+        self.threads = normalize_threads(threads)
+
+    def run(self):
+        ok = False
+        error = ""
+        try:
+            ok = delete_workspace_thread(self.root, self.thread_id, self.threads)
+            if not ok:
+                error = "delete_workspace_thread returned false"
+        except Exception as exc:
+            ok = False
+            error = str(exc)
+        self.finished_signal.emit(self.thread_id, ok, error)
 
 
 def wechat_strip_markdown_code(text: str, keep_summary: bool = False) -> str:
@@ -10518,6 +10732,71 @@ class ChatBubble(QFrame):
         self._last_content_width = 0
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setup_ui()
+
+    def prompt_input_style(self) -> str:
+        return f"""
+            QLineEdit {{
+                background: {COLORS['surface']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+                padding: 7px 10px;
+                font-size: 12px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {COLORS['accent']};
+            }}
+        """
+
+    def copy_text_button_style(self) -> str:
+        return f"""
+            QPushButton {{
+                background: {COLORS['surface']};
+                color: {COLORS['accent_dark']};
+                border: 1px solid {soft_accent_border_color()};
+                border-radius: 9px;
+                padding: 5px 12px;
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{
+                background: {COLORS['accent_light']};
+                border-color: {COLORS['accent']};
+            }}
+        """
+
+    def copy_icon_button_style(self) -> str:
+        return f"""
+            QPushButton {{
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 8px;
+                padding: 5px;
+            }}
+            QPushButton:hover {{
+                background: {COLORS['surface_alt']};
+                border-color: {COLORS['border']};
+            }}
+            QPushButton:pressed {{
+                background: {COLORS['border']};
+            }}
+        """
+
+    def apply_copy_button_visuals(self):
+        copy_btn = getattr(self, "copy_btn", None)
+        if not isinstance(copy_btn, QPushButton):
+            return
+        copy_btn.setText("")
+        icon_path = find_bundled_asset("copy-transparent.png")
+        if icon_path:
+            copy_btn.setIcon(QIcon(icon_path))
+            copy_btn.setIconSize(QSize(18, 18))
+        else:
+            copy_btn.setIcon(line_icon("copy", "#9ca3af", 20))
+            copy_btn.setIconSize(QSize(18, 18))
+        copy_btn.setFixedSize(32, 32)
+        copy_btn.setToolTip(self.copy_text)
+        copy_btn.setStyleSheet(self.copy_icon_button_style())
     
     def setup_ui(self):
         self.setObjectName("chatBubblePlainSystemLog" if self.plain_system_log else "chatBubble")
@@ -10608,24 +10887,9 @@ class ChatBubble(QFrame):
             header.addWidget(role_label)
             header.addStretch()
             if self.show_copy:
-                self.copy_btn = QPushButton(self.copy_text)
+                self.copy_btn = QPushButton("")
                 self.copy_btn.setCursor(Qt.PointingHandCursor)
-                self.copy_btn.setFixedHeight(28)
-                self.copy_btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: {COLORS['surface']};
-                        color: {COLORS['accent_dark']};
-                        border: 1px solid {soft_accent_border_color()};
-                        border-radius: 9px;
-                        padding: 5px 12px;
-                        font-size: 12px;
-                        font-weight: 700;
-                    }}
-                    QPushButton:hover {{
-                        background: {COLORS['accent_light']};
-                        border-color: {COLORS['accent']};
-                    }}
-                """)
+                self.apply_copy_button_visuals()
                 self.copy_btn.clicked.connect(self.copy_content)
                 header.addWidget(self.copy_btn)
             if self.show_paste_ai:
@@ -10658,19 +10922,7 @@ class ChatBubble(QFrame):
             self.prompt_input.setPlaceholderText("一句需求，例如：创建一个地狱卡牌游戏")
             self.prompt_input.setText(self.prompt_input_text)
             self.prompt_input.setFixedHeight(32)
-            self.prompt_input.setStyleSheet(f"""
-                QLineEdit {{
-                    background: {COLORS['surface']};
-                    color: {COLORS['text']};
-                    border: 1px solid {COLORS['border']};
-                    border-radius: 10px;
-                    padding: 7px 10px;
-                    font-size: 12px;
-                }}
-                QLineEdit:focus {{
-                    border: 1px solid {COLORS['accent']};
-                }}
-            """)
+            self.prompt_input.setStyleSheet(self.prompt_input_style())
             prompt_row.addWidget(self.prompt_input)
             layout.addLayout(prompt_row)
         
@@ -10698,6 +10950,7 @@ class ChatBubble(QFrame):
         content_border = COLORS["border"] if flat_system_log else ("transparent" if self.flat else COLORS["border"])
         content_radius = 12 if flat_system_log else (0 if self.flat else 12)
         content_padding = "10px 12px" if flat_system_log else ("2px 0" if self.flat else "10px 12px")
+        content_font_px = scaled_font_px(14 if self.role == "ai" and not flat_system_log else 12)
         self.content_label.setStyleSheet(f"""
             {editor_type} {{
                 background: {content_bg};
@@ -10706,7 +10959,7 @@ class ChatBubble(QFrame):
                 border-radius: {content_radius}px;
                 padding: {content_padding};
                 {font_family}
-                font-size: {scaled_font_px(12)}px;
+                font-size: {content_font_px}px;
                 selection-background-color: #d8e6ff;
                 selection-color: {COLORS['text']};
             }}
@@ -10786,7 +11039,8 @@ class ChatBubble(QFrame):
                 border: none;
                 border-radius: 0;
                 padding: 0;
-                font-size: {scaled_font_px(12)}px;
+                font-size: {scaled_font_px(14)}px;
+                line-height: 1.35;
             }}
         """
 
@@ -10874,6 +11128,7 @@ class ChatBubble(QFrame):
         viewer = QLabel()
         viewer.setTextFormat(Qt.TextFormat.RichText)
         viewer.setWordWrap(True)
+        viewer.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         viewer.setOpenExternalLinks(False)
         viewer.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
@@ -11221,21 +11476,7 @@ class ChatBubble(QFrame):
             label.setStyleSheet(f"color: {COLORS['text']}; font-weight: 700; font-size: 13px; background: transparent;")
         copy_btn = getattr(self, "copy_btn", None)
         if isinstance(copy_btn, QPushButton):
-            copy_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {COLORS['surface']};
-                    color: {COLORS['accent_dark']};
-                    border: 1px solid {soft_accent_border_color()};
-                    border-radius: 9px;
-                    padding: 5px 12px;
-                    font-size: 12px;
-                    font-weight: 700;
-                }}
-                QPushButton:hover {{
-                    background: {COLORS['accent_light']};
-                    border-color: {COLORS['accent']};
-                }}
-            """)
+            self.apply_copy_button_visuals()
         paste_ai_btn = getattr(self, "paste_ai_btn", None)
         if isinstance(paste_ai_btn, QPushButton):
             paste_ai_btn.setStyleSheet(f"""
@@ -11253,6 +11494,9 @@ class ChatBubble(QFrame):
                     border-color: {COLORS['accent']};
                 }}
             """)
+        prompt_input = getattr(self, "prompt_input", None)
+        if isinstance(prompt_input, QLineEdit):
+            prompt_input.setStyleSheet(self.prompt_input_style())
         if self.markdown and self.expand_to_content:
             parts = split_markdown_fenced_blocks(self.visible_content())
             signatures = [
@@ -11293,6 +11537,7 @@ class ChatBubble(QFrame):
                 content_border = COLORS["border"] if flat_system_log else ("transparent" if self.flat else COLORS["border"])
                 content_radius = 12 if flat_system_log else (0 if self.flat else 12)
                 content_padding = "10px 12px" if flat_system_log else ("2px 0" if self.flat else "10px 12px")
+                content_font_px = scaled_font_px(14 if self.role == "ai" and not flat_system_log else 12)
                 self.content_label.setStyleSheet(f"""
                     {editor_type} {{
                         background: {content_bg};
@@ -11301,7 +11546,7 @@ class ChatBubble(QFrame):
                         border-radius: {content_radius}px;
                         padding: {content_padding};
                         {font_family}
-                        font-size: {scaled_font_px(12)}px;
+                        font-size: {content_font_px}px;
                         selection-background-color: #d8e6ff;
                         selection-color: {COLORS['text']};
                     }}
@@ -11332,8 +11577,9 @@ class ChatBubble(QFrame):
         copy_btn = getattr(self, "copy_btn", None)
         if copy_btn is None:
             return
-        copy_btn.setText("已复制")
-        QTimer.singleShot(1000, lambda: copy_btn.setText(self.copy_text))
+        copy_btn.setText("")
+        copy_btn.setToolTip("已复制")
+        QTimer.singleShot(1000, lambda: copy_btn.setToolTip(self.copy_text))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -11364,7 +11610,7 @@ class ChatBubble(QFrame):
                     source_text = str(getattr(widget, "markdown_source", "") or "")
                     line_spacing = max(1, widget.fontMetrics().lineSpacing())
                     source_height = estimate_wrapped_text_height(source_text, widget.fontMetrics(), text_width)
-                    target_height = max(target_height, source_height + line_spacing * 3)
+                    target_height = max(target_height, source_height + line_spacing)
                     if self.stabilize_markdown_height:
                         key = id(widget)
                         target_height = max(int(self._stable_markdown_heights.get(key, 0)), target_height)
@@ -11964,6 +12210,24 @@ class ChangeSummaryCard(QFrame):
             self.undo_btn.clicked.disconnect()
             self.undo_btn.clicked.connect(lambda: self.undo_requested.emit(self))
 
+
+class ElasticSpacer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._elastic_height = 0
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setFixedHeight(0)
+
+    def get_elastic_height(self) -> int:
+        return self._elastic_height
+
+    def set_elastic_height(self, value: int):
+        self._elastic_height = max(0, int(value))
+        self.setFixedHeight(self._elastic_height)
+        self.updateGeometry()
+
+    elasticHeight = Property(int, get_elastic_height, set_elastic_height)
+
 # ============================================================
 # 侧栏
 # ============================================================
@@ -11982,7 +12246,7 @@ class ThreadCard(QFrame):
         self._rename_cancelled = False
         self.setObjectName("threadCard")
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedHeight(50)
+        self.setFixedHeight(42)
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setup_ui()
@@ -11990,10 +12254,10 @@ class ThreadCard(QFrame):
 
     def setup_ui(self):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 10, 8, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(10, 7, 6, 7)
+        layout.setSpacing(6)
         title = QLabel(str(self.thread.get("title", "会话")))
-        title.setStyleSheet("background: transparent; border: none; font-size: 12px; font-weight: 900;")
+        title.setStyleSheet("background: transparent; border: none; font-size: 12px; font-weight: 700;")
         title.setMinimumWidth(0)
         title.setTextFormat(Qt.TextFormat.PlainText)
         title.setWordWrap(False)
@@ -12059,7 +12323,7 @@ class ThreadCard(QFrame):
                 border-color: {hover_border};
             }}
         """)
-        self.title_label.setStyleSheet(f"background: transparent; border: none; color: {color}; font-size: 12px; font-weight: 900;")
+        self.title_label.setStyleSheet(f"background: transparent; border: none; color: {color}; font-size: 12px; font-weight: 700;")
         self.title_edit.setStyleSheet(f"""
             QLineEdit {{
                 background: {COLORS['surface']};
@@ -12265,6 +12529,7 @@ class Sidebar(QFrame):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("sidebarPanel")
         self.setFixedWidth(0)
         self._expanded_width = 260
         self._min_width = 220
@@ -12277,14 +12542,15 @@ class Sidebar(QFrame):
         self.skill_cards: Dict[str, SkillCard] = {}
         
         self.setStyleSheet(f"""
-            QFrame {{
+            QFrame#sidebarPanel {{
                 background: {COLORS['sidebar_bg']};
                 border: none;
+                border-top: 1px solid {sidebar_divider_color()};
             }}
         """)
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setContentsMargins(14, 14, 0, 14)
         layout.setSpacing(12)
 
         nav_row = QHBoxLayout()
@@ -12317,6 +12583,8 @@ class Sidebar(QFrame):
         self.stack = QStackedWidget()
         self.stack.setStyleSheet("QStackedWidget { background: transparent; border: none; }")
         self.files_page = QWidget()
+        self.files_page.setObjectName("sidebarFilesPage")
+        self.files_page.setStyleSheet(f"QWidget#sidebarFilesPage {{ background: {COLORS['sidebar_bg']}; border: none; }}")
         files_layout = QVBoxLayout(self.files_page)
         files_layout.setContentsMargins(0, 0, 0, 0)
         files_layout.setSpacing(0)
@@ -12326,6 +12594,8 @@ class Sidebar(QFrame):
         self.stack.addWidget(self.files_page)
 
         self.threads_page = QWidget()
+        self.threads_page.setObjectName("sidebarThreadsPage")
+        self.threads_page.setStyleSheet(f"QWidget#sidebarThreadsPage {{ background: {COLORS['sidebar_bg']}; border: none; }}")
         threads_layout = QVBoxLayout(self.threads_page)
         threads_layout.setContentsMargins(0, 0, 0, 0)
         threads_layout.setSpacing(8)
@@ -12336,7 +12606,9 @@ class Sidebar(QFrame):
         add_row.addWidget(label)
         add_row.addStretch()
         self.add_thread_btn = QToolButton(cursor=Qt.PointingHandCursor)
-        self.add_thread_btn.setText("+")
+        self.add_thread_btn.setText("")
+        self.add_thread_btn.setIcon(line_icon("plus", "white", 18))
+        self.add_thread_btn.setIconSize(QSize(16, 16))
         self.add_thread_btn.setToolTip("新建会话")
         self.add_thread_btn.setFixedSize(28, 28)
         self.add_thread_btn.clicked.connect(self.new_thread_requested.emit)
@@ -12346,8 +12618,7 @@ class Sidebar(QFrame):
                 color: white;
                 border: none;
                 border-radius: 10px;
-                font-size: 18px;
-                font-weight: 900;
+                padding: 0;
             }}
             QToolButton:hover {{
                 background: {COLORS['accent_dark']};
@@ -12356,23 +12627,27 @@ class Sidebar(QFrame):
         add_row.addWidget(self.add_thread_btn)
         threads_layout.addLayout(add_row)
         self.thread_list = QWidget()
+        self.thread_list.setObjectName("threadList")
+        self.thread_list.setStyleSheet(f"QWidget#threadList {{ background: {COLORS['sidebar_bg']}; border: none; }}")
         self.thread_list.setMinimumWidth(0)
         self.thread_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.thread_list_layout = QVBoxLayout(self.thread_list)
         self.thread_list_layout.setContentsMargins(0, 0, 0, 0)
-        self.thread_list_layout.setSpacing(8)
+        self.thread_list_layout.setSpacing(6)
         self.thread_list_layout.addStretch()
         self.thread_scroll = QScrollArea()
         self.thread_scroll.setWidgetResizable(True)
         self.thread_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.thread_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.thread_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.thread_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.thread_scroll.setWidget(self.thread_list)
         self.thread_scroll.setStyleSheet(self.sidebar_list_scroll_style())
         threads_layout.addWidget(self.thread_scroll, 1)
         self.stack.addWidget(self.threads_page)
 
         self.skills_page = QWidget()
+        self.skills_page.setObjectName("sidebarSkillsPage")
+        self.skills_page.setStyleSheet(f"QWidget#sidebarSkillsPage {{ background: {COLORS['sidebar_bg']}; border: none; }}")
         skills_layout = QVBoxLayout(self.skills_page)
         skills_layout.setContentsMargins(0, 0, 0, 0)
         skills_layout.setSpacing(8)
@@ -12381,6 +12656,8 @@ class Sidebar(QFrame):
         skill_label.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900; background: transparent; border: none;")
         skills_layout.addWidget(skill_label)
         self.skill_list = QWidget()
+        self.skill_list.setObjectName("skillList")
+        self.skill_list.setStyleSheet(f"QWidget#skillList {{ background: {COLORS['sidebar_bg']}; border: none; }}")
         self.skill_list_layout = QVBoxLayout(self.skill_list)
         self.skill_list_layout.setContentsMargins(0, 0, 0, 0)
         self.skill_list_layout.setSpacing(8)
@@ -12389,7 +12666,7 @@ class Sidebar(QFrame):
         self.skill_scroll.setWidgetResizable(True)
         self.skill_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.skill_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.skill_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.skill_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.skill_scroll.setWidget(self.skill_list)
         self.skill_scroll.setStyleSheet(self.sidebar_list_scroll_style())
         skills_layout.addWidget(self.skill_scroll, 1)
@@ -12448,9 +12725,10 @@ class Sidebar(QFrame):
 
     def apply_theme_style(self):
         self.setStyleSheet(f"""
-            QFrame {{
+            QFrame#sidebarPanel {{
                 background: {COLORS['sidebar_bg']};
                 border: none;
+                border-top: 1px solid {sidebar_divider_color()};
             }}
         """)
         self.root_label.setStyleSheet(f"""
@@ -12463,6 +12741,10 @@ class Sidebar(QFrame):
                 font-size: 12px;
             }}
         """)
+        for widget_name in ("files_page", "threads_page", "thread_list", "skills_page", "skill_list"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setStyleSheet(f"QWidget#{widget.objectName()} {{ background: {COLORS['sidebar_bg']}; border: none; }}")
         for label in (getattr(self, "thread_section_label", None), getattr(self, "skill_section_label", None)):
             if label is not None:
                 label.setStyleSheet(f"color: {COLORS['text']}; font-size: 13px; font-weight: 900; background: transparent; border: none;")
@@ -12472,13 +12754,14 @@ class Sidebar(QFrame):
                 color: white;
                 border: none;
                 border-radius: 10px;
-                font-size: 18px;
-                font-weight: 900;
+                padding: 0;
             }}
             QToolButton:hover {{
                 background: {COLORS['accent_dark']};
             }}
         """)
+        self.add_thread_btn.setIcon(line_icon("plus", "white", 18))
+        self.add_thread_btn.setIconSize(QSize(16, 16))
         self.bottom_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {COLORS['surface']};
@@ -12621,6 +12904,8 @@ class Sidebar(QFrame):
         self.tree.setAnimated(True)
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tree.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.tree.setAllColumnsShowFocus(False)
         self.tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.apply_tree_style()
@@ -12790,193 +13075,455 @@ class Sidebar(QFrame):
 # ============================================================
 class HomePage(QWidget):
     enter_chat = Signal(str)
-    
+
+    DESIGN_W = 1120
+    DESIGN_H = 820
+    SOURCE_W = 1672
+    SOURCE_H = 941
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setup_ui()
-    
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
-        layout.setContentsMargins(34, 30, 34, 30)
-        layout.setSpacing(18)
+        self.setMinimumSize(960, 680)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self.setMouseTracking(True)
+        self.global_backdrop = self.load_home_asset("global_backdrop.png", 1020, 390)
+        self.left_interface = self.load_home_asset("left_interface.png", 970, 645)
+        self.ag_logo = self.load_home_asset("ag_logo_feathered.png", 490, 485)
+        self.feature_icon_pixmaps = {
+            "Q": self.load_home_asset("icon_q.png", 72, 70),
+            "wx": self.load_home_asset("icon_wx.png", 72, 70),
+            "run": self.load_home_asset("icon_run.png", 72, 70),
+            "term": self.load_home_asset("icon_term.png", 72, 70),
+            "file": self.load_home_asset("icon_file.png", 72, 70),
+            "flow": self.load_home_asset("icon_flow.png", 72, 70),
+        }
+        self.start_time = time.monotonic()
+        self.duration = 2.24
+        self._rail_progress = 0.0
+        self._control_effects = {}
+        self.setup_controls()
+        self.timer = QTimer(self)
+        self.timer.setInterval(16)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start()
 
-        shell = QFrame()
-        shell.setMaximumWidth(780)
-        shell.setStyleSheet(f"""
-            QFrame {{
-                background: {COLORS['surface']};
-                border: 1px solid {COLORS['border']};
-                border-radius: 28px;
-            }}
-        """)
-        shell_layout = QVBoxLayout(shell)
-        shell_layout.setContentsMargins(28, 26, 28, 28)
-        shell_layout.setSpacing(18)
-        layout.addWidget(shell, alignment=Qt.AlignCenter)
-
-        brand_badge = QLabel("LOCAL AGENT WORKSPACE", alignment=Qt.AlignCenter)
-        brand_badge.setStyleSheet(f"""
-            QLabel {{
-                color: {COLORS['accent_dark']};
-                background: {COLORS['accent_light']};
-                border: 1px solid {soft_accent_border_color()};
-                border-radius: 14px;
-                padding: 7px 13px;
-                font-size: 11px;
-                font-weight: 800;
-                letter-spacing: 1px;
-            }}
-        """)
-        shell_layout.addWidget(brand_badge, alignment=Qt.AlignCenter)
-
-        title = QLabel("Agent. QT智能体", alignment=Qt.AlignCenter)
-        title.setStyleSheet(f"font-size: 34px; font-weight: 900; color: {COLORS['text']}; background: transparent; border: none;")
-        shell_layout.addWidget(title)
-
-        subtitle = QLabel("粘贴 AI 回复后，自动识别命令块、文件正文、扩展指令与后台进程。")
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet(f"font-size: 14px; color: {COLORS['text_secondary']}; background: transparent; border: none;")
-        shell_layout.addWidget(subtitle)
-        
-        # 功能卡片
-        features_frame = QFrame()
-        features_frame.setStyleSheet(f"QFrame {{ background: transparent; border: none; }}")
-        features_layout = QGridLayout(features_frame)
-        features_layout.setContentsMargins(0, 4, 0, 0)
-        features_layout.setHorizontalSpacing(12)
-        features_layout.setVerticalSpacing(12)
-        
-        for idx, (emoji, name, desc) in enumerate([
-            ("PROMPT", "复制提示词", "生成带工作区路径、执行协议和扩展指令说明的完整提示词。"),
-            ("PASTE", "粘贴 AI 回复", "识别 Bash、HTML、CSS、JS、SVG、JSON 等代码块并安全分离内容。"),
-            ("RUN", "自动执行", "按顺序执行命令块、替换占位符、保留 heredoc，并记录执行结果。"),
-            ("TERM", "终端与后台", "长任务会进入底部终端区域，可持续查看输出、复制日志和手动停止。"),
-            ("FILES", "文件与变更", "侧栏浏览项目文件，展示文件变更卡片，并支持 Undo / Redo。"),
-            ("FLOW", "连续协作", "保留对话、执行结果和自动化上下文，方便继续编程、办公和调研工作。"),
-        ]):
-            card = QFrame()
-            card.setMinimumHeight(92)
-            card.setStyleSheet(f"""
-                QFrame {{
-                    background: {COLORS['surface_alt']};
-                    border: 1px solid {COLORS['border']};
-                    border-radius: 18px;
-                }}
-            """)
-            row = QHBoxLayout(card)
-            row.setContentsMargins(14, 12, 14, 12)
-            row.setSpacing(12)
-            badge = QLabel(emoji, alignment=Qt.AlignCenter)
-            badge.setFixedSize(54, 30)
-            badge.setStyleSheet(f"""
-                QLabel {{
-                    background: {COLORS['surface']};
-                    color: {COLORS['accent_dark']};
-                    border: 1px solid {soft_accent_border_color()};
-                    border-radius: 10px;
-                    font-size: 10px;
-                    font-weight: 900;
-                }}
-            """)
-            row.addWidget(badge, alignment=Qt.AlignVCenter)
-            text_col = QVBoxLayout()
-            text_col.setSpacing(4)
-            name_label = QLabel(name)
-            name_label.setStyleSheet(f"font-weight: 800; font-size: 13px; color: {COLORS['text']}; background: transparent; border: none;")
-            desc_label = QLabel(desc)
-            desc_label.setWordWrap(True)
-            desc_label.setStyleSheet(f"font-size: 12px; line-height: 150%; color: {COLORS['text_secondary']}; background: transparent; border: none;")
-            text_col.addWidget(name_label)
-            text_col.addWidget(desc_label)
-            row.addLayout(text_col)
-            row.addStretch()
-            features_layout.addWidget(card, idx // 2, idx % 2)
-        
-        shell_layout.addWidget(features_frame)
-        
-        # 目录选择
-        dir_frame = QFrame()
-        dir_frame.setStyleSheet(
-            f"background: {COLORS['accent_light']}; border-radius: 18px; border: 1px solid {soft_accent_border_color()};"
-        )
-        dir_layout = QVBoxLayout(dir_frame)
-        dir_layout.setContentsMargins(18, 16, 18, 16)
-        dir_layout.setSpacing(12)
-        
-        dir_layout.addWidget(QLabel("选择工作目录", styleSheet=f"font-weight: 800; font-size: 15px; color: {COLORS['text']}; background: transparent; border: none;"))
-        
-        path_row = QHBoxLayout()
-        self.path_edit = QLineEdit(os.path.expanduser("~/Desktop/my-project"))
+    def setup_controls(self):
+        self.path_edit = QLineEdit(os.path.expanduser("~/Desktop/my-project"), self)
         self.path_edit.setPlaceholderText("项目目录路径...")
-        self.path_edit.setMinimumHeight(42)
-        self.path_edit.setStyleSheet(f"""
-            QLineEdit {{
-                background: {COLORS['surface']};
-                color: {COLORS['text']};
-                border: 1px solid {soft_accent_border_color()};
-                border-radius: 12px;
-                padding: 10px 14px;
-                font-size: 13px;
-            }}
-            QLineEdit:focus {{
-                border: 1px solid {COLORS['accent']};
-            }}
-        """)
-        path_row.addWidget(self.path_edit)
-        
-        for text, func in [("📂 浏览", self.browse_folder), ("➕ 新建", self.create_folder)]:
-            btn = QPushButton(text)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setMinimumHeight(42)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {COLORS['surface']};
-                    color: {COLORS['text']};
-                    border: 1px solid {soft_accent_border_color()};
-                    border-radius: 12px;
-                    padding: 10px 14px;
-                    font-size: 12px;
-                    font-weight: 700;
-                }}
-                QPushButton:hover {{
-                    background: {COLORS['surface_alt']};
-                    color: {COLORS['accent_dark']};
-                }}
-            """)
-            btn.clicked.connect(func)
-            path_row.addWidget(btn)
-        dir_layout.addLayout(path_row)
-        shell_layout.addWidget(dir_frame)
-        
-        enter_btn = QPushButton("进入工作区")
-        enter_btn.setCursor(Qt.PointingHandCursor)
-        enter_btn.setMinimumHeight(48)
-        enter_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['accent']};
-                color: white;
-                border: none;
-                border-radius: 14px;
-                padding: 14px;
-                font-size: 15px;
-                font-weight: 900;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['accent_dark']};
-            }}
-        """)
-        enter_btn.clicked.connect(self.on_enter)
-        shell_layout.addWidget(enter_btn)
+        self.path_edit.setStyleSheet(self.path_edit_style())
+        self.browse_btn = QPushButton("◩  浏览", self)
+        self.create_btn = QPushButton("+  新建", self)
+        self.enter_btn = QPushButton("进入工作区  →", self)
+        for btn in (self.browse_btn, self.create_btn, self.enter_btn):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.browse_btn.setStyleSheet(self.secondary_button_style())
+        self.create_btn.setStyleSheet(self.secondary_button_style())
+        self.enter_btn.setStyleSheet(self.primary_button_style())
+        self.browse_btn.clicked.connect(self.browse_folder)
+        self.create_btn.clicked.connect(self.create_folder)
+        self.enter_btn.clicked.connect(self.on_enter)
+        self.path_edit.returnPressed.connect(self.on_enter)
+        for widget in (self.path_edit, self.browse_btn, self.create_btn, self.enter_btn):
+            effect = QGraphicsOpacityEffect(widget)
+            effect.setOpacity(0.0)
+            widget.setGraphicsEffect(effect)
+            self._control_effects[widget] = effect
 
-        layout.addStretch()
-    
+    def path_edit_style(self) -> str:
+        return """
+            QLineEdit {
+                background: rgba(255, 255, 255, 238);
+                color: #1d2a3f;
+                border: 1px solid #d9e6f6;
+                border-radius: 13px;
+                padding: 8px 16px;
+                font-size: 14px;
+                font-weight: 500;
+            }
+            QLineEdit:focus {
+                border-color: #b8d1ff;
+                background: rgba(255, 255, 255, 248);
+            }
+        """
+
+    def secondary_button_style(self) -> str:
+        return """
+            QPushButton {
+                background: rgba(255, 255, 255, 236);
+                color: #1d2a3f;
+                border: 1px solid #d9e6f6;
+                border-radius: 13px;
+                padding: 7px 14px;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            QPushButton:hover {
+                background: rgba(247, 251, 255, 246);
+                color: #165ff2;
+                border-color: #b8d1ff;
+            }
+            QPushButton:pressed {
+                background: rgba(238, 246, 255, 248);
+                padding-top: 8px;
+                padding-bottom: 6px;
+            }
+        """
+
+    def primary_button_style(self) -> str:
+        return """
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #4f8dff, stop:1 #6f65ff);
+                color: white;
+                border: 1px solid rgba(255, 255, 255, 92);
+                border-radius: 13px;
+                padding: 7px 14px;
+                font-size: 14px;
+                font-weight: 800;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #69a3ff, stop:1 #7568ff);
+                border-color: rgba(255, 255, 255, 140);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #3f7cf3, stop:1 #6158ef);
+                padding-top: 8px;
+                padding-bottom: 6px;
+            }
+        """
+
+    def homepage_asset_dir(self) -> str:
+        candidates = [
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "homepage")),
+            os.path.abspath(os.path.join(os.getcwd(), "assets", "homepage")),
+        ]
+        for path in candidates:
+            if os.path.isdir(path):
+                return path
+        return candidates[0]
+
+    def load_home_asset(self, filename: str, width: int, height: int) -> QPixmap:
+        path = os.path.join(self.homepage_asset_dir(), filename)
+        pixmap = QPixmap(path)
+        if not pixmap.isNull():
+            return pixmap
+        fallback = QImage(max(1, width), max(1, height), QImage.Format.Format_ARGB32_Premultiplied)
+        fallback.fill(Qt.GlobalColor.transparent)
+        return QPixmap.fromImage(fallback)
+
+    def home_font(self, size: int, weight=QFont.Weight.Normal) -> QFont:
+        families = ["PingFang SC", "Microsoft YaHei", "Helvetica Neue", "Arial"]
+        f = QFont(families[0], size)
+        f.setFamilies(families)
+        f.setWeight(weight)
+        f.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        return f
+
+    def clamp01(self, value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    def smoothstep(self, value: float) -> float:
+        value = self.clamp01(value)
+        return value * value * (3.0 - 2.0 * value)
+
+    def delayed(self, now: float, start: float, duration: float) -> float:
+        return self.clamp01((now - start) / duration)
+
+    def ease_out(self, value: float) -> float:
+        value = self.clamp01(value)
+        if value >= 0.992:
+            return 1.0
+        eased = 1.0 - pow(1.0 - value, 3.0)
+        return 1.0 if eased > 0.998 else self.clamp01(eased)
+
+    def tick(self):
+        if time.monotonic() - self.start_time > self.duration + 0.35:
+            self.timer.stop()
+        self.update_control_geometry()
+        self.update()
+
+    def logical_rect(self) -> QRectF:
+        scale = min(self.width() / self.DESIGN_W, self.height() / self.DESIGN_H)
+        width = self.DESIGN_W * scale
+        height = self.DESIGN_H * scale
+        return QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
+
+    def design_to_widget_rect(self, rect: QRectF) -> QRectF:
+        logical = self.logical_rect()
+        scale = logical.width() / self.DESIGN_W
+        return QRectF(
+            logical.left() + rect.left() * scale,
+            logical.top() + rect.top() * scale,
+            rect.width() * scale,
+            rect.height() * scale,
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_control_geometry()
+
+    def update_control_geometry(self):
+        rail = self._rail_progress
+        y_offset = 46 * (1.0 - rail)
+        rects = {
+            self.path_edit: QRectF(88, 708 + y_offset, 552, 40),
+            self.browse_btn: QRectF(666, 708 + y_offset, 94, 40),
+            self.create_btn: QRectF(778, 708 + y_offset, 94, 40),
+            self.enter_btn: QRectF(892, 708 + y_offset, 134, 40),
+        }
+        opacity = self.smoothstep(rail)
+        for widget, rect in rects.items():
+            mapped = self.design_to_widget_rect(rect)
+            widget.setGeometry(int(round(mapped.x())), int(round(mapped.y())), int(round(mapped.width())), int(round(mapped.height())))
+            widget.setVisible(opacity > 0.02)
+            effect = self._control_effects.get(widget)
+            if effect is not None:
+                effect.setOpacity(opacity)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.paint_window_backdrop(painter)
+
+        rect = self.logical_rect()
+        scale = rect.width() / self.DESIGN_W
+        t = min((time.monotonic() - self.start_time) / self.duration, 1.0)
+        left = self.ease_out(self.delayed(t, 0.00, 0.48))
+        right = self.ease_out(self.delayed(t, 0.12, 0.52))
+        right_content = self.ease_out(self.delayed(t, 0.30, 0.42))
+        right_icons = self.ease_out(self.delayed(t, 0.56, 0.30))
+        rail = self.ease_out(self.delayed(t, 0.62, 0.28))
+        self._rail_progress = rail
+        self.update_control_geometry()
+
+        painter.save()
+        painter.translate(rect.topLeft())
+        painter.scale(scale, scale)
+        self.paint_left_art(painter, left)
+        self.paint_right_panel(painter, right, right_content, right_icons)
+        self.paint_directory_rail(painter, rail)
+        painter.restore()
+
+    def paint_window_backdrop(self, painter: QPainter):
+        bg = QLinearGradient(0, 0, self.width(), self.height())
+        bg.setColorAt(0.0, QColor("#eef7ff"))
+        bg.setColorAt(0.50, QColor("#fbfdff"))
+        bg.setColorAt(1.0, QColor("#f7fbff"))
+        painter.fillRect(self.rect(), QBrush(bg))
+        glow = QRadialGradient(QPointF(self.width() * 0.28, self.height() * 0.52), max(self.width(), self.height()) * 0.55)
+        glow.setColorAt(0.0, QColor(133, 210, 255, 150))
+        glow.setColorAt(0.55, QColor(213, 237, 255, 52))
+        glow.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.fillRect(self.rect(), QBrush(glow))
+        violet = QRadialGradient(QPointF(self.width() * 0.46, self.height() * 0.48), max(self.width(), self.height()) * 0.38)
+        violet.setColorAt(0.0, QColor(137, 112, 255, 80))
+        violet.setColorAt(0.7, QColor(244, 239, 255, 36))
+        violet.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.fillRect(self.rect(), QBrush(violet))
+        painter.save()
+        painter.setOpacity(0.26)
+        target = QRectF(-40, self.height() * 0.34, self.width() * 0.84, self.height() * 0.64)
+        painter.drawPixmap(target, self.global_backdrop, QRectF(0, 0, self.global_backdrop.width(), self.global_backdrop.height()))
+        painter.restore()
+
+    def paint_left_art(self, painter: QPainter, progress: float):
+        base_x = -42 - 128 * (1.0 - progress)
+        base_y = 66 + 18 * (1.0 - progress)
+        workspace_rect = QRectF(base_x, base_y, 598, 420)
+        logo_rect = QRectF(base_x + 198, base_y + 150, 326, 321)
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(74, 126, 198, 36))
+        painter.setOpacity(0.18 * self.smoothstep(progress))
+        painter.drawRoundedRect(workspace_rect.adjusted(20, 34, -6, 44), 38, 38)
+        blur = 1.0 - self.smoothstep(progress)
+        if blur > 0.02:
+            painter.setOpacity(0.22 * blur)
+            painter.drawPixmap(workspace_rect.adjusted(-18 * blur, -12 * blur, 18 * blur, 14 * blur), self.left_interface, QRectF(0, 0, self.left_interface.width(), self.left_interface.height()))
+        painter.setOpacity(self.clamp01(0.08 + progress * 0.34))
+        painter.drawPixmap(workspace_rect, self.left_interface, QRectF(0, 0, self.left_interface.width(), self.left_interface.height()))
+        frost = QLinearGradient(workspace_rect.topLeft(), workspace_rect.bottomRight())
+        frost.setColorAt(0.0, QColor(255, 255, 255, 76))
+        frost.setColorAt(0.48, QColor(242, 249, 255, 136))
+        frost.setColorAt(1.0, QColor(235, 241, 255, 118))
+        painter.setOpacity(0.92 * self.smoothstep(progress))
+        painter.setBrush(QBrush(frost))
+        painter.setPen(QPen(QColor(255, 255, 255, 110), 1))
+        painter.drawRoundedRect(workspace_rect.adjusted(8, 8, -18, -28), 32, 32)
+        painter.setOpacity(0.25 * self.smoothstep(progress))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(90, 98, 220, 44))
+        painter.drawRoundedRect(logo_rect.translated(0, 24), 72, 72)
+        painter.setOpacity(self.clamp01(0.18 + progress * 0.88))
+        painter.drawPixmap(logo_rect, self.ag_logo, QRectF(0, 0, self.ag_logo.width(), self.ag_logo.height()))
+        veil = QLinearGradient(372, 0, 690, 0)
+        veil.setColorAt(0.0, QColor(255, 255, 255, 0))
+        veil.setColorAt(0.62, QColor(255, 255, 255, 190))
+        veil.setColorAt(1.0, QColor(255, 255, 255, 246))
+        painter.setOpacity(self.smoothstep(progress))
+        painter.fillRect(QRectF(360, 0, 360, 640), QBrush(veil))
+        painter.restore()
+
+    def paint_right_panel(self, painter: QPainter, panel_progress: float, content_progress: float, icon_progress: float):
+        x = 516 + 138 * (1.0 - panel_progress)
+        y = 64
+        w = 532
+        h = 554
+        painter.save()
+        painter.setOpacity(self.smoothstep(panel_progress))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(73, 101, 170, 28))
+        painter.drawRoundedRect(QRectF(x + 12, y + 18, w - 24, h - 18), 34, 34)
+        panel_bg = QLinearGradient(x, y, x + w, y + h)
+        panel_bg.setColorAt(0.0, QColor(255, 255, 255, 232))
+        panel_bg.setColorAt(0.46, QColor(252, 254, 255, 238))
+        panel_bg.setColorAt(1.0, QColor(248, 251, 255, 232))
+        self.round_rect(painter, QRectF(x, y, w, h), 34, panel_bg, QColor(226, 237, 250, 190), pen_width=1)
+        painter.setOpacity(self.smoothstep(content_progress))
+        content_dx = 52 * (1.0 - content_progress)
+        content_dy = 16 * (1.0 - content_progress)
+        self.paint_hero_copy_static(painter, x + content_dx, y + 34 + content_dy, w)
+        self.paint_feature_grid_static(painter, x + 34 + content_dx * 0.45, y + 248 + content_dy * 0.55, icon_progress)
+        painter.restore()
+
+    def paint_hero_copy_static(self, painter: QPainter, panel_x: float, y: float, panel_w: float):
+        center_x = panel_x + panel_w / 2
+        badge_x = center_x - 125
+        self.round_rect(painter, QRectF(badge_x, y, 250, 36), 18, QColor(255, 255, 255, 226), QColor("#9cc5ff"))
+        painter.setFont(self.home_font(13, QFont.Weight.Black))
+        painter.setPen(QColor("#1776ff"))
+        painter.drawText(QRectF(badge_x, y, 250, 36), Qt.AlignmentFlag.AlignCenter, "LOCAL AGENT WORKSPACE")
+        agent_font = self.home_font(43, QFont.Weight.Black)
+        qt_font = self.home_font(43, QFont.Weight.Black)
+        cn_font = self.home_font(35, QFont.Weight.Black)
+        agent_text = "Agent."
+        qt_text = "QT"
+        cn_text = "智能体"
+        gap_aq = 5
+        gap_qc = 6
+        agent_w = QFontMetricsF(agent_font).horizontalAdvance(agent_text)
+        qt_w = QFontMetricsF(qt_font).horizontalAdvance(qt_text)
+        cn_w = QFontMetricsF(cn_font).horizontalAdvance(cn_text)
+        title_x = center_x - (agent_w + gap_aq + qt_w + gap_qc + cn_w) / 2
+        baseline = y + 94
+        painter.setFont(agent_font)
+        painter.setPen(QColor("#182236"))
+        painter.drawText(QPointF(title_x, baseline), agent_text)
+        qt_x = title_x + agent_w + gap_aq
+        grad = QLinearGradient(qt_x, y + 48, qt_x + qt_w, y + 102)
+        grad.setColorAt(0.0, QColor("#75a8ff"))
+        grad.setColorAt(1.0, QColor("#5b55ee"))
+        path = QPainterPath()
+        path.addText(QPointF(qt_x, baseline), qt_font, qt_text)
+        painter.fillPath(path, QBrush(grad))
+        painter.setFont(cn_font)
+        painter.setPen(QColor("#182236"))
+        painter.drawText(QPointF(qt_x + qt_w + gap_qc, baseline), cn_text)
+        painter.setFont(self.home_font(19, QFont.Weight.Black))
+        painter.setPen(QColor("#1776ff"))
+        painter.drawText(QRectF(panel_x, y + 109, panel_w, 30), Qt.AlignmentFlag.AlignCenter, "本地 AI 工作空间 / 编程办公调研助手")
+        painter.setFont(self.home_font(14, QFont.Weight.DemiBold))
+        painter.setPen(QColor("#33415c"))
+        painter.drawText(QRectF(panel_x, y + 139, panel_w, 26), Qt.AlignmentFlag.AlignCenter, "更智能 · 更高效 · 更安全的本地 AI 体验")
+
+    def paint_feature_grid_static(self, painter: QPainter, x: float, y: float, icon_progress: float):
+        x = round(x)
+        y = round(y)
+        card_w = 214
+        card_h = 78
+        col_gap = 46
+        row_gap = 26
+        icon_x = 32
+        text_x = 72
+        features = [
+            (0, 0, "Q", "网页模型", "登录即用，无需 API"),
+            (card_w + col_gap, 0, "wx", "微信远控", "远程投递和安全连接"),
+            (0, card_h + row_gap, "run", "自动执行", "命令流程自动闭环"),
+            (card_w + col_gap, card_h + row_gap, "term", "终端后台", "长任务可视化运行"),
+            (0, (card_h + row_gap) * 2, "file", "文件变更", "项目浏览与 Undo"),
+            (card_w + col_gap, (card_h + row_gap) * 2, "flow", "连续协作", "保留上下文和结果"),
+        ]
+        for dx, dy, icon, title, desc in features:
+            card = QRectF(x + dx, y + dy, card_w, card_h)
+            self.round_rect(painter, card, 22, QColor(255, 255, 255, 198), QColor(221, 232, 248, 220))
+            self.paint_icon(painter, icon, QPointF(round(card.left() + icon_x), round(card.center().y())), self.smoothstep(icon_progress))
+            painter.setFont(self.home_font(14, QFont.Weight.Black))
+            painter.setPen(QColor("#182236"))
+            painter.drawText(QPointF(round(card.left() + text_x), round(card.top() + 33)), title)
+            painter.setFont(self.home_font(11, QFont.Weight.DemiBold))
+            painter.setPen(QColor("#52627b"))
+            painter.drawText(QPointF(round(card.left() + text_x), round(card.top() + 55)), desc)
+
+    def paint_icon(self, painter: QPainter, kind: str, center: QPointF, alpha: float = 1.0):
+        painter.save()
+        alpha = self.clamp01(alpha)
+        painter.translate(center)
+        pixmap = self.feature_icon_pixmaps.get(kind)
+        target = QRectF(-24, -24, 48, 48)
+        if pixmap and not pixmap.isNull():
+            feather = QPainterPath()
+            feather.addRoundedRect(target, 13, 13)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 120))
+            painter.setOpacity(0.72 * alpha)
+            painter.drawRoundedRect(target.adjusted(1, 1, -1, -1), 13, 13)
+            painter.setOpacity(0.24 * alpha)
+            painter.drawPixmap(target.adjusted(-3, -3, 3, 3), pixmap, QRectF(0, 0, pixmap.width(), pixmap.height()))
+            painter.setOpacity(0.98 * alpha)
+            painter.setClipPath(feather)
+            painter.drawPixmap(target, pixmap, QRectF(0, 0, pixmap.width(), pixmap.height()))
+            painter.setClipping(False)
+            edge = QLinearGradient(target.topLeft(), target.bottomRight())
+            edge.setColorAt(0.0, QColor(255, 255, 255, 70))
+            edge.setColorAt(0.50, QColor(255, 255, 255, 8))
+            edge.setColorAt(1.0, QColor(255, 255, 255, 80))
+            painter.setBrush(QBrush(edge))
+            painter.setPen(QPen(QColor(220, 232, 248, 130), 1))
+            painter.setOpacity(alpha)
+            painter.drawRoundedRect(target, 13, 13)
+        else:
+            painter.setOpacity(alpha)
+            self.round_rect(painter, QRectF(-22, -22, 44, 44), 14, QColor(255, 255, 255, 235), QColor("#d6e5fb"))
+            painter.setFont(self.home_font(22, QFont.Weight.Black))
+            painter.setPen(QColor("#347bff"))
+            painter.drawText(QRectF(-20, -19, 40, 38), Qt.AlignmentFlag.AlignCenter, kind[:1].upper())
+        painter.restore()
+
+    def paint_directory_rail(self, painter: QPainter, progress: float):
+        x = 64
+        y = 656 + 46 * (1.0 - progress)
+        w = 992
+        h = 108
+        painter.save()
+        painter.setOpacity(self.smoothstep(progress))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(74, 116, 185, 7))
+        painter.drawRoundedRect(QRectF(x + 14, y + 22, w - 28, h - 2), 25, 25)
+        painter.setBrush(QColor(112, 134, 180, 5))
+        painter.drawRoundedRect(QRectF(x + 6, y + 10, w - 12, h + 4), 25, 25)
+        bg = QLinearGradient(x, y, x + w, y + h)
+        bg.setColorAt(0.0, QColor(255, 255, 255, 232))
+        bg.setColorAt(0.54, QColor(250, 253, 255, 228))
+        bg.setColorAt(1.0, QColor(245, 250, 255, 230))
+        self.round_rect(painter, QRectF(x, y, w, h), 25, bg, QColor("#e3edf8"), pen_width=1)
+        painter.setFont(self.home_font(16, QFont.Weight.Bold))
+        painter.setPen(QColor("#1d2a3f"))
+        painter.drawText(QPointF(x + 24, y + 35), "选择工作目录")
+        painter.restore()
+
+    def round_rect(self, painter: QPainter, rect: QRectF, radius: float, fill, stroke, pen_width: int = 1):
+        painter.save()
+        painter.setPen(QPen(stroke, pen_width))
+        painter.setBrush(QBrush(fill) if isinstance(fill, QLinearGradient) else fill)
+        painter.drawRoundedRect(rect, radius, radius)
+        painter.restore()
+
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "选择项目目录", self.path_edit.text())
         if folder:
             self.path_edit.setText(folder)
-    
+
     def create_folder(self):
         base = os.path.expanduser("~/Desktop")
         name = f"project-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -12984,7 +13531,7 @@ class HomePage(QWidget):
         if folder:
             os.makedirs(folder, exist_ok=True)
             self.path_edit.setText(folder)
-    
+
     def on_enter(self):
         path = self.path_edit.text().strip()
         if not path:
@@ -13008,6 +13555,10 @@ class ChatPage(QWidget):
         self.skills: List[Dict[str, str]] = []
         self.selected_skill_ids: set[str] = set()
         self.cmd_outputs = []
+        self.cmd_output_render_timer = QTimer(self)
+        self.cmd_output_render_timer.setSingleShot(True)
+        self.cmd_output_render_timer.timeout.connect(self.flush_command_output_render)
+        self.cmd_output_render_dirty = False
         self.pending_snapshot: Dict[str, bytes] = {}
         self.change_tracker: Optional[InternalGitChangeTracker] = None
         self.pending_internal_git_commit = ""
@@ -13075,6 +13626,32 @@ class ChatPage(QWidget):
         self.history_save_workers: List[HistorySaveWorker] = []
         self.history_save_dirty = False
         self.history_save_generation = 0
+        self.history_load_worker: Optional[HistoryLoadWorker] = None
+        self.history_load_workers: List[HistoryLoadWorker] = []
+        self.history_load_serial = 0
+        self.history_render_entries: List[Dict[str, object]] = []
+        self.history_render_index = 0
+        self.history_render_cursor = 0
+        self.history_render_insert_index = 0
+        self.history_render_started_at = 0.0
+        self.history_force_bottom_until = 0.0
+        self.history_hidden_entries: List[Dict[str, object]] = []
+        self.history_expand_cursor = 0
+        self.history_expand_insert_index = 0
+        self.history_expand_pending = False
+        self.history_trim_notice: Optional[QPushButton] = None
+        self.chat_scrollbar_visible = False
+        self.chat_scrollbar_fade_timer = QTimer(self)
+        self.chat_scrollbar_fade_timer.setSingleShot(True)
+        self.chat_scrollbar_fade_timer.timeout.connect(self.hide_chat_scrollbar)
+        self.chat_overscroll_limit = 56
+        self.chat_overscroll_release_timer = QTimer(self)
+        self.chat_overscroll_release_timer.setSingleShot(True)
+        self.chat_overscroll_release_timer.timeout.connect(self.release_chat_overscroll)
+        self.chat_overscroll_animation: Optional[QPropertyAnimation] = None
+        self.pending_delete_thread_ids: set[str] = set()
+        self.deleted_thread_save_generations: Dict[str, int] = {}
+        self.delete_thread_workers: List[DeleteThreadWorker] = []
         self.pending_provider_io: Optional[Dict[str, object]] = None
         self.ui_heartbeat_last = time.perf_counter()
         self.ui_heartbeat_timer = QTimer(self)
@@ -13143,6 +13720,44 @@ class ChatPage(QWidget):
                 self.automation_preview_bubble is not None,
                 len(self.automation_preview_pending_text or ""),
             )
+
+    def chat_scroll_area_style(self, active: bool = False) -> str:
+        handle_bg = COLORS["border_strong"] if active else "transparent"
+        hover_bg = COLORS["border_strong"]
+        return f"""
+            QScrollArea {{
+                background: {COLORS['surface']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 18px;
+            }}
+            QScrollArea QWidget#qt_scrollarea_viewport {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollArea > QWidget > QWidget {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 8px;
+                margin: 6px 2px 6px 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {handle_bg};
+                border-radius: 4px;
+                min-height: 30px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {hover_bg};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: transparent;
+            }}
+        """
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -13167,14 +13782,14 @@ class ChatPage(QWidget):
         self.sidebar.delete_path_requested.connect(self.delete_project_path)
         self.sidebar_btn = QToolButton()
         self.sidebar_btn.setText("›")
-        self.sidebar_btn.setFixedSize(22, 34)
+        self.sidebar_btn.setFixedSize(12, 34)
         self.sidebar_btn.clicked.connect(self.toggle_sidebar)
         self.sidebar_btn.setStyleSheet(f"""
             QToolButton {{
                 background: transparent;
                 border: none;
                 color: {COLORS['accent_dark']};
-                font-size: 20px;
+                font-size: 18px;
                 font-weight: 800;
                 padding-top: 3px;
             }}
@@ -13186,7 +13801,14 @@ class ChatPage(QWidget):
         
         sidebar_wrapper = QWidget()
         self.sidebar_wrapper = sidebar_wrapper
-        sidebar_wrapper.setFixedWidth(24)
+        sidebar_wrapper.setObjectName("sidebarWrapper")
+        sidebar_wrapper.setFixedWidth(14)
+        sidebar_wrapper.setStyleSheet(f"""
+            QWidget#sidebarWrapper {{
+                background: transparent;
+                border: none;
+            }}
+        """)
         sw_layout = QHBoxLayout(sidebar_wrapper)
         sw_layout.setContentsMargins(0, 0, 0, 0)
         sw_layout.setSpacing(0)
@@ -13202,21 +13824,21 @@ class ChatPage(QWidget):
         right_panel = QWidget(styleSheet=f"background: {COLORS['bg']};")
         self.right_panel = right_panel
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 16, 18, 0)
-        right_layout.setSpacing(12)
+        right_layout.setContentsMargins(16, 8, 18, 0)
+        right_layout.setSpacing(10)
         
         # 路径标签（双击返回首页）
         path_bar = QHBoxLayout()
         path_title = QLabel("工作区")
         self.path_title = path_title
-        path_title.setStyleSheet(f"color: {COLORS['text']}; font-size: 18px; font-weight: 900; background: transparent;")
+        path_title.setStyleSheet(f"color: {COLORS['text']}; font-size: 17px; font-weight: 900; background: transparent;")
         path_bar.addWidget(path_title)
         self.path_label = QLabel("", cursor=Qt.PointingHandCursor,
                                  styleSheet=f"""
                                      QLabel {{
                                          color: {COLORS['text_secondary']};
                                          font-size: 12px;
-                                         padding: 8px 12px;
+                                         padding: 7px 12px;
                                          background: {COLORS['surface']};
                                          border: 1px solid {COLORS['border']};
                                          border-radius: 12px;
@@ -13231,7 +13853,7 @@ class ChatPage(QWidget):
         path_bar.addStretch()
 
         self.copy_prompt_btn = QPushButton("复制系统提示词", clicked=self.on_primary_action_button, cursor=Qt.PointingHandCursor)
-        self.copy_prompt_btn.setFixedHeight(36)
+        self.copy_prompt_btn.setFixedHeight(34)
         self.copy_prompt_btn.setFixedWidth(136)
         self.copy_prompt_btn.setStyleSheet(f"""
             QPushButton {{
@@ -13247,12 +13869,10 @@ class ChatPage(QWidget):
                 background: {COLORS['accent_dark']};
             }}
         """)
-        path_bar.addWidget(self.copy_prompt_btn)
-
         self.settings_btn = QToolButton(cursor=Qt.PointingHandCursor)
         self.settings_btn.setText("")
         self.settings_btn.setIcon(line_icon("settings", COLORS["text"], 18))
-        self.settings_btn.setFixedSize(36, 36)
+        self.settings_btn.setFixedSize(34, 34)
         self.settings_btn.setIconSize(self.settings_btn.size())
         self.settings_btn.setToolTip("")
         self.settings_btn.clicked.connect(self.show_settings_menu)
@@ -13271,10 +13891,8 @@ class ChatPage(QWidget):
                 border-color: {soft_accent_border_color()};
             }}
         """)
-        path_bar.addWidget(self.settings_btn)
-
         self.top_clear_history_btn = QPushButton("清空记录", clicked=self.clear_chat_history, cursor=Qt.PointingHandCursor)
-        self.top_clear_history_btn.setFixedHeight(36)
+        self.top_clear_history_btn.setFixedHeight(34)
         self.top_clear_history_btn.setFixedWidth(68)
         self.top_clear_history_btn.setStyleSheet(f"""
             QPushButton {{
@@ -13291,46 +13909,23 @@ class ChatPage(QWidget):
             }}
         """)
         path_bar.addWidget(self.top_clear_history_btn)
+        path_bar.addWidget(self.copy_prompt_btn)
+        path_bar.addWidget(self.settings_btn)
         right_layout.addLayout(path_bar)
         
-        self.scroll_area = QScrollArea(widgetResizable=True,
-                                       styleSheet=f"""
-                                           QScrollArea {{
-                                               background: {COLORS['surface']};
-                                               border: 1px solid {COLORS['border']};
-                                               border-radius: 18px;
-                                           }}
-                                           QScrollArea QWidget#qt_scrollarea_viewport {{
-                                               background: {COLORS['surface']};
-                                               border-radius: 18px;
-                                           }}
-                                           QScrollArea > QWidget > QWidget {{
-                                               background: {COLORS['surface']};
-                                               border-radius: 18px;
-                                           }}
-                                           QScrollBar:vertical {{
-                                               background: transparent;
-                                               width: 8px;
-                                               margin: 6px 2px 6px 0;
-                                           }}
-                                           QScrollBar::handle:vertical {{
-                                               background: {COLORS['border_strong']};
-                                               border-radius: 4px;
-                                               min-height: 30px;
-                                           }}
-                                           QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-                                               height: 0;
-                                           }}
-                                       """)
+        self.scroll_area = QScrollArea(widgetResizable=True, styleSheet=self.chat_scroll_area_style(False))
         self.chat_container = QWidget()
-        self.chat_container.setStyleSheet(f"background: {COLORS['surface']};")
+        self.chat_container.setStyleSheet("background: transparent; border: none;")
         self.chat_layout = QVBoxLayout(self.chat_container)
         self.chat_root_layout = self.chat_layout
         self.chat_root_layout.setAlignment(Qt.AlignTop)
         self.chat_root_layout.setSpacing(0)
         self.chat_layout.setContentsMargins(0, 0, 0, 0)
+        self.chat_top_overscroll = ElasticSpacer(self.chat_container)
+        self.chat_bottom_overscroll = ElasticSpacer(self.chat_container)
+        self.chat_root_layout.addWidget(self.chat_top_overscroll)
         self.chat_column = QWidget()
-        self.chat_column.setStyleSheet(f"background: {COLORS['surface']};")
+        self.chat_column.setStyleSheet("background: transparent; border: none;")
         self.chat_column.setMaximumWidth(self.chat_column_max_width)
         self.chat_column.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Maximum)
         self.chat_column_layout = QVBoxLayout(self.chat_column)
@@ -13338,11 +13933,13 @@ class ChatPage(QWidget):
         self.chat_column_layout.setSpacing(10)
         self.chat_column_layout.setContentsMargins(14, 14, 14, 14)
         self.chat_root_layout.addWidget(self.chat_column, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self.chat_root_layout.addWidget(self.chat_bottom_overscroll)
         self.chat_layout = self.chat_column_layout
         self.scroll_area.setWidget(self.chat_container)
-        self.scroll_area.viewport().setStyleSheet(f"background: {COLORS['surface']}; border-radius: 18px;")
+        self.scroll_area.viewport().setStyleSheet("background: transparent; border: none;")
         self.scroll_area.viewport().installEventFilter(self)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self.on_chat_scroll_changed)
+        self.scroll_area.verticalScrollBar().rangeChanged.connect(self.on_chat_scroll_range_changed)
         self.sidebar_resize_overlay = QLabel("正在调整侧栏宽度，释放后恢复内容显示", self.scroll_area.viewport())
         self.sidebar_resize_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sidebar_resize_overlay.setVisible(False)
@@ -13510,12 +14107,95 @@ class ChatPage(QWidget):
 
     def eventFilter(self, watched, event):
         try:
-            if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
-                self.update_chat_column_width()
-                self.update_sidebar_resize_overlay_geometry()
+            if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport():
+                if event.type() == QEvent.Type.Resize:
+                    self.update_chat_column_width()
+                    self.update_sidebar_resize_overlay_geometry()
+                elif event.type() == QEvent.Type.Wheel and self.handle_chat_overscroll_wheel(event):
+                    return True
         except RuntimeError:
             return False
         return super().eventFilter(watched, event)
+
+    def handle_chat_overscroll_wheel(self, event) -> bool:
+        if not hasattr(self, "scroll_area"):
+            return False
+        phase = event.phase() if getattr(event, "phase", None) is not None else Qt.ScrollPhase.NoScrollPhase
+        if phase == Qt.ScrollPhase.ScrollEnd:
+            if self.current_chat_overscroll_height() > 0:
+                self.release_chat_overscroll()
+                return True
+            return False
+        bar = self.scroll_area.verticalScrollBar()
+        pixel_delta = event.pixelDelta().y() if hasattr(event, "pixelDelta") else 0
+        angle_delta = event.angleDelta().y() if hasattr(event, "angleDelta") else 0
+        delta = pixel_delta or angle_delta
+        if delta == 0:
+            return False
+        top_active = getattr(self, "chat_top_overscroll", None) is not None and self.chat_top_overscroll.get_elastic_height() > 0
+        bottom_active = getattr(self, "chat_bottom_overscroll", None) is not None and self.chat_bottom_overscroll.get_elastic_height() > 0
+        at_top = bar.value() <= bar.minimum() or top_active
+        at_bottom = bar.value() >= bar.maximum() or bottom_active
+        phased_scroll = phase != Qt.ScrollPhase.NoScrollPhase or bool(pixel_delta)
+        release_delay_ms = None if phased_scroll else 200
+        if delta > 0 and at_top:
+            self.apply_chat_overscroll("top", delta, bool(pixel_delta), release_delay_ms)
+            return True
+        if delta < 0 and at_bottom:
+            self.apply_chat_overscroll("bottom", delta, bool(pixel_delta), release_delay_ms)
+            return True
+        if (top_active and delta < 0) or (bottom_active and delta > 0):
+            self.release_chat_overscroll()
+        return False
+
+    def current_chat_overscroll_height(self) -> int:
+        top = getattr(getattr(self, "chat_top_overscroll", None), "elasticHeight", 0) or 0
+        bottom = getattr(getattr(self, "chat_bottom_overscroll", None), "elasticHeight", 0) or 0
+        return max(int(top), int(bottom))
+
+    def apply_chat_overscroll(self, edge: str, delta: int, pixel_delta: bool, release_delay_ms: Optional[int]):
+        spacer = self.chat_top_overscroll if edge == "top" else self.chat_bottom_overscroll
+        opposite = self.chat_bottom_overscroll if edge == "top" else self.chat_top_overscroll
+        opposite.set_elastic_height(0)
+        if self.chat_overscroll_animation is not None:
+            self.chat_overscroll_animation.stop()
+            self.chat_overscroll_animation = None
+        step = abs(delta) * (0.32 if pixel_delta else 0.12)
+        step = max(5, min(18, int(step)))
+        target = min(self.chat_overscroll_limit, spacer.get_elastic_height() + step)
+        spacer.set_elastic_height(target)
+        if edge == "top":
+            self.scroll_area.verticalScrollBar().setValue(0)
+        else:
+            self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
+            QTimer.singleShot(0, self.force_scroll_to_bottom_once)
+        if release_delay_ms is not None:
+            self.chat_overscroll_release_timer.start(release_delay_ms)
+
+    def release_chat_overscroll(self):
+        spacers = [
+            spacer for spacer in (
+                getattr(self, "chat_top_overscroll", None),
+                getattr(self, "chat_bottom_overscroll", None),
+            )
+            if spacer is not None and spacer.get_elastic_height() > 0
+        ]
+        if not spacers:
+            return
+        if self.chat_overscroll_animation is not None:
+            self.chat_overscroll_animation.stop()
+        spacer = max(spacers, key=lambda item: item.get_elastic_height())
+        bottom_release = spacer is getattr(self, "chat_bottom_overscroll", None)
+        animation = QPropertyAnimation(spacer, b"elasticHeight", self)
+        animation.setDuration(210)
+        animation.setStartValue(spacer.get_elastic_height())
+        animation.setEndValue(0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        if bottom_release:
+            animation.valueChanged.connect(lambda _value: self.force_scroll_to_bottom_once())
+        animation.finished.connect(lambda: setattr(self, "chat_overscroll_animation", None))
+        self.chat_overscroll_animation = animation
+        animation.start()
 
     def update_chat_column_width(self):
         if not hasattr(self, "chat_column") or not hasattr(self, "scroll_area"):
@@ -13547,10 +14227,11 @@ class ChatPage(QWidget):
     def add_history_trim_notice(self, hidden_count: int):
         if hidden_count <= 0:
             return
-        notice = QLabel(f"已折叠较早 {hidden_count} 条历史。完整历史仍会进入自动化上下文。")
-        notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        notice = QPushButton(f"已折叠较早 {hidden_count} 条历史。完整历史仍会进入自动化上下文。点击展开")
+        notice.setCursor(Qt.CursorShape.PointingHandCursor)
+        notice.clicked.connect(self.expand_hidden_history)
         notice.setStyleSheet(f"""
-            QLabel {{
+            QPushButton {{
                 background: {COLORS['surface_alt']};
                 color: {COLORS['text_secondary']};
                 border: 1px solid {COLORS['border']};
@@ -13558,9 +14239,16 @@ class ChatPage(QWidget):
                 padding: 10px 12px;
                 font-size: 12px;
                 font-weight: 800;
+                text-align: center;
+            }}
+            QPushButton:hover {{
+                background: {COLORS['accent_light']};
+                color: {COLORS['accent_dark']};
+                border-color: {COLORS['accent']};
             }}
         """)
         notice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.history_trim_notice = notice
         self.add_chat_widget(notice)
 
     def add_context_compaction_notice(self):
@@ -13598,6 +14286,13 @@ class ChatPage(QWidget):
         self.chat_layout.insertWidget(index, widget, 0, alignment)
         if animate:
             animate_widget_in(widget)
+
+    def add_restored_chat_widget(self, widget: QWidget, insert_index: Optional[int] = None) -> Optional[int]:
+        if insert_index is None:
+            self.add_chat_widget(widget)
+            return None
+        self.insert_chat_widget(insert_index, widget)
+        return insert_index + 1
 
     def update_user_bubble_widths(self):
         if not hasattr(self, "chat_layout"):
@@ -13676,6 +14371,33 @@ class ChatPage(QWidget):
             bar.setValue(bar.maximum())
         finally:
             QTimer.singleShot(0, self.clear_programmatic_chat_scroll)
+
+    def force_scroll_to_bottom(self):
+        self.history_force_bottom_until = max(self.history_force_bottom_until, time.time() + 0.9)
+        self.chat_scroll_user_controlled = False
+        self.scroll_to_bottom_now()
+        for delay in (0, 30, 90, 180, 360, 700):
+            QTimer.singleShot(delay, self.force_scroll_to_bottom_once)
+
+    def force_scroll_to_bottom_once(self):
+        if time.time() > self.history_force_bottom_until and self.history_render_cursor <= 0:
+            return
+        self.chat_scroll_user_controlled = False
+        self.scroll_to_bottom_now()
+
+    def show_chat_scrollbar_temporarily(self):
+        if not hasattr(self, "scroll_area"):
+            return
+        if not self.chat_scrollbar_visible:
+            self.chat_scrollbar_visible = True
+            self.scroll_area.setStyleSheet(self.chat_scroll_area_style(True))
+        self.chat_scrollbar_fade_timer.start(900)
+
+    def hide_chat_scrollbar(self):
+        if not hasattr(self, "scroll_area"):
+            return
+        self.chat_scrollbar_visible = False
+        self.scroll_area.setStyleSheet(self.chat_scroll_area_style(False))
 
     def clear_programmatic_chat_scroll(self):
         self.chat_scroll_programmatic = False
@@ -13818,6 +14540,7 @@ class ChatPage(QWidget):
                 if self.is_automation_busy() or self.is_execution_running():
                     raise RuntimeError("当前还有任务在运行，无法新建会话。")
                 title = str((payload or {}).get("title") or (payload or {}).get("name") or "微信会话").strip() or "微信会话"
+                self.flush_history_save(wait=False)
                 self.threads = load_workspace_threads(self.project_root)
                 thread = create_workspace_thread(self.project_root, self.threads)
                 thread["title"] = title
@@ -14229,12 +14952,17 @@ class ChatPage(QWidget):
             self.finish_wechat_active_request(message or "")
     
     def on_chat_scroll_changed(self, _value: int):
+        self.show_chat_scrollbar_temporarily()
         if self.chat_scroll_programmatic:
             return
         if self.is_chat_at_bottom():
             self.chat_scroll_user_controlled = False
         else:
             self.chat_scroll_user_controlled = True
+
+    def on_chat_scroll_range_changed(self, _minimum: int, _maximum: int):
+        if self.history_render_cursor > 0 or time.time() <= self.history_force_bottom_until:
+            self.force_scroll_to_bottom_once()
 
     def schedule_ensure_ai_response_entry(self):
         if self.automation_enabled or self._ensure_ai_entry_pending or self.is_execution_running():
@@ -15152,6 +15880,47 @@ class ChatPage(QWidget):
             }}
         """
 
+    def ai_response_frame_style(self) -> str:
+        return f"""
+            QFrame#aiResponseFrame {{
+                background: {COLORS['card_ai']};
+                border: 1px solid {ai_border_color()};
+                border-radius: 16px;
+                margin: 4px 0;
+            }}
+        """
+
+    def ai_response_confirm_button_style(self) -> str:
+        return f"""
+            QPushButton {{
+                background: {COLORS['success']};
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 6px 16px;
+                font-size: 12px;
+                font-weight: 900;
+            }}
+            QPushButton:hover {{
+                background: #0f8a59;
+            }}
+        """
+
+    def refresh_ai_response_frame_style(self, frame: QFrame):
+        frame.setStyleSheet(self.ai_response_frame_style())
+        title_label = getattr(frame, "title_label", None)
+        if isinstance(title_label, QLabel):
+            title_label.setStyleSheet(f"color: {COLORS['text']}; font-weight: 900; font-size: 13px; background: transparent; border: none;")
+        hint_label = getattr(frame, "hint_label", None)
+        if isinstance(hint_label, QLabel):
+            hint_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; background: transparent; border: none;")
+        confirm_btn = getattr(frame, "confirm_btn", None)
+        if isinstance(confirm_btn, QPushButton):
+            confirm_btn.setStyleSheet(self.ai_response_confirm_button_style())
+        ai_input = getattr(frame, "ai_input", None)
+        if isinstance(ai_input, QTextEdit):
+            ai_input.setStyleSheet(self.ai_manual_input_style())
+
     def apply_chat_visual_settings(self):
         app = QApplication.instance()
         if app is not None:
@@ -15161,13 +15930,20 @@ class ChatPage(QWidget):
             self.sidebar.apply_theme_style()
         if hasattr(self, "sidebar_resize_handle"):
             self.sidebar_resize_handle.apply_theme_style()
+        if hasattr(self, "sidebar_wrapper"):
+            self.sidebar_wrapper.setStyleSheet(f"""
+                QWidget#sidebarWrapper {{
+                    background: transparent;
+                    border: none;
+                }}
+            """)
         if hasattr(self, "sidebar_btn"):
             self.sidebar_btn.setStyleSheet(f"""
                 QToolButton {{
                     background: transparent;
                     border: none;
                     color: {COLORS['accent_dark']};
-                    font-size: 20px;
+                    font-size: 18px;
                     font-weight: 800;
                     padding-top: 3px;
                 }}
@@ -15179,13 +15955,13 @@ class ChatPage(QWidget):
         if hasattr(self, "right_panel"):
             self.right_panel.setStyleSheet(f"background: {COLORS['bg']};")
         if hasattr(self, "path_title"):
-            self.path_title.setStyleSheet(f"color: {COLORS['text']}; font-size: 18px; font-weight: 900; background: transparent;")
+            self.path_title.setStyleSheet(f"color: {COLORS['text']}; font-size: 17px; font-weight: 900; background: transparent;")
         if hasattr(self, "path_label"):
             self.path_label.setStyleSheet(f"""
                 QLabel {{
                     color: {COLORS['text_secondary']};
                     font-size: 12px;
-                    padding: 8px 12px;
+                    padding: 7px 12px;
                     background: {COLORS['surface']};
                     border: 1px solid {COLORS['border']};
                     border-radius: 12px;
@@ -15238,39 +16014,12 @@ class ChatPage(QWidget):
                 }}
             """)
         if hasattr(self, "chat_container"):
-            self.chat_container.setStyleSheet(f"background: {COLORS['surface']}; border-radius: 18px;")
+            self.chat_container.setStyleSheet("background: transparent; border: none;")
         if hasattr(self, "chat_column"):
-            self.chat_column.setStyleSheet(f"background: {COLORS['surface']};")
+            self.chat_column.setStyleSheet("background: transparent; border: none;")
         if hasattr(self, "scroll_area"):
-            self.scroll_area.setStyleSheet(f"""
-                QScrollArea {{
-                    background: {COLORS['surface']};
-                    border: 1px solid {COLORS['border']};
-                    border-radius: 18px;
-                }}
-                QScrollArea QWidget#qt_scrollarea_viewport {{
-                    background: {COLORS['surface']};
-                    border-radius: 18px;
-                }}
-                QScrollArea > QWidget > QWidget {{
-                    background: {COLORS['surface']};
-                    border-radius: 18px;
-                }}
-                QScrollBar:vertical {{
-                    background: transparent;
-                    width: 8px;
-                    margin: 6px 2px 6px 0;
-                }}
-                QScrollBar::handle:vertical {{
-                    background: {COLORS['border_strong']};
-                    border-radius: 4px;
-                    min-height: 30px;
-                }}
-                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-                    height: 0;
-                }}
-            """)
-            self.scroll_area.viewport().setStyleSheet(f"background: {COLORS['surface']}; border-radius: 18px;")
+            self.scroll_area.setStyleSheet(self.chat_scroll_area_style(self.chat_scrollbar_visible))
+            self.scroll_area.viewport().setStyleSheet("background: transparent; border: none;")
         if hasattr(self, "sidebar_resize_overlay"):
             self.sidebar_resize_overlay.setStyleSheet(f"""
                 QLabel {{
@@ -15324,9 +16073,7 @@ class ChatPage(QWidget):
                 widget.updateGeometry()
                 continue
             if widget is not None and widget.objectName() == "aiResponseFrame":
-                ai_input = getattr(widget, "ai_input", None)
-                if ai_input is not None:
-                    ai_input.setStyleSheet(self.ai_manual_input_style())
+                self.refresh_ai_response_frame_style(widget)
         if hasattr(self, "terminal_panel"):
             self.terminal_panel.apply_theme_style()
         if hasattr(self, "terminal_resize_handle"):
@@ -15350,6 +16097,7 @@ class ChatPage(QWidget):
         window = self.window()
         if isinstance(window, QMainWindow):
             window.setStyleSheet(f"QMainWindow {{ background: {COLORS['bg']}; }}")
+            apply_macos_titlebar_theme(window)
         self.apply_preferences_dialog_theme()
         self.update_automation_composer_state()
         if hasattr(self, "chat_column"):
@@ -16788,7 +17536,10 @@ class ChatPage(QWidget):
                     else:
                         widget.copy_text = "发送给 AI" if self.automation_enabled else "复制提示词"
                         button.setEnabled(True)
-                    button.setText(widget.copy_text)
+                    button.setText("")
+                    button.setToolTip(widget.copy_text)
+                    if hasattr(widget, "apply_copy_button_visuals"):
+                        widget.apply_copy_button_visuals()
 
     def add_status_bubble(self, text: str):
         text = str(text or "").strip()
@@ -18221,8 +18972,9 @@ class ChatPage(QWidget):
         QApplication.clipboard().setText(self.display_prompt_text(full_prompt))
         copy_btn = getattr(bubble, "copy_btn", None)
         if copy_btn is not None:
-            copy_btn.setText("已复制")
-            QTimer.singleShot(1000, lambda: copy_btn.setText(bubble.copy_text))
+            copy_btn.setText("")
+            copy_btn.setToolTip("已复制")
+            QTimer.singleShot(1000, lambda: copy_btn.setToolTip(bubble.copy_text))
         self.update_prompt_history_entry(getattr(bubble, "history_entry_id", ""), full_prompt)
 
     def send_prompt_bubble_to_provider(self, bubble: ChatBubble, full_prompt: str):
@@ -18258,7 +19010,8 @@ class ChatPage(QWidget):
             return
         if copy_btn is not None:
             copy_btn.setEnabled(False)
-            copy_btn.setText("等待 AI...")
+            copy_btn.setText("")
+            copy_btn.setToolTip("等待 AI...")
         if status_text:
             self.add_status_bubble(status_text)
         self.automation_request_serial += 1
@@ -18324,7 +19077,8 @@ class ChatPage(QWidget):
                 self.update_automation_composer_state()
                 if copy_btn is not None and not self.automation_loop_active:
                     copy_btn.setEnabled(True)
-                    copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
+                    copy_btn.setText("")
+                    copy_btn.setToolTip(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
                 if error:
                     if looks_like_provider_transient_error(error) and long_retry_round < PROVIDER_LONG_RETRY_ATTEMPTS:
                         retry_round = long_retry_round + 1
@@ -18409,7 +19163,8 @@ class ChatPage(QWidget):
                 self.stop_automation_loop("上下文压缩失败，自动化循环已暂停。", ensure_manual_entry=True)
                 if copy_btn is not None:
                     copy_btn.setEnabled(True)
-                    copy_btn.setText(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
+                    copy_btn.setText("")
+                    copy_btn.setToolTip(source_bubble.copy_text if source_bubble is not None else "发送给 AI")
                 if was_wechat_request:
                     self.add_status_bubble("微信远控上下文压缩失败，已把错误返回到微信，不弹出阻塞窗口。")
                 elif developer_error_details_enabled():
@@ -18441,7 +19196,7 @@ class ChatPage(QWidget):
         self.add_prompt_bubble(full_prompt, save=True, animate=True)
         self.scroll_to_bottom()
 
-    def add_prompt_bubble(self, full_prompt: str, save: bool = False, animate: bool = False):
+    def add_prompt_bubble(self, full_prompt: str, save: bool = False, animate: bool = False, insert_index: Optional[int] = None):
         self.hide_empty_state()
         history_entry_id = uuid.uuid4().hex if save else ""
         prompt_bubble = ChatBubble(
@@ -18462,7 +19217,10 @@ class ChatPage(QWidget):
             prompt_bubble.paste_ai_requested.connect(lambda: self.add_ai_response_frame(focus=True))
         if self.automation_loop_active and getattr(prompt_bubble, "copy_btn", None) is not None:
             prompt_bubble.copy_btn.setEnabled(False)
-        self.add_chat_widget(prompt_bubble, animate=animate)
+        if insert_index is None:
+            self.add_chat_widget(prompt_bubble, animate=animate)
+        else:
+            self.insert_chat_widget(insert_index, prompt_bubble, animate=animate)
         if save:
             self.append_history({
                 "id": history_entry_id,
@@ -18577,7 +19335,7 @@ class ChatPage(QWidget):
         self.history_save_dirty = False
         self.history_save_generation += 1
         generation = self.history_save_generation
-        entries = copy.deepcopy(self.history_entries)
+        entries = [dict(entry) for entry in self.history_entries]
         worker = HistorySaveWorker(self.project_root, self.thread_id, entries, generation)
         self.history_save_worker = worker
         self.history_save_workers.append(worker)
@@ -18588,15 +19346,17 @@ class ChatPage(QWidget):
             worker.wait(3000)
             QApplication.processEvents()
 
-    def on_history_save_finished(self, generation: int, ok: bool, tmp_path: str):
+    def on_history_save_finished(self, generation: int, thread_id: str, ok: bool, tmp_path: str):
         worker = self.history_save_worker
         if worker is not None and generation == self.history_save_generation:
             self.history_save_worker = None
         current_generation = generation == self.history_save_generation
-        if ok and current_generation and self.project_root:
+        thread_id = safe_thread_id(thread_id)
+        deleted_generation = int(self.deleted_thread_save_generations.get(thread_id, -1))
+        if ok and current_generation and self.project_root and generation > deleted_generation:
             try:
-                os.makedirs(history_dir(self.project_root, self.thread_id), exist_ok=True)
-                os.replace(tmp_path, history_path(self.project_root, self.thread_id))
+                os.makedirs(history_dir(self.project_root, thread_id), exist_ok=True)
+                os.replace(tmp_path, history_path(self.project_root, thread_id))
             except OSError:
                 ok = False
         elif tmp_path:
@@ -18606,7 +19366,7 @@ class ChatPage(QWidget):
             except OSError:
                 pass
         if not ok and current_generation:
-            logger.warning("History save failed generation=%d thread_id=%s", generation, self.thread_id)
+            logger.warning("History save failed generation=%d thread_id=%s", generation, thread_id)
         if self.history_save_dirty:
             self.history_save_timer.start(300)
 
@@ -18633,9 +19393,46 @@ class ChatPage(QWidget):
         QApplication.processEvents()
 
     def load_history(self):
-        self.flush_history_save(wait=True)
+        self.flush_history_save(wait=False)
         started = time.perf_counter()
-        self.history_entries = load_workspace_history(self.project_root, self.thread_id)
+        self.history_load_serial += 1
+        serial = self.history_load_serial
+        thread_id = self.thread_id
+        self.history_render_entries = []
+        self.history_render_index = 0
+        self.history_hidden_entries = []
+        self.history_expand_cursor = 0
+        self.history_expand_pending = False
+        self.history_trim_notice = None
+        self.setUpdatesEnabled(False)
+        try:
+            self.clear_chat_widgets()
+            self.hide_empty_state()
+            loading = QLabel("正在加载会话...")
+            loading.setObjectName("historyLoadingNotice")
+            loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            loading.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none; font-size: 12px; padding: 24px;")
+            self.add_chat_widget(loading)
+        finally:
+            self.setUpdatesEnabled(True)
+        worker = HistoryLoadWorker(self.project_root, thread_id, serial)
+        self.history_load_worker = worker
+        self.history_load_workers.append(worker)
+        worker.finished_signal.connect(self.on_history_load_finished)
+        worker.finished.connect(lambda w=worker: self.cleanup_history_load_worker(w))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if elapsed_ms >= 250:
+            logger.warning("History load kickoff slow thread_id=%s elapsed_ms=%d", thread_id, elapsed_ms)
+
+    def on_history_load_finished(self, serial: int, thread_id: str, entries: List[Dict[str, object]], error: str):
+        if serial != self.history_load_serial or safe_thread_id(thread_id) != self.thread_id:
+            return
+        started = time.perf_counter()
+        if error:
+            logger.warning("History load failed thread_id=%s error=%s", thread_id, error)
+        self.history_entries = entries
         self.setUpdatesEnabled(False)
         try:
             self.clear_chat_widgets()
@@ -18644,36 +19441,144 @@ class ChatPage(QWidget):
                     self.show_automation_composer(focus=False)
                 else:
                     self.ensure_initial_prompt_bubble()
-                self.scroll_to_bottom()
+                self.force_scroll_to_bottom()
                 return
             self.hide_empty_state()
             render_entries = self.history_entries[-CHAT_HISTORY_INITIAL_RENDER_ENTRIES:]
+            self.history_hidden_entries = self.history_entries[:-len(render_entries)] if render_entries else list(self.history_entries)
             hidden_count = max(0, len(self.history_entries) - len(render_entries))
             self.add_history_trim_notice(hidden_count)
-            for entry in render_entries:
-                self.restore_history_entry(entry)
-            if self.automation_enabled:
-                self.remove_ai_response_frame()
-                self.remove_empty_automation_prompt_bubbles()
-                self.show_automation_composer(focus=False)
-            elif any(entry.get("type") != "prompt" for entry in self.history_entries):
-                self.ensure_ai_response_entry(focus=False, animate=False, keep_visible=False)
-            self.scroll_to_bottom()
+            self.history_render_entries = list(render_entries)
+            self.history_render_index = 0
+            self.history_render_cursor = len(self.history_render_entries)
+            self.history_render_insert_index = self.chat_layout.count()
+            self.history_render_started_at = time.perf_counter()
+            QTimer.singleShot(0, self.render_next_history_batch)
         finally:
             self.setUpdatesEnabled(True)
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             if elapsed_ms >= 250:
-                logger.warning(
-                    "History load timing entries=%d rendered=%d elapsed_ms=%d",
-                    len(self.history_entries),
-                    min(len(self.history_entries), CHAT_HISTORY_INITIAL_RENDER_ENTRIES),
-                    elapsed_ms,
-                )
+                logger.warning("History load apply slow entries=%d elapsed_ms=%d", len(self.history_entries), elapsed_ms)
+
+    def render_next_history_batch(self):
+        if not self.history_render_entries:
+            return
+        if self.history_render_cursor <= 0:
+            self.finish_history_render()
+            return
+        started = time.perf_counter()
+        end_index = self.history_render_cursor
+        start_index = max(0, end_index - CHAT_HISTORY_RENDER_BATCH_SIZE)
+        insert_index = self.history_render_insert_index
+        self.setUpdatesEnabled(False)
+        try:
+            for entry in self.history_render_entries[start_index:end_index]:
+                next_index = self.restore_history_entry(entry, insert_index=insert_index)
+                if next_index is not None:
+                    insert_index = next_index
+        finally:
+            self.setUpdatesEnabled(True)
+        self.history_render_cursor = start_index
+        self.history_render_index = len(self.history_render_entries) - self.history_render_cursor
+        self.force_scroll_to_bottom()
+        if self.history_render_cursor <= 0:
+            self.finish_history_render()
+            return
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        delay = 0 if elapsed_ms < 24 else 16
+        QTimer.singleShot(delay, self.render_next_history_batch)
+
+    def finish_history_render(self):
+        if self.automation_enabled:
+            self.remove_ai_response_frame()
+            self.remove_empty_automation_prompt_bubbles()
+            self.show_automation_composer(focus=False)
+        elif any(entry.get("type") != "prompt" for entry in self.history_entries):
+            self.ensure_ai_response_entry(focus=False, animate=False, keep_visible=False)
+        self.force_scroll_to_bottom()
+        elapsed_ms = int((time.perf_counter() - self.history_render_started_at) * 1000) if self.history_render_started_at else 0
+        if elapsed_ms >= 250:
+            logger.warning(
+                "History render timing entries=%d rendered=%d elapsed_ms=%d",
+                len(self.history_entries),
+                min(len(self.history_entries), CHAT_HISTORY_INITIAL_RENDER_ENTRIES),
+                elapsed_ms,
+            )
+        self.history_render_entries = []
+        self.history_render_index = 0
+        self.history_render_cursor = 0
+        self.history_render_insert_index = 0
+        self.history_render_started_at = 0.0
+        if self.history_expand_pending:
+            self.history_expand_pending = False
+            QTimer.singleShot(0, self.expand_hidden_history)
+
+    def expand_hidden_history(self):
+        if not self.history_hidden_entries:
+            return
+        if self.history_render_cursor > 0:
+            self.history_expand_pending = True
+            notice = self.history_trim_notice
+            if isinstance(notice, QPushButton):
+                notice.setText("正在加载最新历史，稍后展开较早历史...")
+                notice.setEnabled(False)
+            return
+        notice = self.history_trim_notice
+        if isinstance(notice, QPushButton):
+            try:
+                index = self.chat_layout.indexOf(notice)
+            except RuntimeError:
+                index = -1
+            if index >= 0:
+                item = self.chat_layout.takeAt(index)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+                self.history_expand_insert_index = index
+            else:
+                self.history_expand_insert_index = 0
+            self.history_trim_notice = None
+        else:
+            self.history_expand_insert_index = 0
+        self.history_expand_cursor = 0
+        QTimer.singleShot(0, self.render_next_hidden_history_batch)
+
+    def render_next_hidden_history_batch(self):
+        if self.history_expand_cursor >= len(self.history_hidden_entries):
+            self.history_hidden_entries = []
+            self.history_expand_cursor = 0
+            self.history_expand_insert_index = 0
+            return
+        end_index = min(
+            len(self.history_hidden_entries),
+            self.history_expand_cursor + CHAT_HISTORY_RENDER_BATCH_SIZE,
+        )
+        insert_index = self.history_expand_insert_index
+        self.setUpdatesEnabled(False)
+        try:
+            for entry in self.history_hidden_entries[self.history_expand_cursor:end_index]:
+                next_index = self.restore_history_entry(entry, insert_index=insert_index)
+                if next_index is not None:
+                    insert_index = next_index
+        finally:
+            self.setUpdatesEnabled(True)
+        self.history_expand_insert_index = insert_index
+        self.history_expand_cursor = end_index
+        QTimer.singleShot(16, self.render_next_hidden_history_batch)
+
+    def cleanup_history_load_worker(self, worker: HistoryLoadWorker):
+        try:
+            self.history_load_workers.remove(worker)
+        except ValueError:
+            pass
+        if self.history_load_worker is worker:
+            self.history_load_worker = None
 
     def switch_thread(self, thread_id: str):
         thread_id = safe_thread_id(thread_id)
         if thread_id == self.thread_id or self.is_execution_running() or self.is_automation_request_running():
             return
+        self.flush_history_save(wait=False)
         self.stop_automation_preview(remove_bubble=True)
         if self.automation_loop_active:
             self.stop_automation_loop("", ensure_manual_entry=False)
@@ -18685,6 +19590,7 @@ class ChatPage(QWidget):
     def create_thread(self):
         if not self.project_root:
             return
+        self.flush_history_save(wait=False)
         thread = create_workspace_thread(self.project_root, self.threads)
         self.threads = load_workspace_threads(self.project_root)
         self.thread_id = str(thread.get("id", DEFAULT_THREAD_ID))
@@ -18697,6 +19603,8 @@ class ChatPage(QWidget):
         thread_id = safe_thread_id(thread_id)
         if thread_id == DEFAULT_THREAD_ID:
             return
+        if thread_id in self.pending_delete_thread_ids:
+            return
         thread = next((item for item in self.threads if item.get("id") == thread_id), None)
         title = str(thread.get("title", "这个会话")) if thread else "这个会话"
         ok = styled_confirm(
@@ -18708,9 +19616,28 @@ class ChatPage(QWidget):
         )
         if not ok:
             return
-        if not delete_workspace_thread(self.project_root, thread_id, self.threads):
+        self.pending_delete_thread_ids.add(thread_id)
+        self.deleted_thread_save_generations[thread_id] = self.history_save_generation
+        if self.thread_id == thread_id:
+            self.history_save_dirty = False
+            if self.history_save_timer.isActive():
+                self.history_save_timer.stop()
+        worker = DeleteThreadWorker(self.project_root, thread_id, self.threads)
+        self.delete_thread_workers.append(worker)
+        worker.finished_signal.connect(self.on_delete_thread_finished)
+        worker.finished.connect(lambda w=worker: self.cleanup_delete_thread_worker(w))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def on_delete_thread_finished(self, thread_id: str, ok: bool, error: str):
+        thread_id = safe_thread_id(thread_id)
+        if not ok:
+            self.pending_delete_thread_ids.discard(thread_id)
+            self.deleted_thread_save_generations.pop(thread_id, None)
+            logger.warning("Delete thread failed thread_id=%s error=%s", thread_id, error)
             styled_warning(self, "删除失败", "无法删除这个会话缓存。")
             return
+        self.pending_delete_thread_ids.discard(thread_id)
         self.threads = load_workspace_threads(self.project_root)
         if self.thread_id == thread_id:
             self.thread_id = DEFAULT_THREAD_ID
@@ -18718,6 +19645,12 @@ class ChatPage(QWidget):
         save_last_thread_id(self.project_root, self.thread_id)
         self.sidebar.set_threads(self.threads, self.thread_id)
         self.sidebar.set_tab("threads")
+
+    def cleanup_delete_thread_worker(self, worker: DeleteThreadWorker):
+        try:
+            self.delete_thread_workers.remove(worker)
+        except ValueError:
+            pass
 
     def rename_thread(self, thread_id: str, title: str):
         thread_id = safe_thread_id(thread_id)
@@ -18733,7 +19666,7 @@ class ChatPage(QWidget):
         self.sidebar.set_threads(self.threads, self.thread_id)
         self.sidebar.set_tab("threads")
 
-    def restore_history_entry(self, entry: Dict[str, object]):
+    def restore_history_entry(self, entry: Dict[str, object], insert_index: Optional[int] = None) -> Optional[int]:
         entry_type = entry.get("type")
         if entry_type == "prompt":
             if self.automation_enabled:
@@ -18752,9 +19685,11 @@ class ChatPage(QWidget):
                     )
                     bubble.content = full_prompt
                     bubble.history_entry_id = entry.get("id")
-                    self.add_chat_widget(bubble)
+                    insert_index = self.add_restored_chat_widget(bubble, insert_index)
             else:
-                self.add_prompt_bubble(str(entry.get("content", "")), save=False, animate=False)
+                self.add_prompt_bubble(str(entry.get("content", "")), save=False, animate=False, insert_index=insert_index)
+                if insert_index is not None:
+                    insert_index += 1
         elif entry_type == "ai":
             bubble = ChatBubble(
                 "ai",
@@ -18768,7 +19703,7 @@ class ChatPage(QWidget):
                 expand_to_content=True,
                 flat=self.automation_enabled,
             )
-            self.add_chat_widget(bubble)
+            insert_index = self.add_restored_chat_widget(bubble, insert_index)
         elif entry_type == "result":
             bubble = ExecutionLogPanel(
                 str(entry.get("content", "")),
@@ -18776,7 +19711,7 @@ class ChatPage(QWidget):
                 max_content_height=210,
                 title="执行结果",
             )
-            self.add_chat_widget(bubble)
+            insert_index = self.add_restored_chat_widget(bubble, insert_index)
             records = []
             for raw_record in entry.get("changes", []) if isinstance(entry.get("changes"), list) else []:
                 record = deserialize_change_record(raw_record)
@@ -18789,7 +19724,7 @@ class ChatPage(QWidget):
                 change_card.redo_requested.connect(self.redo_changes)
                 if bool(entry.get("undone", False)):
                     change_card.mark_undone(len(records), 0)
-                self.add_chat_widget(change_card)
+                insert_index = self.add_restored_chat_widget(change_card, insert_index)
         elif entry_type == "terminal_result":
             bubble = ExecutionLogPanel(
                 str(entry.get("content", "")),
@@ -18797,7 +19732,8 @@ class ChatPage(QWidget):
                 max_content_height=210,
                 title="终端执行结果",
             )
-            self.add_chat_widget(bubble)
+            insert_index = self.add_restored_chat_widget(bubble, insert_index)
+        return insert_index
 
     def update_change_history_state(self, entry_id: str, undone: bool):
         if not entry_id:
@@ -18852,6 +19788,12 @@ class ChatPage(QWidget):
         self._shutdown_done = True
         self.flush_history_save(wait=True)
         self.wait_for_history_save_workers(timeout_ms=5000)
+        for worker in list(self.history_load_workers):
+            if worker.isRunning():
+                worker.wait(2000)
+        for worker in list(self.delete_thread_workers):
+            if worker.isRunning():
+                worker.wait(5000)
         self.stop_automation_preview(remove_bubble=False)
         try:
             self.automation_request_serial += 1
@@ -18887,14 +19829,7 @@ class ChatPage(QWidget):
         ai_frame.setObjectName("aiResponseFrame")
         ai_frame.is_closing = False
         ai_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        ai_frame.setStyleSheet(f"""
-            QFrame#aiResponseFrame {{
-                background: {COLORS['card_ai']};
-                border: 1px solid {ai_border_color()};
-                border-radius: 16px;
-                margin: 4px 0;
-            }}
-        """)
+        ai_frame.setStyleSheet(self.ai_response_frame_style())
         ai_layout = QVBoxLayout(ai_frame)
         ai_layout.setContentsMargins(16, 12, 16, 12)
         ai_layout.setSpacing(8)
@@ -18903,29 +19838,19 @@ class ChatPage(QWidget):
         title_label = QLabel("AI 回复区")
         title_label.setFixedHeight(22)
         title_label.setStyleSheet(f"color: {COLORS['text']}; font-weight: 900; font-size: 13px; background: transparent; border: none;")
+        ai_frame.title_label = title_label
         hint_label = QLabel("粘贴完整输出，包含 Bash 与后续代码块。")
         hint_label.setFixedHeight(22)
         hint_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; background: transparent; border: none;")
+        ai_frame.hint_label = hint_label
         header_row.addWidget(title_label)
         header_row.addSpacing(10)
         header_row.addWidget(hint_label)
         header_row.addStretch()
         confirm_btn = QPushButton("确定执行", clicked=lambda: self.process_ai_response(ai_frame), cursor=Qt.PointingHandCursor)
         confirm_btn.setFixedHeight(30)
-        confirm_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['success']};
-                color: white;
-                border: none;
-                border-radius: 10px;
-                padding: 6px 16px;
-                font-size: 12px;
-                font-weight: 900;
-            }}
-            QPushButton:hover {{
-                background: #0f8a59;
-            }}
-        """)
+        confirm_btn.setStyleSheet(self.ai_response_confirm_button_style())
+        ai_frame.confirm_btn = confirm_btn
         header_row.addWidget(confirm_btn)
         ai_layout.addLayout(header_row)
         
@@ -19208,12 +20133,11 @@ class ChatPage(QWidget):
             commands = extract_bash_commands(display_text, blocks)
         except ValueError as exc:
             rejection_text = f"⚠️ {exc}"
-            warning_bubble = ChatBubble(
-                "system",
+            warning_bubble = ExecutionLogPanel(
                 rejection_text,
                 parent=self.chat_container,
-                scrollable=False,
                 max_content_height=130,
+                title="执行结果",
             )
             self.add_chat_widget(warning_bubble, animate=True)
             if self.automation_loop_active:
@@ -19260,12 +20184,11 @@ class ChatPage(QWidget):
                     f"自动化循环需要继续时必须输出一个完整的 ```{runtime_environment()['command_block_lang']} "
                     f"命令块；已完成时必须输出 {AUTOMATION_DONE_MARKER} 加简短总结。"
                 )
-                warning_bubble = ChatBubble(
-                    "system",
+                warning_bubble = ExecutionLogPanel(
                     rejection_text,
                     parent=self.chat_container,
-                    scrollable=False,
                     max_content_height=140,
+                    title="执行结果",
                 )
                 self.add_chat_widget(warning_bubble, animate=True)
                 context_content = build_execution_context_content(
@@ -19280,12 +20203,11 @@ class ChatPage(QWidget):
                 self.request_next_automation_step(context_content)
                 self.scroll_to_bottom()
                 return
-            warning_bubble = ChatBubble(
-                "system",
+            warning_bubble = ExecutionLogPanel(
                 f"⚠️ 未识别到可执行命令\n请确保 AI 输出包含 ```{runtime_environment()['command_block_lang']} 代码块",
                 parent=self.chat_container,
-                scrollable=False,
                 max_content_height=110,
+                title="执行结果",
             )
             self.add_chat_widget(warning_bubble, animate=True)
             self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
@@ -19327,6 +20249,16 @@ class ChatPage(QWidget):
     
     def on_output(self, output: str):
         self.cmd_outputs.append(output)
+        self.cmd_output_render_dirty = True
+        if not self.cmd_output_render_timer.isActive():
+            self.cmd_output_render_timer.start(120)
+
+    def flush_command_output_render(self):
+        if not self.cmd_output_render_dirty:
+            return
+        self.cmd_output_render_dirty = False
+        if self.result_bubble is None:
+            return
         self.result_bubble.update_content('\n'.join(self.cmd_outputs))
     
     def on_long_running(self, cmd: str, cwd: str, name: str, launch_reason: str = "long_running_pattern", kind: str = "unknown"):
@@ -19408,6 +20340,7 @@ class ChatPage(QWidget):
         })
     
     def on_finished(self, full_log: str):
+        self.flush_command_output_render()
         worker = self.worker
         self.worker = None
         if worker is not None:
@@ -19608,6 +20541,10 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.chat_page)
         
         self.stack.setCurrentWidget(self.home_page)
+        QTimer.singleShot(0, self.apply_native_chrome_theme)
+
+    def apply_native_chrome_theme(self):
+        apply_macos_titlebar_theme(self)
     
     def open_chat(self, path: str):
         self.stack.setCurrentWidget(self.chat_page)
