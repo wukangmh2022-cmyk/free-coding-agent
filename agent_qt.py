@@ -7732,29 +7732,42 @@ class WebResearchWorker(QThread):
         self.thread_id = thread_id
         self.thinking_enabled = thinking_enabled
         self.expert_mode_enabled = expert_mode_enabled
+        self._started_at = 0.0
+
+    def emit_status(self, message: str):
+        elapsed = ""
+        if self._started_at:
+            elapsed = f"+{time.perf_counter() - self._started_at:.1f}s "
+        self.status_signal.emit(f"{elapsed}{message}")
 
     def run(self):
         try:
+            self._started_at = time.perf_counter()
             search_outputs: List[str] = []
-            for query in self.queries[:3]:
+            total_queries = len(self.queries[:3])
+            self.emit_status(f"网页搜索任务开始：{total_queries} 个查询")
+            for index, query in enumerate(self.queries[:3], start=1):
                 if self.isInterruptionRequested():
                     search_outputs.append(f"网页搜索：{query}\n已停止后续搜索。")
                     break
                 try:
-                    if platform.system() == "Windows":
-                        self.status_signal.emit(f"网页搜索进行中：{query}")
+                    self.emit_status(f"[{index}/{total_queries}] 开始搜索：{query}")
                     summary = self.manager.web_research(
                         query,
                         self.model,
                         self.thread_id,
                         thinking_enabled=self.thinking_enabled,
                         expert_mode_enabled=self.expert_mode_enabled,
-                        retry_callback=self.status_signal.emit,
+                        retry_callback=self.emit_status,
+                        progress_callback=self.emit_status,
                     )
+                    self.emit_status(f"[{index}/{total_queries}] 搜索完成：{query}")
                     search_outputs.append(f"网页搜索：{query}\n{summary}".strip())
                 except Exception as exc:
+                    self.emit_status(f"[{index}/{total_queries}] 搜索失败：{exc}")
                     search_outputs.append(f"网页搜索：{query}\n搜索失败：{exc}".strip())
             output_text = "\n\n".join(part for part in search_outputs if part).strip() or "网页搜索未返回结果。"
+            self.emit_status("网页搜索任务结束，正在写回结果")
             self.finished_signal.emit(
                 terminal_extension_execution_log(self.directives, output_text),
                 "",
@@ -8327,11 +8340,21 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         timeout: int = 30,
         attempts: int = 1,
         retry_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> dict:
+        def progress(message: str):
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(message)
+            except Exception:
+                pass
+
         started = time.perf_counter()
         encode_started = time.perf_counter()
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
         encode_ms = int((time.perf_counter() - encode_started) * 1000)
+        progress(f"已构造 provider 请求：{method} {path}，请求体 {len(data or b'')} bytes，编码 {encode_ms} ms")
         request = urllib.request.Request(f"{self.base_url}{path}", data=data, method=method)
         if payload is not None:
             request.add_header("Content-Type", "application/json")
@@ -8339,14 +8362,17 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         attempts = max(1, int(attempts or 1))
         for attempt in range(1, attempts + 1):
             try:
+                progress(f"正在等待 provider 响应：{method} {path}，第 {attempt}/{attempts} 次，超时 {timeout}s")
                 http_started = time.perf_counter()
                 with opener.open(request, timeout=timeout) as response:
                     raw = response.read()
                 http_ms = int((time.perf_counter() - http_started) * 1000)
+                progress(f"provider 已返回响应：{len(raw)} bytes，HTTP 等待 {http_ms} ms")
                 decode_started = time.perf_counter()
                 decoded = json.loads(raw.decode("utf-8"))
                 decode_ms = int((time.perf_counter() - decode_started) * 1000)
                 total_ms = int((time.perf_counter() - started) * 1000)
+                progress(f"provider 响应 JSON 已解析：解析 {decode_ms} ms，总耗时 {total_ms} ms")
                 if total_ms >= 250 or encode_ms >= 80 or decode_ms >= 80:
                     logger.warning(
                         "Provider request timing method=%s path=%s request_bytes=%d response_bytes=%d encode_ms=%d http_ms=%d decode_ms=%d total_ms=%d attempt=%d/%d",
@@ -8380,7 +8406,9 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
                 if exc.code in PROVIDER_TRANSIENT_HTTP_CODES and attempt < attempts and not login_required:
                     if retry_callback is not None:
                         try:
-                            retry_callback(provider_retry_status_message(path, attempt + 1, attempts, message))
+                            retry_message = provider_retry_status_message(path, attempt + 1, attempts, message)
+                            retry_callback(retry_message)
+                            progress(retry_message)
                         except Exception:
                             pass
                     logger.warning(
@@ -8399,7 +8427,9 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
                 if attempt < attempts:
                     if retry_callback is not None:
                         try:
-                            retry_callback(provider_retry_status_message(path, attempt + 1, attempts, str(exc)))
+                            retry_message = provider_retry_status_message(path, attempt + 1, attempts, str(exc))
+                            retry_callback(retry_message)
+                            progress(retry_message)
                         except Exception:
                             pass
                     logger.warning(
@@ -8624,8 +8654,21 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         expert_mode_enabled: Optional[bool] = None,
         max_results: int = 5,
         retry_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
-        self.start_provider()
+        def progress(message: str):
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(message)
+            except Exception:
+                pass
+
+        started = time.perf_counter()
+        progress("检查/启动本地网页搜索 provider...")
+        provider_message = self.start_provider()
+        progress(f"{provider_message}，耗时 {int((time.perf_counter() - started) * 1000)} ms")
+        progress(f"准备网页搜索请求：max_results={max(1, int(max_results or 5))}")
         payload = self.request_json(
             "POST",
             "/v1/responses",
@@ -8650,9 +8693,12 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
             timeout=900,
             attempts=PROVIDER_REQUEST_RETRY_ATTEMPTS,
             retry_callback=retry_callback,
+            progress_callback=progress,
         )
+        progress("开始解析网页搜索响应...")
         summary = summarize_web_research_response(payload)
         if summary:
+            progress(f"网页搜索摘要已生成：{len(summary)} 字符，总耗时 {int((time.perf_counter() - started) * 1000)} ms")
             return summary
         raise RuntimeError(f"provider 网页搜索返回格式异常: {payload}")
 
@@ -16895,6 +16941,17 @@ class ChatPage(QWidget):
         self.add_chat_widget(result_bubble, animate=True)
         self.update_automation_composer_state()
         self.scroll_to_bottom()
+        progress_lines: List[str] = []
+
+        def render_web_research_progress(extra_lines: Optional[List[str]] = None) -> str:
+            status_lines = progress_lines[-80:]
+            parts = list(placeholder_lines)
+            if status_lines or extra_lines:
+                parts.extend(["", "Status:"])
+                parts.extend(status_lines)
+                if extra_lines:
+                    parts.extend(extra_lines)
+            return "\n".join(parts)
 
         def start_worker(long_retry_round: int = 0):
             worker = WebResearchWorker(
@@ -16911,7 +16968,11 @@ class ChatPage(QWidget):
 
             def on_status(message: str):
                 if self.web_research_worker is worker:
-                    self.set_status_bar_override(message, duration_ms=12000)
+                    message = str(message or "").strip()
+                    if message:
+                        progress_lines.append(message)
+                        result_bubble.update_content(render_web_research_progress())
+                        self.set_status_bar_override(message, duration_ms=12000)
 
             def on_finished(execution_text: str, error: str):
                 if self.web_research_worker is not worker:
@@ -16925,14 +16986,7 @@ class ChatPage(QWidget):
                     retry_message = f"网页搜索短重试仍未恢复，{wait_seconds} 秒后进行第 {retry_round}/{PROVIDER_LONG_RETRY_ATTEMPTS} 轮后台重试…"
                     self.set_status_bar_override(retry_message, duration_ms=min(PROVIDER_LONG_RETRY_DELAY_MS + 8000, 180000))
                     result_bubble.update_content(
-                        "\n".join(
-                            placeholder_lines
-                            + [
-                                "",
-                                f"Status:",
-                                retry_message,
-                            ]
-                        )
+                        render_web_research_progress([retry_message])
                     )
                     if self.automation_loop_active:
                         QTimer.singleShot(PROVIDER_LONG_RETRY_DELAY_MS, lambda rr=retry_round: start_worker(rr))
@@ -16943,11 +16997,19 @@ class ChatPage(QWidget):
                         cleaned_directives,
                         f"网页搜索失败：{error}",
                     )
-                result_bubble.update_content(final_text)
+                if progress_lines:
+                    final_text_for_display = (
+                        final_text
+                        + "\n\n搜索过程日志：\n"
+                        + "\n".join(progress_lines[-80:])
+                    ).strip()
+                else:
+                    final_text_for_display = final_text
+                result_bubble.update_content(final_text_for_display)
                 context_content = build_execution_context_content(final_text, [])
                 self.append_history({
                     "type": "result",
-                    "content": final_text,
+                    "content": final_text_for_display,
                     "context_content": context_content,
                     "changes": [],
                     "undone": False,
