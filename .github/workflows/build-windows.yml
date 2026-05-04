@@ -9,6 +9,7 @@ on:
     paths:
       - agent_qt.py
       - plugins/**
+      - assets/**
       - .github/workflows/build-windows.yml
 
 jobs:
@@ -107,6 +108,8 @@ jobs:
             --windowed `
             --name AgentQT `
             --add-data "plugins;plugins" `
+            --add-data "assets;assets" `
+            --icon "assets\icon-windowed.ico" `
             agent_qt.py
 
       - name: Prepare release zip

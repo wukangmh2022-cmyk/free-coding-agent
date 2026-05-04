@@ -1,5 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import sys
+
+exe_icon = 'assets/icon-windowed.ico' if sys.platform.startswith('win') else 'assets/icon-windowed.icns'
+
 
 a = Analysis(
     ['agent_qt.py'],
@@ -32,7 +36,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='assets/icon-windowed.icns',
+    icon=exe_icon,
 )
 coll = COLLECT(
     exe,
