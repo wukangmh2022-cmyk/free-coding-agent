@@ -2709,6 +2709,35 @@ def command_block_from_blocks(blocks: Dict[str, List[str]]) -> tuple[str, str]:
     return get_code_block(blocks, "bash") or "", "bash"
 
 
+def platform_command_block_parts(text: str) -> List[tuple[str, str]]:
+    """按出现顺序提取当前平台终端命令块。"""
+    parts = split_markdown_fenced_blocks(str(text or ""))
+    command_parts: List[tuple[str, str]] = []
+    if platform.system() == "Windows":
+        allowed_langs = {"powershell", "ps1", "pwsh", "cmd", "bat", "batch"}
+    else:
+        allowed_langs = {"bash", "sh", "shell", "zsh"}
+    for part in parts:
+        if part.get("type") != "code":
+            continue
+        lang = canonical_lang(str(part.get("lang") or "text"))
+        if lang not in allowed_langs:
+            continue
+        command_parts.append((str(part.get("text") or ""), lang))
+    return command_parts
+
+
+def command_blocks_from_text(text: str) -> List[tuple[str, str]]:
+    blocks = platform_command_block_parts(text)
+    if blocks:
+        return blocks
+    fallback_blocks = scan_all_code_blocks(str(text or ""))
+    command_text, command_lang = command_block_from_blocks(fallback_blocks)
+    if not command_text:
+        return []
+    return [(command_text, command_lang)]
+
+
 def terminal_extension_payload_text(raw: str) -> str:
     text = str(raw or "").strip()
     if not text:
@@ -3086,57 +3115,68 @@ def strip_terminal_extension_directives_from_command(
 
 
 def terminal_extension_directives_from_text(text: str) -> List[str]:
-    blocks = scan_all_code_blocks(str(text or ""))
-    command_text, _command_lang = command_block_from_blocks(blocks)
-    if not command_text:
-        return []
-    _cleaned, directives = strip_terminal_extension_directives_from_command(command_text)
+    directives: List[str] = []
+    for command_text, _command_lang in command_blocks_from_text(text):
+        _cleaned, block_directives = strip_terminal_extension_directives_from_command(command_text)
+        directives.extend(block_directives)
     return directives
 
 
 def strip_terminal_extension_directives_from_text(text: str) -> str:
     source = str(text or "")
-    blocks = scan_all_code_blocks(source)
-    command_text, _command_lang = command_block_from_blocks(blocks)
-    if not command_text:
-        return source
-    cleaned, directives = strip_terminal_extension_directives_from_command(command_text)
-    if not directives:
-        return source
-    return source.replace(command_text, cleaned, 1).strip()
+    updated = source
+    changed = False
+    for command_text, _command_lang in command_blocks_from_text(source):
+        cleaned, directives = strip_terminal_extension_directives_from_command(command_text)
+        if not directives:
+            continue
+        updated = updated.replace(command_text, cleaned, 1)
+        changed = True
+    return updated.strip() if changed else source
 
 
 def extract_bash_commands(text: str, blocks: Dict[str, List[str]]) -> List[str]:
     """提取当前平台命令块并替换占位符。"""
-    command_text, command_lang = command_block_from_blocks(blocks)
-    if not command_text:
+    command_blocks = command_blocks_from_text(text)
+    if not command_blocks:
         return []
-    if not command_text:
-        return []
-    command_text, _terminal_extensions = strip_terminal_extension_directives_from_command(command_text)
-    if looks_like_incomplete_terminal_extension_command(command_text):
-        raise ValueError(
-            "检测到不完整的终端扩展指令。"
-            f"请使用完整格式：{terminal_extension_usage_text()}。"
+    resolved_commands: List[str] = []
+    for command_text, command_lang in command_blocks:
+        command_text, _terminal_extensions = strip_terminal_extension_directives_from_command(command_text)
+        if looks_like_incomplete_terminal_extension_command(command_text):
+            raise ValueError(
+                "检测到不完整的终端扩展指令。"
+                f"请使用完整格式：{terminal_extension_usage_text()}。"
+            )
+        reject_internal_context_in_command_block(command_text)
+        reject_unfenced_file_placeholder_payload(text, blocks, referenced_placeholder_keys(command_text))
+        command_text = resolve_all_placeholders(command_text, blocks)
+        command_text, _terminal_extensions = strip_terminal_extension_directives_from_command(
+            command_text,
+            include_inline_warning=True,
+            command_lang=command_lang,
         )
-    reject_internal_context_in_command_block(command_text)
-    reject_unfenced_file_placeholder_payload(text, blocks, referenced_placeholder_keys(command_text))
-    command_text = resolve_all_placeholders(command_text, blocks)
-    command_text, _terminal_extensions = strip_terminal_extension_directives_from_command(
-        command_text,
-        include_inline_warning=True,
-        command_lang=command_lang,
-    )
-    if looks_like_incomplete_terminal_extension_command(command_text):
-        raise ValueError(
-            "检测到不完整的终端扩展指令。"
-            f"请使用完整格式：{terminal_extension_usage_text()}。"
-        )
-    reject_internal_context_in_command_block(command_text)
-    if command_lang == "powershell":
-        return [POWERSHELL_COMMAND_PREFIX + command_text.strip()] if command_text.strip() else []
-    command_text = command_text.strip()
-    return [command_text] if command_text else []
+        if looks_like_incomplete_terminal_extension_command(command_text):
+            raise ValueError(
+                "检测到不完整的终端扩展指令。"
+                f"请使用完整格式：{terminal_extension_usage_text()}。"
+            )
+        reject_internal_context_in_command_block(command_text)
+        command_text = command_text.strip()
+        if not command_text:
+            continue
+        if command_lang == "powershell":
+            resolved_commands.append(POWERSHELL_COMMAND_PREFIX + command_text)
+        else:
+            resolved_commands.append(command_text)
+    return resolved_commands
+
+
+def has_real_platform_command_blocks(text: str) -> bool:
+    for command_text, _command_lang in command_blocks_from_text(text):
+        if str(command_text or "").strip():
+            return True
+    return False
 
 
 DEEPSEEK_DISCLAIMER_LINE_RE = re.compile(
@@ -4523,6 +4563,14 @@ def build_automation_feedback_prompt(
     clipped_previous_ai = sanitize_automation_prompt_material(truncate_middle(str(previous_ai_response or "").strip(), 4000))
     env = runtime_environment()
     command_block_lang = env["command_block_lang"]
+    schedule_followup_note = ""
+    if "【定时计划触发】" in goal_text:
+        schedule_followup_note = (
+            "\n- 当前任务来自一次“定时计划触发/立即执行”。这类任务的目标是：完成这一次触发即可，不是持续循环执行。"
+            "如果上一轮命令已经成功产出用户要的结果，且没有新的错误、缺失文件、发送失败或未完成动作，"
+            f"本轮就应该直接输出 `{AUTOMATION_DONE_MARKER}` 加最终总结，不要重复执行同一查询、同一脚本或同一接口请求。"
+            "只有当上一轮执行失败、结果为空、数据不可信、格式不符合要求，或还缺少明确的收尾动作（例如发送文件/回传结论）时，才继续输出新的命令块。"
+        )
     web_research_followup_note = ""
     log_text = str(execution_log or "")
     if "web research " in log_text.lower() or "AGENT_WEB_RESEARCH" in log_text:
@@ -4615,6 +4663,7 @@ def build_automation_feedback_prompt(
 - 后台安装/构建/拉取不要当作完成；启动常驻命令时不要加 `&`/`nohup`，等执行结果给出 `Terminal processes:` 摘要后，再使用 `curl -s 'http://127.0.0.1:8798/terminallogs?pid=xxx'` 查询控制台输出。
 - 对下载、联网 HTTP 调用、安装、构建、长时间生成等任务，如果已经转入后台或暂时无输出，不要立刻换方案。优先先等待一小段合理时间，并主动查看终端/后台日志；必要时可以使用短暂等待后再查询日志，确认失败后再换方案。
 - 优先修复日志错误、补齐缺失文件、做必要验证；不要重复成功步骤，不要给备用方案，不要输出 JSON/tool_calls。
+{schedule_followup_note}
 {web_research_followup_note}
 {windows_file_protocol_note}
 {wechat_completion_note}
@@ -17017,7 +17066,8 @@ class ChatPage(QWidget):
                     "undone": False,
                 })
                 if self.automation_loop_active:
-                    QTimer.singleShot(0, lambda cc=context_content: self.request_next_automation_step(cc))
+                    self.set_status_bar_override("网页搜索已完成，正在衔接下一轮处理…", duration_ms=5000)
+                    QTimer.singleShot(80, lambda cc=context_content: self.schedule_next_automation_step(cc))
                 elif self.automation_enabled:
                     self.show_automation_composer(focus=False)
                 else:
@@ -17057,8 +17107,12 @@ class ChatPage(QWidget):
             "\n\n上次成功执行摘要：\n"
             f"{last_success}\n\n"
             "如果上次已经沉淀出稳定脚本或固定方法，本次优先复用；只有失败或需求变化时再修复。"
+            "注意：这次触发只需要成功完成一次并收尾，不要在同一次计划触发里重复执行同一个查询、脚本或接口请求。"
+            f"只要本轮已经拿到符合要求的结果，就应直接输出 `{AUTOMATION_DONE_MARKER}` 加最终总结。"
         ) if last_success else (
             "\n\n如果本次需要探索、修复或生成脚本，请在成功后沉淀一个稳定脚本/固定方法；后续执行应优先复用，避免每天重复试错。"
+            "注意：一次计划触发只要求完成这一次任务。只要本轮已经拿到符合要求的结果，就应直接输出 "
+            f"`{AUTOMATION_DONE_MARKER}` 加最终总结，不要在同一次触发里继续重复执行。"
         )
         return (
             f"【定时计划触发】\n"
@@ -17218,7 +17272,7 @@ class ChatPage(QWidget):
         prompt_text = self.schedule_execution_prompt(schedule_item)
         full_prompt = self.build_system_prompt(prompt_text)
         prompt_entry_id = self.add_automation_user_prompt_bubble(full_prompt, animate=True)
-        self.begin_automation_loop(f"定时计划：{title}")
+        self.begin_automation_loop(prompt_text)
         self.start_automation_worker(prompt_text, "", None, None, prompt_entry_id)
 
     def resolve_schedule_wechat_thread_id(self, preferred_thread_id: str, to_user: str = "") -> str:
@@ -18987,9 +19041,7 @@ class ChatPage(QWidget):
             if terminal_extension_triggers:
                 wechat_triggers = terminal_extension_triggers
                 stripped_display_text = strip_terminal_extension_directives_from_text(display_text)
-                blocks_after_strip = scan_all_code_blocks(stripped_display_text)
-                command_after_strip, _command_lang = command_block_from_blocks(blocks_after_strip)
-                has_real_command = bool((command_after_strip or "").strip())
+                has_real_command = has_real_platform_command_blocks(stripped_display_text)
                 if not has_real_command:
                     schedule_payloads, schedule_actions, schedule_errors = collect_schedule_extension_payloads(
                         "\n".join(terminal_extension_triggers)
@@ -19052,9 +19104,7 @@ class ChatPage(QWidget):
                 done_context_text = display_text
         elif self.automation_loop_active and terminal_extension_triggers:
             stripped_display_text = strip_terminal_extension_directives_from_text(display_text)
-            blocks_after_strip = scan_all_code_blocks(stripped_display_text)
-            command_after_strip, _command_lang = command_block_from_blocks(blocks_after_strip)
-            has_real_command = bool((command_after_strip or "").strip())
+            has_real_command = has_real_platform_command_blocks(stripped_display_text)
             schedule_payloads, schedule_actions, schedule_errors = collect_schedule_extension_payloads(
                 "\n".join(terminal_extension_triggers)
             )
@@ -19467,6 +19517,18 @@ class ChatPage(QWidget):
             "",
             skip_entry_id=skip_entry_id,
         )
+
+    def schedule_next_automation_step(self, log_with_changes: str, skip_entry_id: str = "", attempt: int = 1):
+        if not self.automation_loop_active:
+            return
+        if self.is_execution_running() or self.is_automation_request_running():
+            if attempt < 10:
+                self.set_status_bar_override(f"正在衔接下一轮处理（第 {attempt}/10 次检查）…", duration_ms=3000)
+                QTimer.singleShot(200, lambda lwc=log_with_changes, sid=skip_entry_id, a=attempt + 1: self.schedule_next_automation_step(lwc, sid, a))
+            else:
+                self.set_status_bar_override("下一轮自动续跑启动超时，请稍后重试或手动继续。", duration_ms=10000)
+            return
+        self.request_next_automation_step(log_with_changes, skip_entry_id=skip_entry_id)
 
     def hide_empty_state(self):
         if getattr(self, 'empty_state', None) and self.empty_state.isVisible():
