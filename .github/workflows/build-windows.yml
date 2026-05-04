@@ -9,6 +9,7 @@ on:
     paths:
       - agent_qt.py
       - plugins/**
+      - assets/**
       - .github/workflows/build-windows.yml
 
 jobs:
@@ -40,14 +41,30 @@ jobs:
         run: |
           @'
           import agent_qt
+          import re
+
+          def assert_no_readonly_automatic_variable_assignments(script):
+              readonly = {
+                  "host", "home", "pid", "pshome", "executioncontext", "error",
+                  "foreach", "input", "matches", "myinvocation", "profile",
+                  "pscmdlet", "psitem", "sender", "shellid", "stacktrace", "this",
+              }
+              assigned = {
+                  name.lower()
+                  for name in re.findall(r"(?im)^\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*=", script)
+              }
+              hits = sorted(assigned & readonly)
+              assert not hits, f"PowerShell script assigns read-only automatic variables: {hits}"
 
           runtime_cmd = agent_qt.build_python_runtime_install_command()
           assert runtime_cmd.startswith(agent_qt.POWERSHELL_COMMAND_PREFIX), runtime_cmd[:120]
           assert "$ErrorActionPreference = 'Stop'" in runtime_cmd, runtime_cmd
           assert "winget install --id Python.Python.3.12" in runtime_cmd, runtime_cmd
-          assert 'TargetDir="$BasePythonDir"' in runtime_cmd, runtime_cmd
+          assert 'TargetDir=`"$BasePythonDir`"' in runtime_cmd, runtime_cmd
+          assert "Start-Process -FilePath $installer -ArgumentList $installerArgs -Wait -PassThru" in runtime_cmd, runtime_cmd
           assert "& $BasePython -m venv $VenvDir" in runtime_cmd, runtime_cmd
           assert "Scripts" in runtime_cmd and "python.exe" in runtime_cmd, runtime_cmd
+          assert_no_readonly_automatic_variable_assignments(runtime_cmd)
 
           manager = agent_qt.AutomationProviderManager()
           plugin_cmd = manager.install_dependencies_command()
@@ -55,10 +72,12 @@ jobs:
           assert "$ErrorActionPreference = 'Stop'" in plugin_cmd, plugin_cmd
           assert "Set-Location -LiteralPath $BackendDir" in plugin_cmd, plugin_cmd
           assert "检查系统 Edge/Chrome" in plugin_cmd, plugin_cmd
-          assert 'TargetDir="$BasePythonDir"' in plugin_cmd, plugin_cmd
+          assert 'TargetDir=`"$BasePythonDir`"' in plugin_cmd, plugin_cmd
+          assert "Start-Process -FilePath $installer -ArgumentList $installerArgs -Wait -PassThru" in plugin_cmd, plugin_cmd
           assert "& $BasePython -m venv $VenvDir" in plugin_cmd, plugin_cmd
           assert "playwright install chromium" in plugin_cmd, plugin_cmd
           assert "Playwright browser OK" in plugin_cmd, plugin_cmd
+          assert_no_readonly_automatic_variable_assignments(plugin_cmd)
           shell, args = agent_qt.shell_launch_for_command(agent_qt.POWERSHELL_COMMAND_PREFIX + "Write-Host ok", script_path=r"C:\Temp\agent_qt_test.ps1")
           assert args[:4] == ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"], (shell, args)
           shell, args = agent_qt.shell_launch_for_command(r"C:\Temp\agent_qt_test.cmd", script_path=r"C:\Temp\agent_qt_test.cmd")
@@ -89,6 +108,8 @@ jobs:
             --windowed `
             --name AgentQT `
             --add-data "plugins;plugins" `
+            --add-data "assets;assets" `
+            --icon "assets\icon-windowed.ico" `
             agent_qt.py
 
       - name: Prepare release zip
@@ -150,12 +171,18 @@ jobs:
             --windowed \
             --name AgentQT \
             --add-data "plugins:plugins" \
+            --add-data "assets:assets" \
+            --icon "assets/icon-windowed.icns" \
             agent_qt.py
 
       - name: Prepare DMG
         run: |
           mkdir -p release
           cp -R dist/AgentQT.app release/AgentQT.app
+          cp assets/icon-windowed.icns release/.VolumeIcon.icns
+          if command -v SetFile >/dev/null 2>&1; then
+            SetFile -a C release
+          fi
           cp README.md release/README.md
           cp LICENSE release/LICENSE
           cat > release/MACOS-README.txt <<'EOF'

@@ -135,6 +135,40 @@ DEFAULT_STOP_GENERATION_SELECTORS = (
     '[aria-label*="Stop generating" i]',
     '[title*="Stop generating" i]',
 )
+LOGIN_REQUIRED_MESSAGE = (
+    "DeepSeek Web 尚未登录。请在 Agent Qt 设置里点击“打开网页登录”，"
+    "登录完成后保持页面在聊天界面，再重新发送。"
+)
+LOGIN_URL_MARKERS = (
+    "/login",
+    "/sign",
+    "/signin",
+    "/auth",
+    "passport",
+    "oauth",
+)
+LOGIN_TEXT_MARKERS = (
+    "sign in to continue",
+    "log in to continue",
+    "please sign in",
+    "please log in",
+    "please login",
+    "login required",
+    "请先登录",
+    "请登录",
+    "登录后继续",
+    "登录以继续",
+    "扫码登录",
+    "验证码登录",
+)
+LOGIN_CONTROL_MARKERS = (
+    "sign in",
+    "log in",
+    "login",
+    "请登录",
+    "扫码登录",
+    "验证码登录",
+)
 THINKING_TOGGLE_TOKENS: tuple[tuple[str, int], ...] = (
     ("深度思考", 240),
     ("deepthink", 220),
@@ -3774,7 +3808,9 @@ class DeepSeekWebBridge:
                 )
                 try:
                     input_box = self.first_visible(page, self.input_selectors)
-                except RuntimeError:
+                except RuntimeError as exc:
+                    if self.is_login_required_error(exc):
+                        raise
                     logger.warning("DeepSeek input box missing after initial page prep; trying recovery paths.")
                     recovered_input = None
                     recovery_urls = [self.url]
@@ -3789,7 +3825,9 @@ class DeepSeekWebBridge:
                             recovered_input = self.first_visible(page, self.input_selectors, timeout_ms=5000)
                             self._refresh_current_chat_url(page, persist=False)
                             break
-                        except Exception:
+                        except Exception as exc:
+                            if self.is_login_required_error(exc):
+                                raise
                             logger.debug("DeepSeek input recovery path failed url=%s", recovery_url, exc_info=True)
                             recovered_input = None
                     if recovered_input is None:
@@ -3828,6 +3866,7 @@ class DeepSeekWebBridge:
                     if trace is not None:
                         trace.mark("prompt_filled")
                     logger.warning("DeepSeek submit_prompt prompt filled prompt_chars=%d", len(prompt))
+                    self.raise_if_login_required(page)
                     if not self.try_submit(page, input_box, trace=trace):
                         raise RuntimeError("Failed to submit prompt to DeepSeek web UI.")
                     if not self.confirm_submission_started(
@@ -3838,6 +3877,7 @@ class DeepSeekWebBridge:
                         transport_capture=transport_capture,
                         trace=trace,
                     ):
+                        self.raise_if_login_required(page)
                         logger.warning("DeepSeek submit did not start generation; retrying once.")
                         if trace is not None:
                             trace.mark("submit_retry_started")
@@ -3851,6 +3891,7 @@ class DeepSeekWebBridge:
                             transport_capture=transport_capture,
                             trace=trace,
                         ):
+                            self.raise_if_login_required(page)
                             raise RuntimeError(
                                 "DeepSeek submit button was clicked, but the web page stayed idle. "
                                 "The DeepSeek Web page may have rejected an overlong message; reduce the prompt/history size and retry."
@@ -5229,6 +5270,29 @@ class DeepSeekWebBridge:
                 locator = page.locator(selector).last
                 try:
                     if locator.is_visible(timeout=per_selector_timeout_ms):
+                        try:
+                            if locator.evaluate(
+                                """(node) => {
+                                    const text = [
+                                        node.getAttribute('placeholder'),
+                                        node.getAttribute('aria-label'),
+                                        node.getAttribute('title'),
+                                        node.innerText,
+                                        node.textContent,
+                                    ].join(' ').toLowerCase();
+                                    return text.includes('sign in')
+                                        || text.includes('log in')
+                                        || text.includes('login')
+                                        || text.includes('请登录')
+                                        || text.includes('扫码登录')
+                                        || text.includes('验证码登录');
+                                }"""
+                            ):
+                                raise RuntimeError(LOGIN_REQUIRED_MESSAGE)
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            pass
                         return locator
                 except PlaywrightTimeoutError:
                     continue
@@ -5237,8 +5301,9 @@ class DeepSeekWebBridge:
             if time.monotonic() >= deadline:
                 break
             page.wait_for_timeout(poll_interval_ms)
+        self.raise_if_login_required(page)
         raise RuntimeError(
-            "DeepSeek input box not found. Please login in the persistent browser profile and keep the page on chat view."
+            "DeepSeek input box not found. The page may still be loading or may not be on the chat view."
         )
 
     def fill_input(self, page: Page, input_box: Locator, prompt: str) -> None:
@@ -5861,6 +5926,78 @@ class DeepSeekWebBridge:
                 continue
         return False
 
+    @staticmethod
+    def is_login_required_error(exc: BaseException) -> bool:
+        text = str(exc or "").lower()
+        return (
+            "尚未登录" in text
+            or "请先登录" in text
+            or "please login" in text
+            or "please log in" in text
+            or "login required" in text
+        )
+
+    def login_required_diagnostics(self, page: Page) -> dict[str, Any]:
+        try:
+            result = page.evaluate(
+                """({ urlMarkers, textMarkers, controlMarkers }) => {
+                    const lower = (value) => String(value || '').toLowerCase();
+                    const isVisible = (node) => {
+                        if (!(node instanceof HTMLElement)) return false;
+                        const style = window.getComputedStyle(node);
+                        if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
+                        const rect = node.getBoundingClientRect();
+                        return !!rect.width && !!rect.height;
+                    };
+                    const url = lower(window.location.href);
+                    const bodyText = lower(document.body ? document.body.innerText : '').slice(0, 30000);
+                    const visibleControls = Array.from(document.querySelectorAll('button,a,[role="button"]'))
+                        .filter(isVisible)
+                        .map((node) => lower([
+                            node.innerText,
+                            node.textContent,
+                            node.getAttribute('aria-label'),
+                            node.getAttribute('title'),
+                        ].join(' ')).trim())
+                        .filter(Boolean)
+                        .slice(0, 80);
+                    const visibleInputs = Array.from(document.querySelectorAll('textarea,input,[contenteditable="true"]'))
+                        .filter(isVisible)
+                        .map((node) => lower([
+                            node.getAttribute('placeholder'),
+                            node.getAttribute('aria-label'),
+                            node.getAttribute('title'),
+                        ].join(' ')).trim())
+                        .filter(Boolean)
+                        .slice(0, 30);
+                    const urlHit = urlMarkers.find((marker) => url.includes(lower(marker))) || '';
+                    const textHit = textMarkers.find((marker) => bodyText.includes(lower(marker))) || '';
+                    const inputHit = visibleInputs.find((text) => controlMarkers.some((marker) => text.includes(lower(marker)))) || '';
+                    const controlHit = visibleControls.find((text) => controlMarkers.some((marker) => text === lower(marker) || text.includes(lower(marker)))) || '';
+                    const hasChatInput = visibleInputs.some((text) => !controlMarkers.some((marker) => text.includes(lower(marker))));
+                    const loginRequired = Boolean(urlHit || inputHit || ((textHit || controlHit) && !hasChatInput));
+                    return {
+                        login_required: loginRequired,
+                        url: window.location.href,
+                        reason: urlHit ? `url:${urlHit}` : textHit ? `text:${textHit}` : inputHit ? `input:${inputHit.slice(0, 80)}` : controlHit ? `control:${controlHit.slice(0, 80)}` : '',
+                    };
+                }""",
+                {
+                    "urlMarkers": list(LOGIN_URL_MARKERS),
+                    "textMarkers": list(LOGIN_TEXT_MARKERS),
+                    "controlMarkers": list(LOGIN_CONTROL_MARKERS),
+                },
+            )
+            return result if isinstance(result, dict) else {"login_required": False, "invalid": result}
+        except Exception as exc:
+            return {"login_required": False, "error": str(exc)}
+
+    def raise_if_login_required(self, page: Page) -> None:
+        diagnostics = self.login_required_diagnostics(page)
+        if isinstance(diagnostics, dict) and diagnostics.get("login_required"):
+            reason = str(diagnostics.get("reason") or "").strip()
+            raise RuntimeError(f"{LOGIN_REQUIRED_MESSAGE} ({reason})" if reason else LOGIN_REQUIRED_MESSAGE)
+
     def input_submit_diagnostics(self, page: Page) -> dict[str, Any]:
         try:
             result = page.evaluate(
@@ -6115,6 +6252,7 @@ class DeepSeekWebBridge:
                 break
             now = time.time()
             if now - last_progress_log >= 5:
+                self.raise_if_login_required(page)
                 logger.warning(
                     "DeepSeek wait_for_response waiting for response current_count=%d current_chars=%d transport_chars=%d transport_candidates=%d can_submit=%s",
                     current_count,

@@ -1,4 +1,8 @@
-# Agent Qt
+# AgentQT / Agent Qt
+
+**AgentQT** (also written as **Agent Qt**) is a free local desktop coding agent with a Codex-like UI for web AI providers. The repository name is **free-coding-agent**.
+
+Keywords: AgentQT, Agent Qt, free-coding-agent, coding agent, AI coding agent, Codex UI, desktop agent, PySide6, Python, web AI provider, local automation.
 
 ![Agent Qt 开屏图](docs/images/agent-qt-hero.png)
 
