@@ -694,11 +694,11 @@ function Set-AgentQtPreferredPipSourceFromInstaller {{
     $installerHost = ''
     try {{ $installerHost = ([Uri]$InstallerUrl).Host.ToLowerInvariant() }} catch {{ return }}
     foreach ($row in $script:PythonInstallerPipSourceMap) {{
-        $host = ([string]$row[0]).ToLowerInvariant()
+        $installerSourceHost = ([string]$row[0]).ToLowerInvariant()
         $indexUrl = [string]$row[1]
         $trustedHosts = [string]$row[2]
-        if (-not $host -or -not $indexUrl) {{ continue }}
-        if ($installerHost -eq $host) {{
+        if (-not $installerSourceHost -or -not $indexUrl) {{ continue }}
+        if ($installerHost -eq $installerSourceHost) {{
             $args = @('-i', $indexUrl)
             foreach ($trustedHost in ($trustedHosts -split '\\s+')) {{
                 if ($trustedHost) {{
