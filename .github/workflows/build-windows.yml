@@ -59,7 +59,8 @@ jobs:
           assert runtime_cmd.startswith(agent_qt.POWERSHELL_COMMAND_PREFIX), runtime_cmd[:120]
           assert "$ErrorActionPreference = 'Stop'" in runtime_cmd, runtime_cmd
           assert "winget install --id Python.Python.3.12" in runtime_cmd, runtime_cmd
-          assert 'TargetDir="$BasePythonDir"' in runtime_cmd, runtime_cmd
+          assert 'TargetDir=`"$BasePythonDir`"' in runtime_cmd, runtime_cmd
+          assert "Start-Process -FilePath $installer -ArgumentList $installerArgs -Wait -PassThru" in runtime_cmd, runtime_cmd
           assert "& $BasePython -m venv $VenvDir" in runtime_cmd, runtime_cmd
           assert "Scripts" in runtime_cmd and "python.exe" in runtime_cmd, runtime_cmd
           assert_no_readonly_automatic_variable_assignments(runtime_cmd)
@@ -70,7 +71,8 @@ jobs:
           assert "$ErrorActionPreference = 'Stop'" in plugin_cmd, plugin_cmd
           assert "Set-Location -LiteralPath $BackendDir" in plugin_cmd, plugin_cmd
           assert "检查系统 Edge/Chrome" in plugin_cmd, plugin_cmd
-          assert 'TargetDir="$BasePythonDir"' in plugin_cmd, plugin_cmd
+          assert 'TargetDir=`"$BasePythonDir`"' in plugin_cmd, plugin_cmd
+          assert "Start-Process -FilePath $installer -ArgumentList $installerArgs -Wait -PassThru" in plugin_cmd, plugin_cmd
           assert "& $BasePython -m venv $VenvDir" in plugin_cmd, plugin_cmd
           assert "playwright install chromium" in plugin_cmd, plugin_cmd
           assert "Playwright browser OK" in plugin_cmd, plugin_cmd
