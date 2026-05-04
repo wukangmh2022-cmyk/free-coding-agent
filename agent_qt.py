@@ -18439,6 +18439,10 @@ class ChatPage(QWidget):
         if remove_bubble and self.automation_preview_bubble is not None:
             bubble = self.automation_preview_bubble
             self.automation_preview_bubble = None
+            try:
+                bubble.preview_status = None
+            except RuntimeError:
+                pass
             self.chat_layout.removeWidget(bubble)
             bubble.hide()
             bubble.setParent(None)
@@ -18512,8 +18516,19 @@ class ChatPage(QWidget):
             text = f"AI 正在回复... 已生成约 {self.automation_preview_last_chars} 字"
         else:
             text = "AI 正在回复..."
-        if status.text() != text:
-            status.setText(text)
+        try:
+            if status.text() != text:
+                status.setText(text)
+        except RuntimeError:
+            try:
+                bubble.preview_status = None
+            except RuntimeError:
+                pass
+            if self.automation_preview_bubble is bubble:
+                self.automation_preview_bubble = None
+            self.automation_preview_render_timer.stop()
+            self.automation_preview_dots_timer.stop()
+            return
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         if elapsed_ms >= 40:
             logger.warning("Automation preview status UI slow elapsed_ms=%d chars=%d", elapsed_ms, self.automation_preview_last_chars)
@@ -18546,7 +18561,14 @@ class ChatPage(QWidget):
             if previous_code_blocks > next_code_blocks:
                 return
         scroll_state = self.capture_chat_scroll_state()
-        bubble.update_content(text)
+        try:
+            bubble.update_content(text)
+        except RuntimeError:
+            if self.automation_preview_bubble is bubble:
+                self.automation_preview_bubble = None
+            self.automation_preview_render_timer.stop()
+            self.automation_preview_dots_timer.stop()
+            return
         self.automation_preview_last_rendered_text = text
         self.stabilize_chat_scroll_after_update(scroll_state)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -19285,6 +19307,13 @@ class ChatPage(QWidget):
             item = self.chat_layout.takeAt(0)
             widget = item.widget()
             if widget and widget is not self.empty_state:
+                if widget is self.automation_preview_bubble:
+                    self.automation_preview_bubble = None
+                    self.automation_preview_render_timer.stop()
+                    self.automation_preview_dots_timer.stop()
+                    self.automation_preview_pending_text = ""
+                    self.automation_preview_last_rendered_text = ""
+                    self.automation_preview_thread_id = ""
                 widget.deleteLater()
             elif widget is self.empty_state:
                 widget.setParent(None)
