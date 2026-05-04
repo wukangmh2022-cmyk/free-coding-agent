@@ -4314,7 +4314,6 @@ def looks_like_web_login_required_error(text: str) -> bool:
         "尚未登录",
         "请先登录",
         "网页登录还没有准备好",
-        "input box not found",
         "please login",
         "please log in",
         "login required",

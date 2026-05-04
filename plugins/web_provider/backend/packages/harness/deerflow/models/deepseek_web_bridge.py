@@ -165,7 +165,9 @@ LOGIN_CONTROL_MARKERS = (
     "sign in",
     "log in",
     "login",
-    "登录",
+    "请登录",
+    "扫码登录",
+    "验证码登录",
 )
 THINKING_TOGGLE_TOKENS: tuple[tuple[str, int], ...] = (
     ("深度思考", 240),
@@ -5281,7 +5283,9 @@ class DeepSeekWebBridge:
                                     return text.includes('sign in')
                                         || text.includes('log in')
                                         || text.includes('login')
-                                        || text.includes('登录');
+                                        || text.includes('请登录')
+                                        || text.includes('扫码登录')
+                                        || text.includes('验证码登录');
                                 }"""
                             ):
                                 raise RuntimeError(LOGIN_REQUIRED_MESSAGE)
@@ -5299,7 +5303,7 @@ class DeepSeekWebBridge:
             page.wait_for_timeout(poll_interval_ms)
         self.raise_if_login_required(page)
         raise RuntimeError(
-            "DeepSeek input box not found. Please login in the persistent browser profile and keep the page on chat view."
+            "DeepSeek input box not found. The page may still be loading or may not be on the chat view."
         )
 
     def fill_input(self, page: Page, input_box: Locator, prompt: str) -> None:
@@ -5963,8 +5967,6 @@ class DeepSeekWebBridge:
                             node.getAttribute('placeholder'),
                             node.getAttribute('aria-label'),
                             node.getAttribute('title'),
-                            node.innerText,
-                            node.textContent,
                         ].join(' ')).trim())
                         .filter(Boolean)
                         .slice(0, 30);
