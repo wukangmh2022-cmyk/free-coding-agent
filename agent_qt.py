@@ -584,6 +584,7 @@ def agent_runtime_env(create: bool = True) -> Dict[str, str]:
     env["PATH"] = os.pathsep.join(part for part in path_parts if part)
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
     return env
 
@@ -3252,6 +3253,15 @@ def write_temp_shell_script(cmd: str) -> str:
         newline = "\r\n"
         encoding = "utf-8-sig"
         content = strip_shell_command_marker(cmd)
+        prologue = (
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+            "$OutputEncoding = [System.Text.Encoding]::UTF8\n"
+            "$env:PYTHONUTF8 = '1'\n"
+            "$env:PYTHONIOENCODING = 'utf-8'\n"
+            "$env:PYTHONUNBUFFERED = '1'\n"
+        )
+        if "[Console]::OutputEncoding" not in "\n".join(content.splitlines()[:8]):
+            content = prologue + content
     elif platform.system() == "Windows":
         newline = "\r\n"
         encoding = "utf-8"
@@ -3365,6 +3375,8 @@ def run_shell_command_capture(cmd: str, cwd: str, timeout: int, project_root: st
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         **subprocess_no_window_kwargs(),
     )
