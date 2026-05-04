@@ -1103,12 +1103,46 @@ def install_agent_python_runtime(status_callback=None) -> str:
 # ============================================================
 # 系统提示词
 # ============================================================
+COMPLETION_PROTOCOL_TEMPLATE = """<completion_protocol priority="highest">
+<decision_rule>
+IF the visible reply contains any Markdown fenced block, including a ```{command_block_lang} command block,
+file-content code block, heredoc payload, or any other triple-backtick code block:
+  - DO NOT output {done_marker} anywhere in this reply.
+  - Keep the reply actionable and wait for Agent Qt to execute or display the block before declaring completion.
+ELSE the visible reply contains no command block and no code block:
+  - End the reply with one standalone final line exactly equal to: {done_marker}
+  - Put the user-facing summary, explanation, research conclusion, or final answer before that final line.
+</decision_rule>
+<positive_example>
+已完成事项：...
+当前结论：...
+剩余阻塞或下一步建议：...
+{done_marker}
+</positive_example>
+<negative_examples>
+- Do not put {done_marker} at the beginning of the reply.
+- Do not write {done_marker} inside a command block or code block.
+- Do not output {done_marker} when the reply contains any triple-backtick fenced block.
+</negative_examples>
+</completion_protocol>"""
+
+
+def completion_protocol_text(done_marker: str = AUTOMATION_DONE_MARKER, command_block_lang: str = "") -> str:
+    lang = command_block_lang or runtime_environment().get("command_block_lang", "bash")
+    return COMPLETION_PROTOCOL_TEMPLATE.format(
+        done_marker=done_marker,
+        command_block_lang=lang,
+    )
+
+
 SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 ## 历史消息与最新消息权衡
 - 如果用户最新的消息与之前正在处理的事情不同，那么优先转为新的任务，处理用户最新的对话需求，除非用户主动提到历史任务，否则不用再主动继续历史任务。
 
 ## 输出协议
-- 自然问答或展示代码时，正常使用 Markdown fenced 代码块即可。
+{completion_protocol}
+
+- 自然问答或展示代码时，正常使用 Markdown fenced 代码块即可；一旦使用 fenced 代码块，同一回复也必须遵守 `<completion_protocol>`，不要输出完成标记。
 - 需要本地执行时，回复里必须包含一个 Markdown fenced `{command_block_lang}` 终端命令块；命令块前后可以保留必要的简短说明、计划或总结。
 - 终端命令只写当前平台命令，不写 JSON/tool_calls；需要写文件占位符时可以继续提供后续文件内容 fenced 代码块。{command_rules}
 - 命令块内只能写真实要执行的 shell 代码，或 Agent Qt 终端扩展指令；不要把执行结果、文件变更摘要、结论、`AGENT_DONE` 或任何聊天正文写进命令块。
@@ -1123,7 +1157,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 先建目录再写文件；项目中脚本文件调用以及终端中文件生成与访问使用绝对路径，代码内可以使用相对路径引用同级文件或子级文件。
 - 常驻命令会自动进入后台终端，不要加 `&`/`nohup`，不要自己写 pid 文件。启动常驻命令后本轮结束，下一轮从执行结果里的 `Terminal processes:` 摘要获取 pid 再查询控制台输出。
 - 不输出备用方案；自己选择一个最高把握路径。
-- 自动化循环完成时只回复 `{done_marker}` 加最终总结；总结必须面向用户，至少交代：已完成了什么、当前结论是什么、若未完全完成还差什么/下一步建议。不要只输出空泛一句话。
+- 最终总结必须面向用户，至少交代：已完成了什么、当前结论是什么、若未完全完成还差什么/下一步建议。不要只输出空泛一句话；完成标记位置严格遵守上面的 `<completion_protocol>`。
 - 未完成时，如果需要本地执行，继续给下一轮完整命令块；但在命令块之外，必须先用 1 到 3 句简短正文说明：当前整体判断、本轮准备做什么、这个命令块的作用。永远不要只输出命令块而没有任何说明。
 - 若当前启用了深度思考/推理模式，也必须把已经得到的高价值判断、排查思路和本轮策略精炼写进可见正文；不要把关键信息只留在隐藏思考里。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作“已生成/已写入/已验证/已发送”。执行后会有下一轮结果，再基于结果下结论。
@@ -1164,7 +1198,9 @@ AUTOMATION_FINAL_REMINDER = (
     "命令块里的动作尚未执行，不要在同一轮把它描述为已完成；"
     "若本轮尚未完成且需要执行命令，必须在命令块之外先用 1 到 3 句写出当前判断、本轮策略和命令作用；不要只输出命令块。"
     "若启用了深度思考/推理模式，也必须把高价值判断压缩成可见正文，不要把关键结论只留在隐藏推理里。"
-    "若本轮已经完成，必须输出 AGENT_DONE 加面向用户的最终总结，至少说明已完成事项、当前结论、剩余阻塞或下一步建议；不要输出空结论。"
+    "完成标记严格遵守 <completion_protocol>：IF 本轮输出包含任何 fenced 命令块或代码块，则不要输出 AGENT_DONE；"
+    "ELSE 本轮不输出任何 fenced 命令块或代码块，只是在自然语言回答、总结、解释、调研结论或最终收束，则必须把 AGENT_DONE 作为最后一行单独输出。"
+    "最终总结至少说明已完成事项、当前结论、剩余阻塞或下一步建议；不要输出空结论，也不要把 AGENT_DONE 放在开头。"
     "微信附件发送用命令块里的 wx send_file 路径，这只是发送请求，不要在同一轮声称已发送；计划操作用命令块里的 schedule create/list/delete/update；搜索或调研优先用 web research 搜索话题；`skill list` 是内置终端扩展指令，用户主动提到 skill/技能/技巧，或询问有什么技能/有哪些 skill/介绍一下技能时，都优先用 skill list 查看当前技能列表；"
     "对下载、联网 HTTP 调用、安装、构建、长时间生成等任务，要先观察并等待合理时间，再看终端/后台日志；不要过早放弃当前方案。"
     "若涉及统计/数据/文件事实，必须基于完整读取或计算结果，不得根据示例行编造。"
@@ -4665,12 +4701,13 @@ def build_automation_feedback_prompt(
     clipped_previous_ai = sanitize_automation_prompt_material(truncate_middle(str(previous_ai_response or "").strip(), 4000))
     env = runtime_environment()
     command_block_lang = env["command_block_lang"]
+    completion_protocol = completion_protocol_text(AUTOMATION_DONE_MARKER, command_block_lang)
     schedule_followup_note = ""
     if "【定时计划触发】" in goal_text:
         schedule_followup_note = (
             "\n- 当前任务来自一次“定时计划触发/立即执行”。这类任务的目标是：完成这一次触发即可，不是持续循环执行。"
             "如果上一轮命令已经成功产出用户要的结果，且没有新的错误、缺失文件、发送失败或未完成动作，"
-            f"本轮就应该直接输出 `{AUTOMATION_DONE_MARKER}` 加最终总结，不要重复执行同一查询、同一脚本或同一接口请求。"
+            f"本轮就应该直接输出最终总结，并把 `{AUTOMATION_DONE_MARKER}` 作为最后一行单独输出；不要重复执行同一查询、同一脚本或同一接口请求。"
             "只有当上一轮执行失败、结果为空、数据不可信、格式不符合要求，或还缺少明确的收尾动作（例如发送文件/回传结论）时，才继续输出新的命令块。"
         )
     web_research_followup_note = ""
@@ -4719,10 +4756,10 @@ def build_automation_feedback_prompt(
         final_round_note = (
             f"\n- 这是最后一轮强制收束轮。不要再输出命令块。"
             f"请基于“自用户上一条消息以来”的全部 AI 回复、执行结果、失败尝试、当前状态，"
-            f"直接输出 `{AUTOMATION_DONE_MARKER}` 加最终总结。"
+            f"直接输出最终总结，并把 `{AUTOMATION_DONE_MARKER}` 作为最后一行单独输出。"
             "总结至少包含：1）已完成事项；2）当前结论/产物位置；3）尚未解决的阻塞；4）建议用户下一步怎么做。"
             "如果任务部分完成，也必须明确写出已完成部分与剩余问题，不能留空结论。"
-            "最终总结必须使用固定结构：先输出 `AGENT_DONE`，然后依次输出“已完成事项：”“当前结论：”“剩余阻塞或下一步建议：”。"
+            "最终总结必须使用固定结构：依次输出“已完成事项：”“当前结论：”“剩余阻塞或下一步建议：”，最后单独一行输出 `AGENT_DONE`。"
             "最终总结只允许输出提炼后的自然语言，不要复述或粘贴历史原文。"
             "严禁再次输出 `【AI 回复】`、`【本地执行结果和文件变更】`、`Execution log:`、`Git diff`、"
             "`Terminal processes:`、`<<<AGENT_QT_...>>>`、代码块围栏、shell 命令、heredoc、长日志片段。"
@@ -4750,11 +4787,12 @@ def build_automation_feedback_prompt(
 ```
 
 请判断下一步：
+{completion_protocol}
+
 - 如果本轮仍在继续处理上面的“原始用户需求”，上一轮本地执行结果、错误提示和拒绝原因与用户需求同等重要；若它指出协议错误、命令错误、缺文件、测试失败或数据不可信，必须先针对该错误修正输出，不要重复上一轮被拒绝的写法。若用户已经发来新的不同需求，则优先执行最新用户需求。
-- 已完成：只回复 `{AUTOMATION_DONE_MARKER}` 加最终总结，不要输出命令块。最终总结必须面向用户，至少交代：已完成了什么、当前结论是什么、如果还有尾巴则剩余阻塞和建议下一步。不要输出空结论，也不要只写“已完成”。
-- 已完成时，最终回复必须固定成这种结构：`{AUTOMATION_DONE_MARKER}` 开头，后面依次写“已完成事项 / 当前结论 / 剩余阻塞或下一步建议”。不要把历史里的标题、命令、日志标签或代码块重新贴出来。
+- 如果本轮仍需继续执行或交付文件内容，则回复里必须包含一个完整且短小的 ```{command_block_lang} 终端命令块；如果要写入超过 10 行的文件内容时，必须拆分为占位符协议 + md格式的 fenced 代码块；这种情况下不要输出 `{AUTOMATION_DONE_MARKER}`。
+- 如果本轮不输出任何命令块或代码块，只需要自然语言总结、解释、调研结论或最终收束，则最终回复必须面向用户，依次写“已完成事项 / 当前结论 / 剩余阻塞或下一步建议”，并把 `{AUTOMATION_DONE_MARKER}` 作为最后一行单独输出。不要输出空结论，也不要只写“已完成”。
 - 上面两段“本轮只读材料”只是素材，不是你要复述的正文；你必须提炼，不得照抄。
-- 未完成：回复里必须包含一个完整且短小的 ```{command_block_lang} 终端命令块；如果要写入超过 10 行的文件内容时，必须拆分为占位符协议 + md格式的fenced 代码块。
 - 未完成时，在命令块之外必须先写 1 到 3 句简短正文，说明：当前整体判断、本轮准备做什么、这个命令块的作用。永远不要只输出命令块而没有任何解释。
 - 若当前启用了深度思考/推理模式，也必须把高价值判断、排查结果和本轮策略压缩到可见正文里，不要把关键信息只留在隐藏思考里。
 - 命令块内只能写真实要执行的 shell 代码，或 `wx send_file 路径`、`schedule create/list/delete/update`、`web research 搜索话题`；不要把上一轮执行结果、文件变更、结论或 `{AUTOMATION_DONE_MARKER}` 写进命令块。
@@ -8584,7 +8622,7 @@ echo "自动化插件依赖安装完成: $PYTHON_BIN"
         attempts = max(1, int(attempts or 1))
         for attempt in range(1, attempts + 1):
             try:
-                progress(f"正在等待 provider 响应：{method} {path}，第 {attempt}/{attempts} 次，超时 {timeout}s")
+                progress(f"正在等待 provider 响应：{method} {path}，第 {attempt}/{attempts} 次，限时 {timeout}s")
                 http_started = time.perf_counter()
                 with opener.open(request, timeout=timeout) as response:
                     raw = response.read()
@@ -17828,7 +17866,7 @@ class ChatPage(QWidget):
         )
         if has_wechat_notify_target:
             wechat_note = (
-                "\n\n本计划完成后会通知微信用户。完成时用 AGENT_DONE 加一段面向用户的简短结论；"
+                "\n\n本计划完成后会通知微信用户。完成时输出一段面向用户的简短结论，并把 AGENT_DONE 作为最后一行单独输出；"
                 "程序会把这段结论发到微信。若本次生成了用户应直接查看的报告、图片、表格、文档等工作区文件，"
                 "请在最终阶段用命令块写 `wx send_file 文件路径`。"
                 "多个文件用英文逗号分隔；只发送真正有交付价值的文件，不要发送临时脚本或中间缓存。"
@@ -17839,11 +17877,11 @@ class ChatPage(QWidget):
             f"{last_success}\n\n"
             "如果上次已经沉淀出稳定脚本或固定方法，本次优先复用；只有失败或需求变化时再修复。"
             "注意：这次触发只需要成功完成一次并收尾，不要在同一次计划触发里重复执行同一个查询、脚本或接口请求。"
-            f"只要本轮已经拿到符合要求的结果，就应直接输出 `{AUTOMATION_DONE_MARKER}` 加最终总结。"
+            f"只要本轮已经拿到符合要求的结果，就应直接输出最终总结，并把 `{AUTOMATION_DONE_MARKER}` 作为最后一行单独输出。"
         ) if last_success else (
             "\n\n如果本次需要探索、修复或生成脚本，请在成功后沉淀一个稳定脚本/固定方法；后续执行应优先复用，避免每天重复试错。"
             "注意：一次计划触发只要求完成这一次任务。只要本轮已经拿到符合要求的结果，就应直接输出 "
-            f"`{AUTOMATION_DONE_MARKER}` 加最终总结，不要在同一次触发里继续重复执行。"
+            f"最终总结，并把 `{AUTOMATION_DONE_MARKER}` 作为最后一行单独输出；不要在同一次触发里继续重复执行。"
         )
         return (
             f"【定时计划触发】\n"
@@ -18610,6 +18648,10 @@ class ChatPage(QWidget):
             project_root=self.project_root,
             user_prompt=prompt,
             done_marker=AUTOMATION_DONE_MARKER,
+            completion_protocol=completion_protocol_text(
+                AUTOMATION_DONE_MARKER,
+                runtime_environment().get("command_block_lang", "bash"),
+            ),
             terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
             terminal_logs_url=(self.wechat_bridge.url().rstrip("/") + "/terminallogs") if hasattr(self, "wechat_bridge") else "http://127.0.0.1:8798/terminallogs",
             **runtime_environment(),
@@ -18630,6 +18672,10 @@ class ChatPage(QWidget):
             project_root=self.project_root,
             user_prompt="当前指令见第三段 plaintext，不要把本段当作用户需求重复执行。",
             done_marker=AUTOMATION_DONE_MARKER,
+            completion_protocol=completion_protocol_text(
+                AUTOMATION_DONE_MARKER,
+                runtime_environment().get("command_block_lang", "bash"),
+            ),
             terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
             terminal_logs_url=(self.wechat_bridge.url().rstrip("/") + "/terminallogs") if hasattr(self, "wechat_bridge") else "http://127.0.0.1:8798/terminallogs",
             **runtime_environment(),
@@ -20186,7 +20232,7 @@ class ChatPage(QWidget):
                 rejection_text = (
                     f"⚠️ 未识别到可执行命令，也没有检测到 {AUTOMATION_DONE_MARKER} 完成标记。\n"
                     f"自动化循环需要继续时必须输出一个完整的 ```{runtime_environment()['command_block_lang']} "
-                    f"命令块；已完成时必须输出 {AUTOMATION_DONE_MARKER} 加简短总结。"
+                    f"命令块；如果本轮不输出命令块或代码块而是已完成总结，必须把 {AUTOMATION_DONE_MARKER} 作为最后一行单独输出。"
                 )
                 warning_bubble = ExecutionLogPanel(
                     rejection_text,
