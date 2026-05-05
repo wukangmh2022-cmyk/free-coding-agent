@@ -2226,8 +2226,30 @@ def close_icon(color: str = "#657089", size: int = 16) -> QIcon:
 # ============================================================
 # 工具函数
 # ============================================================
+def windows_recursive_force_delete_rejection(cmd: str) -> str:
+    text = str(cmd or "")
+    absolute_path = r"(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/])"
+    delete_cmd = r"\b(?:Remove-Item|rm|del|erase|rd|rmdir)\b"
+    has_delete = re.search(delete_cmd, text, re.I)
+    has_recurse = re.search(r"(?:-(?:Recurse|r)\b|/s\b)", text, re.I)
+    has_force = re.search(r"(?:-(?:Force|fo?)\b|/q\b)", text, re.I)
+    has_absolute_path = re.search(absolute_path, text)
+    if has_delete and has_recurse and has_force and has_absolute_path:
+        return (
+            "原因：检测到强制递归删除 Windows 绝对路径，为避免误删已拦截。\n"
+            "建议：如果确认只删除工作区内的临时目录，请先用 `Get-ChildItem` 确认目标，"
+            "再改用更小范围、路径明确的 `Remove-Item -Recurse`。"
+        )
+    return ""
+
 def command_safety_rejection(cmd: str) -> str:
-    cmd = strip_shell_command_marker(cmd)
+    raw_cmd = str(cmd or "")
+    is_windows_shell = platform.system() == "Windows" or is_powershell_command(raw_cmd)
+    cmd = strip_shell_command_marker(raw_cmd)
+    if is_windows_shell:
+        rejection = windows_recursive_force_delete_rejection(cmd)
+        if rejection:
+            return rejection
     for bad in FORBIDDEN:
         if bad in cmd:
             if bad == "rm -rf /":
@@ -7988,10 +8010,11 @@ class ExecuteWorker(QThread):
                 continue
             syntax_error = validate_shell_command_syntax(cmd)
             if syntax_error:
+                command_block_lang = runtime_environment().get("command_block_lang", "bash")
                 outputs.append(
                     f"[{i}] ⛔ 命令块未执行: {display_cmd}\n"
                     f"{syntax_error}\n"
-                    "请让 AI 重新输出一个完整的 ```bash 命令块；不要继续执行被截断的片段。"
+                    f"请让 AI 重新输出一个完整的 ```{command_block_lang} 命令块；不要继续执行被截断的片段。"
                 )
                 self.output_signal.emit(outputs[-1])
                 continue
