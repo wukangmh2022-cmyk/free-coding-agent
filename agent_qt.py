@@ -51,7 +51,7 @@ except ImportError:
 
 PROMPT_BUBBLE_MARKER = "<!-- agent_qt_user_prompt:"
 AUTOMATION_DONE_MARKER = "AGENT_DONE"
-COMPLETION_LINE_RE = re.compile(r"^\s*(?:AGENT_DONE\b|AGENT_QT_DONE\b)", re.I)
+COMPLETION_LINE_RE = re.compile(r"^\s*(?:AGENT_DONE\b)", re.I)
 AGENT_HOME_DIR = os.path.expanduser(os.environ.get("AGENT_QT_HOME", "~/.agent_qt"))
 _AGENT_RUNTIME_PYTHON: Optional[str] = None
 _AGENT_RUNTIME_ERROR = ""
@@ -1104,25 +1104,26 @@ def install_agent_python_runtime(status_callback=None) -> str:
 # 系统提示词
 # ============================================================
 COMPLETION_PROTOCOL_TEMPLATE = """<completion_protocol priority="highest">
+<completion_marker>{done_marker}</completion_marker>
 <decision_rule>
 IF the visible reply contains any Markdown fenced block, including a ```{command_block_lang} command block,
 file-content code block, heredoc payload, or any other triple-backtick code block:
-  - DO NOT output {done_marker} anywhere in this reply.
+  - DO NOT output the completion marker anywhere in this reply.
   - Keep the reply actionable and wait for Agent Qt to execute or display the block before declaring completion.
 ELSE the visible reply contains no command block and no code block:
-  - End the reply with one standalone final line exactly equal to: {done_marker}
+  - End the reply with one standalone final line exactly equal to the completion marker.
   - Put the user-facing summary, explanation, research conclusion, or final answer before that final line.
 </decision_rule>
-<positive_example>
+<positive_shape>
 已完成事项：...
 当前结论：...
 剩余阻塞或下一步建议：...
-{done_marker}
-</positive_example>
+[completion marker as the final standalone line]
+</positive_shape>
 <negative_examples>
-- Do not put {done_marker} at the beginning of the reply.
-- Do not write {done_marker} inside a command block or code block.
-- Do not output {done_marker} when the reply contains any triple-backtick fenced block.
+- Do not put the completion marker at the beginning of the reply.
+- Do not write the completion marker inside a command block or code block.
+- Do not output the completion marker when the reply contains any triple-backtick fenced block.
 </negative_examples>
 </completion_protocol>"""
 
@@ -1145,7 +1146,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 自然问答或展示代码时，正常使用 Markdown fenced 代码块即可；一旦使用 fenced 代码块，同一回复也必须遵守 `<completion_protocol>`，不要输出完成标记。
 - 需要本地执行时，回复里必须包含一个 Markdown fenced `{command_block_lang}` 终端命令块；命令块前后可以保留必要的简短说明、计划或总结。
 - 终端命令只写当前平台命令，不写 JSON/tool_calls；需要写文件占位符时可以继续提供后续文件内容 fenced 代码块。{command_rules}
-- 命令块内只能写真实要执行的 shell 代码，或 Agent Qt 终端扩展指令；不要把执行结果、文件变更摘要、结论、`AGENT_DONE` 或任何聊天正文写进命令块。
+- 命令块内只能写真实要执行的 shell 代码，或 Agent Qt 终端扩展指令；不要把执行结果、文件变更摘要、结论、完成标记或任何聊天正文写进命令块。
 - 【占位符协议】：替换符只用于“命令块写文件”：命令块用 `<!-- Lang block N -->` 等带编号替换符占位；同一回复里的第 N 个同语言 fenced 代码块提供要写入的完整文件内容。不要把替换符当作待办、摘要、计划、说明或普通正文输出；命令块未引用的替换符没有意义。
 - 替换符语言必须和后续文件内容代码块语言一致；编号按“语言”分别从 1 开始，不是按所有文件全局排序。写 1 个 HTML + 1 个 CSS + 1 个 JavaScript 时应分别用 `<!-- HTML block 1 -->`、`<!-- CSS block 1 -->`、`<!-- JavaScript block 1 -->`，不要写成 HTML 1 / CSS 2 / JavaScript 3。不要用 `Game block`、`File block` 这类泛化名称。
 - 占位符正例：命令块只放 shell 和占位符，真实文件内容放在后续同编号同语言 fenced 代码块里：
@@ -1157,6 +1158,7 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 先建目录再写文件；项目中脚本文件调用以及终端中文件生成与访问使用绝对路径，代码内可以使用相对路径引用同级文件或子级文件。
 - 常驻命令会自动进入后台终端，不要加 `&`/`nohup`，不要自己写 pid 文件。启动常驻命令后本轮结束，下一轮从执行结果里的 `Terminal processes:` 摘要获取 pid 再查询控制台输出。
 - 不输出备用方案；自己选择一个最高把握路径。
+- 不要使用 Agent Qt Provider 端口 `{automation_provider_port}` 启动用户项目服务或临时 HTTP 服务；本地预览服务请改用其它空闲端口。纯静态 HTML/CSS/JS 页面优先用 `open /绝对路径/index.html` 直接打开，除非页面确实需要本地 HTTP origin。
 - 最终总结必须面向用户，至少交代：已完成了什么、当前结论是什么、若未完全完成还差什么/下一步建议。不要只输出空泛一句话；完成标记位置严格遵守上面的 `<completion_protocol>`。
 - 未完成时，如果需要本地执行，继续给下一轮完整命令块；但在命令块之外，必须先用 1 到 3 句简短正文说明：当前整体判断、本轮准备做什么、这个命令块的作用。永远不要只输出命令块而没有任何说明。
 - 若当前启用了深度思考/推理模式，也必须把已经得到的高价值判断、排查思路和本轮策略精炼写进可见正文；不要把关键信息只留在隐藏思考里。
@@ -1194,13 +1196,13 @@ AUTOMATION_FINAL_REMINDER = (
     "再做一次内部自检：当前是否需要执行命令；是否需要写入或覆盖文件；"
     "若写文件，命令块内只能放带编号占位符，文件正文必须放在后续独立 fenced 代码块；"
     "占位符尖括号内的语言必须和文件内容代码块语言一致，例如 HTML 对 html、SVG 对 svg；"
-    "命令块内不得包含执行结果、结论或 AGENT_DONE；"
+    "命令块内不得包含执行结果、结论或完成标记；"
     "命令块里的动作尚未执行，不要在同一轮把它描述为已完成；"
     "若本轮尚未完成且需要执行命令，必须在命令块之外先用 1 到 3 句写出当前判断、本轮策略和命令作用；不要只输出命令块。"
     "若启用了深度思考/推理模式，也必须把高价值判断压缩成可见正文，不要把关键结论只留在隐藏推理里。"
-    "完成标记严格遵守 <completion_protocol>：IF 本轮输出包含任何 fenced 命令块或代码块，则不要输出 AGENT_DONE；"
-    "ELSE 本轮不输出任何 fenced 命令块或代码块，只是在自然语言回答、总结、解释、调研结论或最终收束，则必须把 AGENT_DONE 作为最后一行单独输出。"
-    "最终总结至少说明已完成事项、当前结论、剩余阻塞或下一步建议；不要输出空结论，也不要把 AGENT_DONE 放在开头。"
+    "完成标记严格遵守 <completion_protocol>：IF 本轮输出包含任何 fenced 命令块或代码块，则不要输出完成标记；"
+    "ELSE 本轮不输出任何 fenced 命令块或代码块，只是在自然语言回答、总结、解释、调研结论或最终收束，则必须把完成标记作为最后一行单独输出。"
+    "最终总结至少说明已完成事项、当前结论、剩余阻塞或下一步建议；不要输出空结论，也不要把完成标记放在开头。"
     "微信附件发送用命令块里的 wx send_file 路径，这只是发送请求，不要在同一轮声称已发送；计划操作用命令块里的 schedule create/list/delete/update；搜索或调研优先用 web research 搜索话题；`skill list` 是内置终端扩展指令，用户主动提到 skill/技能/技巧，或询问有什么技能/有哪些 skill/介绍一下技能时，都优先用 skill list 查看当前技能列表；"
     "对下载、联网 HTTP 调用、安装、构建、长时间生成等任务，要先观察并等待合理时间，再看终端/后台日志；不要过早放弃当前方案。"
     "若涉及统计/数据/文件事实，必须基于完整读取或计算结果，不得根据示例行编造。"
@@ -1220,6 +1222,7 @@ DEFAULT_THREAD_ID = "default"
 HISTORY_VERSION = 1
 TERMINAL_COMPLETED_HISTORY_LIMIT = 50
 COMMAND_BACKGROUND_TIMEOUT_SECONDS = env_int("AGENT_QT_COMMAND_BACKGROUND_TIMEOUT_SECONDS", 10, minimum=3)
+TERMINAL_AUTO_CLOSE_EXITED_MS = env_int("AGENT_QT_TERMINAL_AUTO_CLOSE_EXITED_MS", 4000, minimum=0)
 PROVIDER_REQUEST_RETRY_ATTEMPTS = env_int("AGENT_QT_PROVIDER_REQUEST_RETRY_ATTEMPTS", 5, minimum=1)
 PROVIDER_LONG_RETRY_ATTEMPTS = env_int("AGENT_QT_PROVIDER_LONG_RETRY_ATTEMPTS", 5, minimum=1)
 PROVIDER_LONG_RETRY_DELAY_MS = env_int("AGENT_QT_PROVIDER_LONG_RETRY_DELAY_MS", 60000, minimum=1000)
@@ -3341,7 +3344,6 @@ def reject_internal_context_in_command_block(command_text: str):
         "===== 执行结果 =====",
         "===== AI 输出 =====",
         "AGENT_DONE",
-        "AGENT_QT_DONE",
     )
     for marker in internal_markers:
         if marker in text:
@@ -3575,7 +3577,7 @@ def run_shell_command_capture(cmd: str, cwd: str, timeout: int, project_root: st
         with open(log_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(
                 f"$ {strip_shell_command_marker(cmd)}\n"
-                f"# cwd: {cwd}\n"
+                f"# launch cwd: {cwd}\n"
                 f"# pid: {process.pid}\n"
                 f"# terminal_id: {terminal_id}\n"
             )
@@ -4256,7 +4258,7 @@ def strip_automation_done_marker(text: str) -> str:
     raw = str(text or "")
     if not raw.strip():
         return ""
-    marker_pattern = rf"(?:{re.escape(AUTOMATION_DONE_MARKER)}|AGENT_QT_DONE)"
+    marker_pattern = rf"(?:{re.escape(AUTOMATION_DONE_MARKER)})"
     marker_re = re.compile(rf"(?i)^\s*{marker_pattern}\b\s*:?\s*")
     lines: List[str] = []
     in_fence = False
@@ -4669,7 +4671,7 @@ def looks_like_provider_transient_error(error: str) -> bool:
 
 
 def sanitize_automation_prompt_material(text: str) -> str:
-    value = str(text or "")
+    value = strip_automation_done_marker(str(text or ""))
     replacements = {
         "```": "〔代码块〕",
         "<<<AGENT_QT_LOW_VALUE_CONTEXT_START": "〔低价值上下文开始",
@@ -4707,7 +4709,7 @@ def build_automation_feedback_prompt(
         schedule_followup_note = (
             "\n- 当前任务来自一次“定时计划触发/立即执行”。这类任务的目标是：完成这一次触发即可，不是持续循环执行。"
             "如果上一轮命令已经成功产出用户要的结果，且没有新的错误、缺失文件、发送失败或未完成动作，"
-            f"本轮就应该直接输出最终总结，并把 `{AUTOMATION_DONE_MARKER}` 作为最后一行单独输出；不要重复执行同一查询、同一脚本或同一接口请求。"
+            "本轮就应该直接输出最终总结，并按 <completion_protocol> 在最后一行单独输出完成标记；不要重复执行同一查询、同一脚本或同一接口请求。"
             "只有当上一轮执行失败、结果为空、数据不可信、格式不符合要求，或还缺少明确的收尾动作（例如发送文件/回传结论）时，才继续输出新的命令块。"
         )
     web_research_followup_note = ""
@@ -4718,7 +4720,7 @@ def build_automation_feedback_prompt(
             " 下一轮不要再次输出 `web research` 命令，也不要解释网页搜索工具协议；"
             "请直接把这些搜索结果当作中间线索，继续完成最初用户任务。"
             "默认把这一步视为“搜索后的继续执行阶段”，而不是完成阶段。"
-            "除非用户最初的原话明确只是在让你搜索、调研、整理或解释信息，否则这一轮不要直接输出 AGENT_DONE。"
+            "除非用户最初的原话明确只是在让你搜索、调研、整理或解释信息，否则这一轮不要直接输出完成标记。"
             "如果你认为搜索结果已经足够，请先用自然语言把当前判断、证据和接下来的完成动作说清楚，再继续原始任务。"
             "只要原始用户需求里还包含下载、生成、修改、保存、发送、验证、运行、安装、整理文件、写脚本、产出文档或任何本地工作区动作，"
             "就必须把任务视为“未完成”，继续输出下一步命令块；不能仅凭搜索结果就结束。"
@@ -4749,17 +4751,17 @@ def build_automation_feedback_prompt(
         wechat_completion_note = (
             "\n- 本轮来自微信且具备附件发送上下文。若文件已经定位、生成或验证完成且需要发回微信，"
             "下一步输出包含 `wx send_file 文件路径` 的命令块；"
-            "不要同时写 AGENT_DONE，也不要声称文件已发送。"
+            "不要同时写完成标记，也不要声称文件已发送。"
         )
     final_round_note = ""
     if force_final_summary:
         final_round_note = (
             f"\n- 这是最后一轮强制收束轮。不要再输出命令块。"
             f"请基于“自用户上一条消息以来”的全部 AI 回复、执行结果、失败尝试、当前状态，"
-            f"直接输出最终总结，并把 `{AUTOMATION_DONE_MARKER}` 作为最后一行单独输出。"
+            "直接输出最终总结，并按 <completion_protocol> 在最后一行单独输出完成标记。"
             "总结至少包含：1）已完成事项；2）当前结论/产物位置；3）尚未解决的阻塞；4）建议用户下一步怎么做。"
             "如果任务部分完成，也必须明确写出已完成部分与剩余问题，不能留空结论。"
-            "最终总结必须使用固定结构：依次输出“已完成事项：”“当前结论：”“剩余阻塞或下一步建议：”，最后单独一行输出 `AGENT_DONE`。"
+            "最终总结必须使用固定结构：依次输出“已完成事项：”“当前结论：”“剩余阻塞或下一步建议：”，最后单独一行输出完成标记。"
             "最终总结只允许输出提炼后的自然语言，不要复述或粘贴历史原文。"
             "严禁再次输出 `【AI 回复】`、`【本地执行结果和文件变更】`、`Execution log:`、`Git diff`、"
             "`Terminal processes:`、`<<<AGENT_QT_...>>>`、代码块围栏、shell 命令、heredoc、长日志片段。"
@@ -4790,12 +4792,12 @@ def build_automation_feedback_prompt(
 {completion_protocol}
 
 - 如果本轮仍在继续处理上面的“原始用户需求”，上一轮本地执行结果、错误提示和拒绝原因与用户需求同等重要；若它指出协议错误、命令错误、缺文件、测试失败或数据不可信，必须先针对该错误修正输出，不要重复上一轮被拒绝的写法。若用户已经发来新的不同需求，则优先执行最新用户需求。
-- 如果本轮仍需继续执行或交付文件内容，则回复里必须包含一个完整且短小的 ```{command_block_lang} 终端命令块；如果要写入超过 10 行的文件内容时，必须拆分为占位符协议 + md格式的 fenced 代码块；这种情况下不要输出 `{AUTOMATION_DONE_MARKER}`。
-- 如果本轮不输出任何命令块或代码块，只需要自然语言总结、解释、调研结论或最终收束，则最终回复必须面向用户，依次写“已完成事项 / 当前结论 / 剩余阻塞或下一步建议”，并把 `{AUTOMATION_DONE_MARKER}` 作为最后一行单独输出。不要输出空结论，也不要只写“已完成”。
+- 如果本轮仍需继续执行或交付文件内容，则回复里必须包含一个完整且短小的 ```{command_block_lang} 终端命令块；如果要写入超过 10 行的文件内容时，必须拆分为占位符协议 + md格式的 fenced 代码块；这种情况下不要输出完成标记。
+- 如果本轮不输出任何命令块或代码块，只需要自然语言总结、解释、调研结论或最终收束，则最终回复必须面向用户，依次写“已完成事项 / 当前结论 / 剩余阻塞或下一步建议”，并按 <completion_protocol> 在最后一行单独输出完成标记。不要输出空结论，也不要只写“已完成”。
 - 上面两段“本轮只读材料”只是素材，不是你要复述的正文；你必须提炼，不得照抄。
 - 未完成时，在命令块之外必须先写 1 到 3 句简短正文，说明：当前整体判断、本轮准备做什么、这个命令块的作用。永远不要只输出命令块而没有任何解释。
 - 若当前启用了深度思考/推理模式，也必须把高价值判断、排查结果和本轮策略压缩到可见正文里，不要把关键信息只留在隐藏思考里。
-- 命令块内只能写真实要执行的 shell 代码，或 `wx send_file 路径`、`schedule create/list/delete/update`、`web research 搜索话题`；不要把上一轮执行结果、文件变更、结论或 `{AUTOMATION_DONE_MARKER}` 写进命令块。
+- 命令块内只能写真实要执行的 shell 代码，或 `wx send_file 路径`、`schedule create/list/delete/update`、`web research 搜索话题`；不要把上一轮执行结果、文件变更、结论或完成标记写进命令块。
 - 如果执行结果提示“命令块不完整”“未闭合的 shell 引号”“unmatched quote”或 shell 语法不完整，优先判断为上一轮输出被截断；重新输出完整命令块即可。多行 `python -c "..."` 是支持的，不要仅因这类错误改写成单行脚本。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作已完成、已生成、已验证或已发送。
 - 涉及统计、表格、数据查找或文件事实时，必须完整读取/计算后再下结论；示例行只能用于判断结构，不能据此编造定量结论、模型结论或总体判断。
@@ -7136,7 +7138,7 @@ class ManagedProcess(QWidget):
         if self.interactive:
             text = (
                 f"# shell: {self.name}\n"
-                f"# cwd: {self.cwd}\n"
+                f"# launch cwd: {self.cwd}\n"
                 f"# pid: {self.process_id()}\n"
                 f"# terminal_id: {self.terminal_id}\n"
             )
@@ -7147,7 +7149,7 @@ class ManagedProcess(QWidget):
             self.output.set_input_enabled(False)
             text = (
                 f"$ {strip_shell_command_marker(self.cmd)}\n"
-                f"# cwd: {self.cwd}\n"
+                f"# launch cwd: {self.cwd}\n"
                 f"# pid: {self.process_id()}\n"
                 f"# terminal_id: {self.terminal_id}\n"
             )
@@ -7681,6 +7683,7 @@ class TerminalPanel(QWidget):
     ):
         if not interactive and (not cmd.strip() or is_interactive_shell_command(cmd)):
             return None
+        reveal_terminal = bool(interactive or self.maximumHeight() > 0)
         label = name.strip() if name.strip() else self.terminal_title(cwd, len(self.processes) + 1)
         terminal_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         log_path = os.path.join(self.logs_dir(), f"{terminal_id}-{safe_terminal_log_name(label)}.log")
@@ -7710,15 +7713,19 @@ class TerminalPanel(QWidget):
         self.tab_cards[proc] = card
         insert_at = max(0, self.tab_row.count() - 2)
         self.tab_row.insertWidget(insert_at, card)
-        self.select_process(proc)
         self.stack.setVisible(True)
         self.setVisible(True)
+        if reveal_terminal:
+            self.select_process(proc)
+            self.expand()
+        else:
+            card.set_active(False)
         self.refresh_header()
-        self.expand()
         self.write_process_registry()
         return proc
 
     def add_external_process(self, info: Dict[str, object]):
+        reveal_terminal = bool(self.maximumHeight() > 0)
         cmd = str(info.get("cmd") or "")
         cwd = str(info.get("cwd") or self.project_root or os.path.expanduser("~"))
         label = str(info.get("name") or "timeout-command")
@@ -7744,11 +7751,14 @@ class TerminalPanel(QWidget):
         self.tab_cards[proc] = card
         insert_at = max(0, self.tab_row.count() - 2)
         self.tab_row.insertWidget(insert_at, card)
-        self.select_process(proc)
         self.stack.setVisible(True)
         self.setVisible(True)
+        if reveal_terminal:
+            self.select_process(proc)
+            self.expand()
+        else:
+            card.set_active(False)
         self.refresh_header()
-        self.expand()
         self.write_process_registry()
         return proc
 
@@ -7772,6 +7782,25 @@ class TerminalPanel(QWidget):
             "log_path": proc.log_path,
             "pid": proc.process_id(),
         })
+        if (
+            TERMINAL_AUTO_CLOSE_EXITED_MS > 0
+            and not proc.interactive
+            and proc in self.processes
+        ):
+            QTimer.singleShot(
+                TERMINAL_AUTO_CLOSE_EXITED_MS,
+                lambda p=proc: self.remove_finished_process(p),
+            )
+
+    def remove_finished_process(self, proc: ManagedProcess):
+        if proc not in self.processes:
+            return
+        try:
+            if proc.is_running():
+                return
+        except RuntimeError:
+            return
+        self.remove_process(proc)
 
     def create_interactive_terminal(self):
         cwd = self.project_root or os.path.expanduser("~")
@@ -8160,7 +8189,7 @@ class AutomationProviderManager:
         self.plugin_root = automation_plugin_root()
         self.backend_dir = find_automation_backend()
         self.host = os.environ.get("AGENT_QT_AUTOMATION_HOST", "127.0.0.1")
-        self.port = int(os.environ.get("AGENT_QT_AUTOMATION_PORT", "8765"))
+        self.port = int(os.environ.get("AGENT_QT_AUTOMATION_PORT", "18765"))
         self.base_url = f"http://{self.host}:{self.port}"
         self.log_dir = os.path.join(self.plugin_root, "logs")
         self.pid_file = os.path.join(self.plugin_root, "provider.pid")
@@ -13030,6 +13059,13 @@ class Sidebar(QFrame):
             self.thread_cards[card.thread_id] = card
             self.thread_list_layout.insertWidget(self.thread_list_layout.count() - 1, card)
 
+    def scroll_threads_to_bottom(self):
+        def _scroll():
+            bar = self.thread_scroll.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        QTimer.singleShot(0, _scroll)
+        QTimer.singleShot(80, _scroll)
+
     def set_active_thread(self, thread_id: str):
         self._active_thread_id = safe_thread_id(thread_id)
         for card in self.thread_cards.values():
@@ -14561,6 +14597,8 @@ class ChatPage(QWidget):
                 self.thread_id = str(thread.get("id", DEFAULT_THREAD_ID))
                 save_last_thread_id(self.project_root, self.thread_id)
                 self.sidebar.set_threads(self.threads, self.thread_id)
+                self.sidebar.set_tab("threads")
+                self.sidebar.scroll_threads_to_bottom()
                 self.load_history()
                 self.wechat_bridge.finish_request(request_id, {"ok": True, "thread": thread, "active_thread_id": self.thread_id})
                 return
@@ -17866,7 +17904,7 @@ class ChatPage(QWidget):
         )
         if has_wechat_notify_target:
             wechat_note = (
-                "\n\n本计划完成后会通知微信用户。完成时输出一段面向用户的简短结论，并把 AGENT_DONE 作为最后一行单独输出；"
+                "\n\n本计划完成后会通知微信用户。完成时输出一段面向用户的简短结论，并按 <completion_protocol> 在最后一行单独输出完成标记；"
                 "程序会把这段结论发到微信。若本次生成了用户应直接查看的报告、图片、表格、文档等工作区文件，"
                 "请在最终阶段用命令块写 `wx send_file 文件路径`。"
                 "多个文件用英文逗号分隔；只发送真正有交付价值的文件，不要发送临时脚本或中间缓存。"
@@ -17877,11 +17915,11 @@ class ChatPage(QWidget):
             f"{last_success}\n\n"
             "如果上次已经沉淀出稳定脚本或固定方法，本次优先复用；只有失败或需求变化时再修复。"
             "注意：这次触发只需要成功完成一次并收尾，不要在同一次计划触发里重复执行同一个查询、脚本或接口请求。"
-            f"只要本轮已经拿到符合要求的结果，就应直接输出最终总结，并把 `{AUTOMATION_DONE_MARKER}` 作为最后一行单独输出。"
+            "只要本轮已经拿到符合要求的结果，就应直接输出最终总结，并按 <completion_protocol> 在最后一行单独输出完成标记。"
         ) if last_success else (
             "\n\n如果本次需要探索、修复或生成脚本，请在成功后沉淀一个稳定脚本/固定方法；后续执行应优先复用，避免每天重复试错。"
             "注意：一次计划触发只要求完成这一次任务。只要本轮已经拿到符合要求的结果，就应直接输出 "
-            f"最终总结，并把 `{AUTOMATION_DONE_MARKER}` 作为最后一行单独输出；不要在同一次触发里继续重复执行。"
+            "最终总结，并按 <completion_protocol> 在最后一行单独输出完成标记；不要在同一次触发里继续重复执行。"
         )
         return (
             f"【定时计划触发】\n"
@@ -18652,6 +18690,7 @@ class ChatPage(QWidget):
                 AUTOMATION_DONE_MARKER,
                 runtime_environment().get("command_block_lang", "bash"),
             ),
+            automation_provider_port=getattr(self.automation_manager, "port", 18765),
             terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
             terminal_logs_url=(self.wechat_bridge.url().rstrip("/") + "/terminallogs") if hasattr(self, "wechat_bridge") else "http://127.0.0.1:8798/terminallogs",
             **runtime_environment(),
@@ -18676,6 +18715,7 @@ class ChatPage(QWidget):
                 AUTOMATION_DONE_MARKER,
                 runtime_environment().get("command_block_lang", "bash"),
             ),
+            automation_provider_port=getattr(self.automation_manager, "port", 18765),
             terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
             terminal_logs_url=(self.wechat_bridge.url().rstrip("/") + "/terminallogs") if hasattr(self, "wechat_bridge") else "http://127.0.0.1:8798/terminallogs",
             **runtime_environment(),
@@ -18741,7 +18781,9 @@ class ChatPage(QWidget):
         )
 
     def summarize_automation_text(self, text: str, limit: int) -> str:
-        content = summarize_fenced_code_blocks_for_context(strip_low_value_context_blocks(str(text or "").strip()))
+        content = strip_automation_done_marker(
+            summarize_fenced_code_blocks_for_context(strip_low_value_context_blocks(str(text or "").strip()))
+        )
         if len(content) <= limit:
             return content
         lines = [line.rstrip() for line in content.splitlines() if line.strip()]
@@ -18749,7 +18791,6 @@ class ChatPage(QWidget):
             return ""
         high_signal: List[str] = []
         high_signal_patterns = (
-            AUTOMATION_DONE_MARKER,
             "Files changed:",
             "文件变更：",
             "Git diff file names:",
@@ -19646,6 +19687,7 @@ class ChatPage(QWidget):
         save_last_thread_id(self.project_root, self.thread_id)
         self.sidebar.set_threads(self.threads, self.thread_id)
         self.sidebar.set_tab("threads")
+        self.sidebar.scroll_threads_to_bottom()
         self.load_history()
 
     def delete_thread(self, thread_id: str):
@@ -19977,7 +20019,7 @@ class ChatPage(QWidget):
         if role_label is not None:
             role_label.setText("AI")
         bubble.ensure_copy_button("复制 AI 输出")
-        bubble.update_content(text)
+        bubble.update_content(strip_automation_done_marker(text))
         self.stabilize_chat_scroll_after_update(scroll_state)
         self.automation_preview_bubble = None
         return bubble
@@ -19999,8 +20041,9 @@ class ChatPage(QWidget):
             )
             self.scroll_to_bottom()
             return
-        done_response = self.automation_loop_active and is_automation_done_response(text)
-        display_text = strip_automation_done_marker(text) if done_response else text
+        has_completion_marker = is_automation_done_response(text)
+        done_response = self.automation_loop_active and has_completion_marker
+        display_text = strip_automation_done_marker(text) if has_completion_marker else text
         wechat_triggers: List[str] = []
         wechat_trigger_context_text = ""
         done_context_text = ""
@@ -20230,9 +20273,9 @@ class ChatPage(QWidget):
                     self.scroll_to_bottom()
                     return
                 rejection_text = (
-                    f"⚠️ 未识别到可执行命令，也没有检测到 {AUTOMATION_DONE_MARKER} 完成标记。\n"
+                    "⚠️ 未识别到可执行命令，也没有检测到完成标记。\n"
                     f"自动化循环需要继续时必须输出一个完整的 ```{runtime_environment()['command_block_lang']} "
-                    f"命令块；如果本轮不输出命令块或代码块而是已完成总结，必须把 {AUTOMATION_DONE_MARKER} 作为最后一行单独输出。"
+                    "命令块；如果本轮不输出命令块或代码块而是已完成总结，必须按 completion protocol 在最后一行单独输出完成标记。"
                 )
                 warning_bubble = ExecutionLogPanel(
                     rejection_text,
