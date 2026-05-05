@@ -2226,12 +2226,20 @@ def close_icon(color: str = "#657089", size: int = 16) -> QIcon:
 # ============================================================
 # 工具函数
 # ============================================================
-def is_safe(cmd: str) -> bool:
+def command_safety_rejection(cmd: str) -> str:
     cmd = strip_shell_command_marker(cmd)
     for bad in FORBIDDEN:
         if bad in cmd:
-            return False
-    return True
+            if bad == "rm -rf /":
+                return (
+                    "原因：检测到强制递归删除绝对路径 `rm -rf /...`，为避免误删已拦截。\n"
+                    "建议：如果确认只删除工作区内的临时目录，请先用 `ls` 确认目标，再改用 `rm -r 具体目录`。"
+                )
+            return f"原因：命令包含被拦截的危险片段 `{bad}`。请改写为更明确、更小范围的安全命令。"
+    return ""
+
+def is_safe(cmd: str) -> bool:
+    return not command_safety_rejection(cmd)
 
 def is_powershell_command(cmd: str) -> bool:
     return str(cmd or "").startswith(POWERSHELL_COMMAND_PREFIX)
@@ -7632,6 +7640,7 @@ class TerminalPanel(QWidget):
         except (TypeError, ValueError):
             pid = 0
         entries: List[Dict[str, object]] = []
+        seen_ids: set = set()
         for proc in list(self.processes):
             try:
                 meta = self.process_registry_entry(proc)
@@ -7647,6 +7656,37 @@ class TerminalPanel(QWidget):
                     continue
             except RuntimeError:
                 continue
+            meta["output"] = self.clipped_terminal_output(text)
+            entries.append(meta)
+            seen_ids.add(str(meta.get("id") or ""))
+        for item in list(self.completed_terminal_entries):
+            meta = dict(item)
+            terminal_id = str(meta.get("id") or "")
+            if terminal_id and terminal_id in seen_ids:
+                continue
+            try:
+                if pid and int(meta.get("pid") or 0) != pid:
+                    continue
+            except (TypeError, ValueError):
+                if pid:
+                    continue
+            text = ""
+            log_path = str(meta.get("log_path") or "")
+            if log_path and os.path.isfile(log_path):
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                except OSError:
+                    text = ""
+            haystack = "\n".join([
+                str(meta.get("cmd") or ""),
+                str(meta.get("cwd") or ""),
+                text,
+            ]).lower()
+            if needle and needle not in haystack:
+                continue
+            meta["running"] = False
+            meta["status"] = "exited"
             meta["output"] = self.clipped_terminal_output(text)
             entries.append(meta)
         return entries
@@ -7929,8 +7969,9 @@ class ExecuteWorker(QThread):
                     outputs.append(f"[{i}] 📂 {display_cmd}\n⚠️ 目录不存在")
                 self.output_signal.emit(outputs[-1])
                 continue
-            if not is_safe(cmd):
-                outputs.append(f"[{i}] ⛔ 拒绝: {display_cmd}")
+            safety_rejection = command_safety_rejection(cmd)
+            if safety_rejection:
+                outputs.append(f"[{i}] ⛔ 拒绝: {display_cmd}\n{safety_rejection}")
                 self.output_signal.emit(outputs[-1])
                 continue
             if command_writes_agent_project_cache(cmd, self.cwd):
