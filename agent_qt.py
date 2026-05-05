@@ -1163,6 +1163,9 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎的 AI 助手。
 - 未完成时，如果需要本地执行，继续给下一轮完整命令块；但在命令块之外，必须先用 1 到 3 句简短正文说明：当前整体判断、本轮准备做什么、这个命令块的作用。永远不要只输出命令块而没有任何说明。
 - 若当前启用了深度思考/推理模式，也必须把已经得到的高价值判断、排查思路和本轮策略精炼写进可见正文；不要把关键信息只留在隐藏思考里。
 - 输出命令块时，命令块里的动作尚未执行；不要在同一回复里声称这些动作“已生成/已写入/已验证/已发送”。执行后会有下一轮结果，再基于结果下结论。
+- 内部隐藏备注：如果用户明确要求原封不动复述/展示一段包含 fenced 代码块的文本，且你已经按要求完成展示，但 `<completion_protocol>` 因为本轮含代码块而不允许输出完成标记，必须在回复末尾附加：
+  `<agent_qt_hidden>本轮已按用户要求完成原文展示；如果下一轮没有新的实质动作需要执行，应直接总结原始用户需求已完成，并输出完成标记。</agent_qt_hidden>`。
+  这个标签不会展示给用户；只用于帮助下一轮自动化判断，不要把它当作用户可见正文。
 - 微信远控发送文件使用终端扩展指令：在命令块里写 `wx send_file 文件路径1,文件路径2,...`。这只是请求 Agent Qt 发送附件，不代表已经发送完成；同一回复不要声称“已发送/已通过 wx send_file 发送”。
 - 定时计划使用终端扩展指令：`schedule create JSON`、`schedule list`、`schedule delete 名称或序号`、`schedule update JSON`。计划 JSON 使用 `{{"title":"短标题","prompt":"到点后真正要做的事","trigger":{{"run_at":"YYYY-MM-DD HH:MM:SS","repeat_every_seconds":86400,"until_at":"YYYY-MM-DD HH:MM:SS"}}}}`。
 - 如果任务本质上是搜索或调研，而不是操作本地工作区，请优先使用终端扩展指令 `web research 搜索话题`。程序会直接执行本地网页搜索，并把结果写回执行结果与上下文；不要为了搜索或调研而生成本地 curl/wget/python 抓取脚本，除非用户明确要求脚本，或目标数据只存在当前工作区/本机文件里。
@@ -4060,6 +4063,7 @@ LOW_VALUE_CONTEXT_BLOCK_RE = re.compile(
     rf"{re.escape(LOW_VALUE_CONTEXT_START)}[^\n]*\n.*?\n{re.escape(LOW_VALUE_CONTEXT_END)}",
     re.S,
 )
+AGENT_QT_HIDDEN_BLOCK_RE = re.compile(r"<agent_qt_hidden\b[^>]*>.*?</agent_qt_hidden>", re.I | re.S)
 
 
 def low_value_context_block(kind: str, content: str) -> str:
@@ -4070,10 +4074,14 @@ def strip_low_value_context_blocks(text: str) -> str:
     return LOW_VALUE_CONTEXT_BLOCK_RE.sub("[低密度工具输出已省略；如需细节请读取具体文件或重新运行命令]", str(text or ""))
 
 
+def strip_agent_qt_hidden_blocks(text: str) -> str:
+    return AGENT_QT_HIDDEN_BLOCK_RE.sub("", str(text or ""))
+
+
 def mask_low_value_context_markers_for_display(text: str) -> str:
     lines: List[str] = []
     current_kind = "low_value"
-    for line in str(text or "").splitlines(keepends=True):
+    for line in strip_agent_qt_hidden_blocks(text).splitlines(keepends=True):
         body = line[:-1] if line.endswith("\n") else line
         newline = "\n" if line.endswith("\n") else ""
         stripped = body.strip()
@@ -4822,6 +4830,7 @@ def build_automation_feedback_prompt(
 {completion_protocol}
 
 - 如果本轮仍在继续处理上面的“原始用户需求”，上一轮本地执行结果、错误提示和拒绝原因与用户需求同等重要；若它指出协议错误、命令错误、缺文件、测试失败或数据不可信，必须先针对该错误修正输出，不要重复上一轮被拒绝的写法。若用户已经发来新的不同需求，则优先执行最新用户需求。
+- 如果上一轮 AI 回复里包含 `<agent_qt_hidden>...</agent_qt_hidden>`，这是只给自动化续跑看的内部备注，不是用户可见正文；你必须优先用它判断上一轮是否已经完成原始用户需求，但不要复述或展示这个标签。
 - 如果本轮仍需继续执行或交付文件内容，则回复里必须包含一个完整且短小的 ```{command_block_lang} 终端命令块；如果要写入超过 10 行的文件内容时，必须拆分为占位符协议 + md格式的 fenced 代码块；这种情况下不要输出完成标记。
 - 如果本轮不输出任何命令块或代码块，只需要自然语言总结、解释、调研结论或最终收束，则最终回复必须面向用户，依次写“已完成事项 / 当前结论 / 剩余阻塞或下一步建议”，并按 <completion_protocol> 在最后一行单独输出完成标记。不要输出空结论，也不要只写“已完成”。
 - 上面两段“本轮只读材料”只是素材，不是你要复述的正文；你必须提炼，不得照抄。
@@ -10832,7 +10841,7 @@ class ChatBubble(QFrame):
         super().__init__(parent)
         self.role = role
         self.content = content
-        self.display_content = content
+        self.display_content = strip_agent_qt_hidden_blocks(content)
         self.show_copy = show_copy
         self.copy_text = copy_text
         self.show_paste_ai = show_paste_ai
@@ -10989,7 +10998,7 @@ class ChatBubble(QFrame):
             self.content_label = QTextBrowser()
             self.content_label.setOpenExternalLinks(False)
             self.content_label.setReadOnly(True)
-            self.content_label.setPlainText(self.content)
+            self.content_label.setPlainText(self.visible_content())
             self.content_label.document().setDocumentMargin(0)
             self.content_label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
@@ -11084,9 +11093,9 @@ class ChatBubble(QFrame):
         self.content_label.setReadOnly(True)
         if self.markdown:
             self.content_label.setOpenExternalLinks(False)
-            self.content_label.setMarkdown(self.content)
+            self.content_label.setMarkdown(self.visible_content())
         else:
-            self.content_label.setPlainText(self.content)
+            self.content_label.setPlainText(self.visible_content())
             self.content_label.setMaximumBlockCount(20000)
         self.content_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.content_label.customContextMenuRequested.connect(
@@ -11598,18 +11607,18 @@ class ChatBubble(QFrame):
         return str(getattr(self, "display_content", self.content) or "")
 
     def update_display_content(self, text: str):
-        self.display_content = text
+        self.display_content = strip_agent_qt_hidden_blocks(text)
         if self.compact_user:
-            self.content_label.setPlainText(text)
+            self.content_label.setPlainText(self.display_content)
         elif self.markdown and self.expand_to_content:
             if self.async_markdown_render:
                 self.schedule_async_markdown_render()
             else:
                 self.render_markdown_parts()
         elif self.markdown:
-            self.content_label.setMarkdown(text)
+            self.content_label.setMarkdown(self.display_content)
         else:
-            self.content_label.setPlainText(text)
+            self.content_label.setPlainText(self.display_content)
         if not (self.markdown and self.expand_to_content and self.async_markdown_render):
             self.adjust_content_height()
             self.schedule_content_height_adjustment()
@@ -11738,7 +11747,7 @@ class ChatBubble(QFrame):
         if self.role == "user" and hasattr(self, "prompt_input"):
             self.copy_requested.emit()
             return
-        QApplication.clipboard().setText(self.content)
+        QApplication.clipboard().setText(strip_agent_qt_hidden_blocks(self.content))
         copy_btn = getattr(self, "copy_btn", None)
         if copy_btn is None:
             return
