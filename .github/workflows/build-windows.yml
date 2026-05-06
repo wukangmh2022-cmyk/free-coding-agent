@@ -117,7 +117,6 @@ jobs:
             --add-data "assets\\icon-windowed.ico;assets" `
             --add-data "assets\\icon-windowed.icns;assets" `
             --add-data "assets\\homepage;assets\\homepage" `
-            --add-data "assets\\icon.iconset;assets\\icon.iconset" `
             --icon "assets\\icon-windowed.ico" `
             agent_qt_stream_quick.py
 
