@@ -1,4 +1,4 @@
-name: Build Windows
+name: Build AgentQT Binaries
 
 on:
   workflow_dispatch:
@@ -6,15 +6,18 @@ on:
     branches:
       - main
       - codex/with-web-provider-plugin
+      - codex/feat-v0.99-stream-quick-release
     paths:
       - agent_qt.py
+      - agent_qt_stream_quick.py
+      - AgentQT.spec
       - plugins/**
       - assets/**
       - .github/workflows/build-windows.yml
 
 jobs:
   build-windows:
-    name: Build AgentQT.exe
+    name: Build AgentQT Windows ZIP
     runs-on: windows-latest
 
     steps:
@@ -34,13 +37,13 @@ jobs:
 
       - name: Compile check
         shell: pwsh
-        run: python -m py_compile agent_qt.py
+        run: python -m py_compile agent_qt_stream_quick.py
 
       - name: Verify Windows install commands
         shell: pwsh
         run: |
           @'
-          import agent_qt
+          import agent_qt_stream_quick as agent_qt
           import re
 
           def assert_no_readonly_automatic_variable_assignments(script):
@@ -89,14 +92,14 @@ jobs:
       - name: Verify frozen exe is not used as Python
         shell: pwsh
         run: |
-          python -c "import os, sys, tempfile, agent_qt; sys.frozen = True; sys.executable = r'C:\Users\asus\AppData\Local\Temp\_MEI160042\AgentQT.exe'; manager = agent_qt.AutomationProviderManager(); manager.plugin_root = tempfile.mkdtemp(prefix='agentqt-provider-'); manager.backend_dir = os.path.abspath('plugins/web_provider/backend'); candidates = manager.candidate_pythons(); assert all(os.path.basename(path).lower() != 'agentqt.exe' for path in candidates), candidates; print('Frozen exe skip checks OK:', candidates)"
+          python -c "import os, sys, tempfile, agent_qt_stream_quick as agent_qt; sys.frozen = True; sys.executable = r'C:\Users\asus\AppData\Local\Temp\_MEI160042\AgentQT.exe'; manager = agent_qt.AutomationProviderManager(); manager.plugin_root = tempfile.mkdtemp(prefix='agentqt-provider-'); manager.backend_dir = os.path.abspath('plugins/web_provider/backend'); candidates = manager.candidate_pythons(); assert all(os.path.basename(path).lower() != 'agentqt.exe' for path in candidates), candidates; print('Frozen exe skip checks OK:', candidates)"
 
       - name: Verify Windows workspace storage and tree
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          python -c "import os, tempfile; from PySide6.QtWidgets import QApplication; import agent_qt; root = tempfile.mkdtemp(prefix='agentqt-win-workspace-'); os.makedirs(os.path.join(root, 'src'), exist_ok=True); open(os.path.join(root, 'src', 'main.py'), 'w', encoding='utf-8').write('print(123)\n'); threads = agent_qt.load_workspace_threads(root); assert agent_qt.save_workspace_threads(root, threads); thread = agent_qt.create_workspace_thread(root, threads); thread_id = str(thread['id']); assert agent_qt.save_last_thread_id(root, thread_id); assert agent_qt.load_last_thread_id(root, agent_qt.load_workspace_threads(root)) == thread_id; entries = [{'id': 'entry-1', 'type': 'prompt', 'content': 'hello'}]; assert agent_qt.save_workspace_history(root, entries, thread_id); assert agent_qt.load_workspace_history(root, thread_id)[0]['content'] == 'hello'; assert os.path.isdir(os.path.join(root, agent_qt.HISTORY_DIR_NAME)); app = QApplication([]); sidebar = agent_qt.Sidebar(); sidebar.refresh_tree(root); assert sidebar.tree.topLevelItemCount() == 1; top = sidebar.tree.topLevelItem(0); assert top.childCount() >= 1; print('Windows workspace cache/tree checks OK:', root)"
+          python -c "import os, tempfile; from PySide6.QtWidgets import QApplication; import agent_qt_stream_quick as agent_qt; root = tempfile.mkdtemp(prefix='agentqt-win-workspace-'); os.makedirs(os.path.join(root, 'src'), exist_ok=True); open(os.path.join(root, 'src', 'main.py'), 'w', encoding='utf-8').write('print(123)\n'); threads = agent_qt.load_workspace_threads(root); assert agent_qt.save_workspace_threads(root, threads); thread = agent_qt.create_workspace_thread(root, threads); thread_id = str(thread['id']); assert agent_qt.save_last_thread_id(root, thread_id); assert agent_qt.load_last_thread_id(root, agent_qt.load_workspace_threads(root)) == thread_id; entries = [{'id': 'entry-1', 'type': 'prompt', 'content': 'hello'}]; assert agent_qt.save_workspace_history(root, entries, thread_id); assert agent_qt.load_workspace_history(root, thread_id)[0]['content'] == 'hello'; assert os.path.isdir(os.path.join(root, agent_qt.HISTORY_DIR_NAME)); app = QApplication([]); sidebar = agent_qt.Sidebar(); sidebar.refresh_tree(root); assert sidebar.tree.topLevelItemCount() == 1; top = sidebar.tree.topLevelItem(0); assert top.childCount() >= 1; print('Windows workspace cache/tree checks OK:', root)"
 
       - name: Build executable
         shell: pwsh
@@ -104,19 +107,13 @@ jobs:
           pyinstaller `
             --noconfirm `
             --clean `
-            --onefile `
-            --windowed `
-            --name AgentQT `
-            --add-data "plugins;plugins" `
-            --add-data "assets;assets" `
-            --icon "assets\icon-windowed.ico" `
-            agent_qt.py
+            AgentQT.spec
 
       - name: Prepare release zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release | Out-Null
-          Copy-Item dist\AgentQT.exe release\AgentQT.exe
+          Copy-Item dist\AgentQT\* release\ -Recurse -Force
           Copy-Item README.md release\README.md
           Copy-Item LICENSE release\LICENSE
           @'
@@ -124,7 +121,7 @@ jobs:
 
           运行方式：
           1. 解压 zip。
-          2. 双击 AgentQT.exe。
+          2. 双击目录中的 AgentQT.exe。
           3. 首次使用自动化插件或 Agent Python 环境时，在设置里点击对应安装按钮。
 
           CI 已检查：
@@ -132,17 +129,17 @@ jobs:
           - Windows 版自动化插件依赖安装命令使用 cmd/bat 语法。
           - 自动化 provider 源码已随 exe 打包。
           '@ | Set-Content -Path release\WINDOWS-README.txt -Encoding UTF8
-          Compress-Archive -Path release\* -DestinationPath AgentQT-Windows.zip -Force
+          Compress-Archive -Path release\* -DestinationPath AgentQT-Windows-v0.99-preview.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: AgentQT-Windows
-          path: AgentQT-Windows.zip
+          path: AgentQT-Windows-v0.99-preview.zip
           if-no-files-found: error
 
   build-macos:
-    name: Build AgentQT.dmg
+    name: Build AgentQT macOS DMG
     runs-on: macos-latest
     if: github.event_name == 'workflow_dispatch'
 
@@ -161,19 +158,14 @@ jobs:
           python -m pip install "PySide6>=6.8.0.2" pyinstaller
 
       - name: Compile check
-        run: python -m py_compile agent_qt.py
+        run: python -m py_compile agent_qt_stream_quick.py
 
       - name: Build app bundle
         run: |
           pyinstaller \
             --noconfirm \
             --clean \
-            --windowed \
-            --name AgentQT \
-            --add-data "plugins:plugins" \
-            --add-data "assets:assets" \
-            --icon "assets/icon-windowed.icns" \
-            agent_qt.py
+            AgentQT.spec
 
       - name: Prepare DMG
         run: |
@@ -203,11 +195,11 @@ jobs:
             -srcfolder release \
             -ov \
             -format UDZO \
-            AgentQT-macOS.dmg
+            AgentQT-macOS-v0.99-preview.dmg
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: AgentQT-macOS
-          path: AgentQT-macOS.dmg
+          path: AgentQT-macOS-v0.99-preview.dmg
           if-no-files-found: error
