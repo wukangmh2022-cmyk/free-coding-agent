@@ -5,3 +5,4 @@ __pycache__/
 .agent_qt/
 release-artifacts/
 assets/
+design_refs/
