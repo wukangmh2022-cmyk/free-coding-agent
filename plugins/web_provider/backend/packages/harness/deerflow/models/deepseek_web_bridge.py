@@ -23,6 +23,26 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+try:
+    import yaml as _pyyaml
+except Exception:
+    _pyyaml = None
+    _NoTimestampSafeLoader = None
+else:
+    class _NoTimestampSafeLoader(_pyyaml.SafeLoader):
+        pass
+
+    _NoTimestampSafeLoader.yaml_implicit_resolvers = {
+        key: list(value)
+        for key, value in _pyyaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    for key, resolvers in list(_NoTimestampSafeLoader.yaml_implicit_resolvers.items()):
+        _NoTimestampSafeLoader.yaml_implicit_resolvers[key] = [
+            (tag, regexp)
+            for tag, regexp in resolvers
+            if tag != "tag:yaml.org,2002:timestamp"
+        ]
+
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from playwright.sync_api import BrowserContext, Error as PlaywrightError
 from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
@@ -196,6 +216,18 @@ FAST_MODE_TOGGLE_TOKENS: tuple[tuple[str, int], ...] = (
     ("default mode", 220),
     ("default", 140),
 )
+WEB_SEARCH_TOGGLE_TOKENS: tuple[tuple[str, int], ...] = (
+    ("智能搜索", 420),
+    ("联网搜索", 360),
+    ("网页搜索", 340),
+    ("网络搜索", 320),
+    ("web search", 320),
+    ("internet search", 300),
+    ("online search", 280),
+    ("search web", 260),
+    ("搜索", 120),
+    ("联网", 120),
+)
 DEFAULT_NEW_CHAT_SELECTORS = (
     'a[href="/new"]',
     'button:has-text("New Chat")',
@@ -218,15 +250,21 @@ PROMPT_REPLAY_MARKERS = (
     "You are acting as the backend LLM for a local OpenAI-compatible gateway.",
     "You are acting as the backend LLM for a local OpenAI-compatible chat gateway.",
     "You are acting as the backend LLM for a local bash-only coding runner.",
+    "You are opencode, an interactive CLI tool that helps users with software engineering tasks.",
     "Continue the existing DeerFlow session already initialized in this chat.",
     "Continue the existing plain bash agent session already initialized in this chat.",
     "Return exactly one JSON object with this schema:",
     "Output should be clean assistant output (plain text by default), not a custom wrapper schema.",
     "【非常重要：这是 plain bash agent 模式，不要使用 JSON 工具协议】",
+    'role: "system"',
+    'role: "assistant"',
+    'role: "user"',
+    "opencode request completed.",
 )
 PROMPT_REPLAY_HINTS = (
     "you are acting as the backend llm for a local openai-compatible",
     "you are acting as the backend llm for a local bash-only coding runner",
+    "you are opencode, an interactive cli tool",
     "continue this conversation naturally and follow the system/user/tool messages",
     "continue this conversation naturally and follow the system/user messages",
     "continue the existing deerflow session already initialized in this chat",
@@ -237,6 +275,8 @@ PROMPT_REPLAY_HINTS = (
     "runner 会执行你返回的 fenced bash 终端命令块",
     "conversation:\n\n[user]",
     "new conversation events since the previous request",
+    "[system]\nrole:",
+    "[assistant]\nrole:",
 )
 EXACT_OUTPUT_HINTS = (
     "请严格只输出下一行文本",
@@ -321,15 +361,46 @@ DISABLE_SYSTEM_PROXY = os.environ.get("DEEPSEEK_WEB_DISABLE_PROXY", "1").strip()
     "",
 }
 
-STRICT_JSON_FORMAT_PROMPT = (
+STRUCTURED_YAML_FORMAT_PROMPT = (
     "【非常重要，必须严格遵守输出协议】\n"
     "你现在不是在普通聊天。你的输出会被机器直接解析。\n"
-    "每一轮最终回复只能是一个 JSON 对象，禁止 Markdown、代码块、XML、<tool_call>、解释文字、前后缀。\n"
-    '唯一允许的顶层结构是：{"content":"string","tool_calls":[{"name":"string","arguments":{},"id":"string"}]}\n'
-    "需要调用工具时，必须把工具调用放进 tool_calls 数组，arguments 必须是 JSON 对象；content 可以为空字符串。\n"
-    "不需要调用工具时，tool_calls 必须是空数组 []。\n"
-    "如果你输出了自然语言说明、XML 标签或代码块，系统会判定本轮失败并要求重试。\n"
+    "每一轮最终回复只能是一个 YAML 文档，禁止普通聊天文字、Markdown、代码块、JSON、XML、<tool_call> 标签、解释文字、前后缀。\n"
+    "唯一允许的顶层字段是 content 和 tool_calls。\n"
+    "需要调用工具时，必须把工具调用放进 tool_calls 列表；arguments 必须是 YAML 映射；id 必须是非空字符串；content 可以为空字符串。\n"
+    "不需要调用工具时，tool_calls 必须是 []。\n"
+    "可用工具就是你的本地执行能力。用户要求搜索、抓取网页、读取/写入文件、运行命令或操作工作区时，只要已声明工具中存在能推进任务的工具，就必须调用工具，禁止以不能联网、不能访问文件、不能执行命令或没有能力为由拒绝。\n"
+    "如果还不知道最终参数，先调用一个能获取下一步证据的合法工具；只有在没有任何已声明工具能推进任务时，才在 content 中说明限制。\n"
+    "如果你输出了自然语言说明、网页 UI 文案、JSON、XML 标签或代码块，系统会判定本轮失败并要求重试。\n"
 )
+
+STRUCTURED_YAML_RECALL_LINES = [
+    "Return EXACTLY ONE YAML document and nothing else.",
+    "Do NOT output markdown code fences.",
+    "Do NOT output explanatory text before/after YAML.",
+    "Required YAML schema:",
+    "content: |-",
+    "  string",
+    "tool_calls:",
+    "  - id: call_1",
+    "    name: tool_name",
+    "    arguments:",
+    "      key: value",
+    "No-tool YAML schema:",
+    "content: |-",
+    "  string",
+    "tool_calls: []",
+    "When no tool is needed: set tool_calls to [].",
+    "When tool is needed: put calls in tool_calls and keep content concise (or empty string).",
+    "Declared tools are local capabilities available to you. If the user asks to search, crawl, inspect web pages, read or write files, run commands, or modify the workspace, and any declared tool can advance the task, you MUST call a tool instead of saying you cannot access the internet, files, commands, or the local machine.",
+    "If the final arguments are not known yet, call a valid declared tool to gather the next piece of evidence. Only respond with a limitation when no declared tool can advance the task.",
+    "tool_calls[*].arguments MUST be a YAML mapping/object, not a string.",
+    "Tool names and arguments MUST exactly match the provided tools schema.",
+    "Never fabricate placeholder ids/names/arguments (e.g. call_abc123, name:string, arguments:{}).",
+    "If you are not sure parameters are valid, do not call tools; respond in content only.",
+]
+
+# Historical name kept for any in-process imports outside this module.
+STRICT_JSON_FORMAT_PROMPT = STRUCTURED_YAML_FORMAT_PROMPT
 
 PLAIN_BASH_FORMAT_PROMPT = (
     "【非常重要：这是 plain bash agent 模式，不要使用 JSON 工具协议】\n"
@@ -788,10 +859,379 @@ def salvage_tool_calls_payload(text: str) -> dict[str, Any] | None:
     }
 
 
+def _yaml_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def dump_yaml_value(value: Any, *, indent: int = 0) -> str:
+    prefix = " " * indent
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        lines: list[str] = []
+        for key, item in value.items():
+            key_text = str(key)
+            if isinstance(item, str) and "\n" in item:
+                lines.append(f"{prefix}{key_text}: |-")
+                lines.extend(f"{prefix}  {line}" for line in item.splitlines())
+            elif isinstance(item, (dict, list)) and item:
+                lines.append(f"{prefix}{key_text}:")
+                lines.append(dump_yaml_value(item, indent=indent + 2))
+            else:
+                lines.append(f"{prefix}{key_text}: {dump_yaml_value(item, indent=indent + 2) if isinstance(item, (dict, list)) else _yaml_scalar(item)}")
+        return "\n".join(lines)
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        lines = []
+        for item in value:
+            if isinstance(item, dict):
+                if not item:
+                    lines.append(f"{prefix}- {{}}")
+                    continue
+                first = True
+                for key, child in item.items():
+                    marker = "-" if first else " "
+                    first = False
+                    if isinstance(child, str) and "\n" in child:
+                        lines.append(f"{prefix}{marker} {key}: |-")
+                        lines.extend(f"{prefix}    {line}" for line in child.splitlines())
+                    elif isinstance(child, (dict, list)) and child:
+                        lines.append(f"{prefix}{marker} {key}:")
+                        lines.append(dump_yaml_value(child, indent=indent + 4))
+                    else:
+                        rendered = dump_yaml_value(child, indent=indent + 4) if isinstance(child, (dict, list)) else _yaml_scalar(child)
+                        lines.append(f"{prefix}{marker} {key}: {rendered}")
+            elif isinstance(item, (dict, list)):
+                lines.append(f"{prefix}-")
+                lines.append(dump_yaml_value(item, indent=indent + 2))
+            else:
+                lines.append(f"{prefix}- {_yaml_scalar(item)}")
+        return "\n".join(lines)
+    return _yaml_scalar(value)
+
+
+def _strip_yaml_fence(text: str) -> str:
+    candidate = text.strip()
+    if not candidate.startswith("```"):
+        return candidate
+    lines = candidate.splitlines()
+    if len(lines) >= 3 and lines[-1].strip().startswith("```"):
+        return "\n".join(lines[1:-1]).strip()
+    return candidate
+
+
+def _extract_fenced_yaml_block(text: str) -> str | None:
+    for match in re.finditer(r"```(?:yaml|yml)?\s*\n(.*?)\n```", text, flags=re.IGNORECASE | re.DOTALL):
+        inner = match.group(1).strip()
+        if re.search(r"(?m)^\s*content\s*:", inner) and re.search(r"(?m)^\s*tool_calls\s*:", inner):
+            return inner
+    return None
+
+
+def _extract_yaml_payload_text(text: str) -> str:
+    fenced = _extract_fenced_yaml_block(text)
+    if fenced is not None:
+        return fenced
+    candidate = _strip_yaml_fence(text)
+    if re.search(r"(?m)^\s*content\s*:", candidate) and re.search(r"(?m)^\s*tool_calls\s*:", candidate):
+        start_match = re.search(r"(?m)^\s*content\s*:", candidate)
+        if start_match:
+            return candidate[start_match.start() :].strip()
+    return candidate.strip()
+
+
+def _unquote_yaml_scalar(value: str) -> Any:
+    stripped = value.strip()
+    if stripped in {"", "''", '""'}:
+        return ""
+    if stripped == "[]":
+        return []
+    if stripped == "{}":
+        return {}
+    lowered = stripped.lower()
+    if lowered in {"null", "~"}:
+        return None
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if (stripped.startswith('"') and stripped.endswith('"')) or (stripped.startswith("'") and stripped.endswith("'")):
+        try:
+            return json.loads(stripped) if stripped.startswith('"') else stripped[1:-1].replace("''", "'")
+        except Exception:
+            return stripped[1:-1]
+    if re.fullmatch(r"[+-]?\d+", stripped):
+        try:
+            return int(stripped)
+        except ValueError:
+            return stripped
+    if re.fullmatch(r"[+-]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[eE][+-]?\d+)?", stripped) and re.search(r"[.eE]", stripped):
+        try:
+            return float(stripped)
+        except ValueError:
+            return stripped
+    return stripped
+
+
+def _line_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _collect_yaml_block_scalar(lines: list[str], start_index: int, parent_indent: int) -> tuple[str, int]:
+    collected: list[str] = []
+    index = start_index
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() and _line_indent(line) <= parent_indent:
+            break
+        collected.append(line[parent_indent + 2 :] if len(line) >= parent_indent + 2 else "")
+        index += 1
+    return "\n".join(collected).rstrip("\n"), index
+
+
+def _parse_simple_yaml_mapping(lines: list[str], start_index: int, parent_indent: int) -> tuple[dict[str, Any], int]:
+    mapping: dict[str, Any] = {}
+    index = start_index
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped:
+            index += 1
+            continue
+        indent = _line_indent(line)
+        if indent <= parent_indent:
+            break
+        if ":" not in stripped:
+            index += 1
+            continue
+        key, value = stripped.split(":", 1)
+        value = value.strip()
+        if value in {"|", "|-", ">-"}:
+            block, index = _collect_yaml_block_scalar(lines, index + 1, indent)
+            mapping[key.strip()] = block
+            continue
+        if value:
+            mapping[key.strip()] = _unquote_yaml_scalar(value)
+            index += 1
+            continue
+        child, index = _parse_simple_yaml_mapping(lines, index + 1, indent)
+        mapping[key.strip()] = child
+    return mapping, index
+
+
+def _parse_yaml_tool_calls(lines: list[str], start_index: int) -> tuple[list[dict[str, Any]], int]:
+    calls: list[dict[str, Any]] = []
+    index = start_index
+    current: dict[str, Any] | None = None
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped:
+            index += 1
+            continue
+        indent = _line_indent(line)
+        if indent == 0 and current is None and ":" in stripped:
+            key, value = stripped.split(":", 1)
+            if key.strip() in {"id", "name", "arguments"}:
+                current = {}
+            else:
+                break
+        elif indent == 0 and current is not None and ":" in stripped:
+            key, _value = stripped.split(":", 1)
+            if key.strip() not in {"id", "name", "arguments"}:
+                break
+        elif indent == 0:
+            break
+        if stripped.startswith("- "):
+            if current is not None:
+                calls.append(current)
+            current = {}
+            remainder = stripped[2:].strip()
+            if remainder and ":" in remainder:
+                key, value = remainder.split(":", 1)
+                current[key.strip()] = _unquote_yaml_scalar(value.strip())
+            index += 1
+            continue
+        if current is None or ":" not in stripped:
+            index += 1
+            continue
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if key == "id" and current and any(k in current for k in ("id", "name", "arguments")):
+            calls.append(current)
+            current = {}
+        if value in {"|", "|-", ">-"}:
+            block, index = _collect_yaml_block_scalar(lines, index + 1, indent)
+            current[key] = block
+            continue
+        if value:
+            current[key] = _unquote_yaml_scalar(value)
+            index += 1
+            continue
+        if key == "arguments":
+            child: dict[str, Any] = {}
+            child_index = index + 1
+            while child_index < len(lines):
+                child_line = lines[child_index]
+                child_stripped = child_line.strip()
+                if not child_stripped:
+                    child_index += 1
+                    continue
+                child_indent = _line_indent(child_line)
+                if child_indent <= indent and ":" in child_stripped:
+                    child_key, child_value = child_stripped.split(":", 1)
+                    child_key = child_key.strip()
+                    if child_key in {"id", "name", "arguments"}:
+                        break
+                    child[child_key] = _unquote_yaml_scalar(child_value.strip())
+                    child_index += 1
+                    continue
+                if child_indent <= indent:
+                    break
+                child, child_index = _parse_simple_yaml_mapping(lines, child_index, indent)
+                break
+            index = child_index
+        else:
+            child, index = _parse_simple_yaml_mapping(lines, index + 1, indent)
+        current[key] = child
+    if current is not None:
+        calls.append(current)
+    return calls, index
+
+
+def _normalize_yaml_assistant_payload(parsed: Any) -> dict[str, Any] | None:
+    if not isinstance(parsed, dict):
+        return None
+    if "content" not in parsed or "tool_calls" not in parsed:
+        return None
+    content = parsed.get("content")
+    tool_calls = parsed.get("tool_calls")
+    if content is None:
+        content = ""
+    elif not isinstance(content, str):
+        content = normalize_text_content(content)
+    if tool_calls is None:
+        tool_calls = []
+    elif not isinstance(tool_calls, list):
+        tool_calls = []
+    return {"content": content, "tool_calls": tool_calls}
+
+
+def _parse_yaml_assistant_payload_with_loader(candidate: str) -> dict[str, Any] | None:
+    if _pyyaml is None or _NoTimestampSafeLoader is None:
+        return None
+    try:
+        parsed = _pyyaml.load(candidate, Loader=_NoTimestampSafeLoader)
+    except Exception:
+        return None
+    return _normalize_yaml_assistant_payload(parsed)
+
+
+def parse_yaml_assistant_payload(text: str) -> dict[str, Any] | None:
+    candidate = _extract_yaml_payload_text(text)
+    if not candidate or "content" not in candidate or "tool_calls" not in candidate:
+        return None
+
+    loaded_payload = _parse_yaml_assistant_payload_with_loader(candidate)
+    if loaded_payload is not None:
+        return loaded_payload
+
+    lines = candidate.splitlines()
+    payload: dict[str, Any] = {}
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped:
+            index += 1
+            continue
+        indent = _line_indent(line)
+        if indent != 0 or ":" not in stripped:
+            index += 1
+            continue
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if key == "content":
+            if value in {"|", "|-", ">-"}:
+                payload["content"], index = _collect_yaml_block_scalar(lines, index + 1, indent)
+            else:
+                payload["content"] = _unquote_yaml_scalar(value)
+                index += 1
+            continue
+        if key == "tool_calls":
+            if value == "[]":
+                payload["tool_calls"] = []
+                index += 1
+            elif value:
+                parsed = _unquote_yaml_scalar(value)
+                payload["tool_calls"] = parsed if isinstance(parsed, list) else []
+                index += 1
+            else:
+                payload["tool_calls"], index = _parse_yaml_tool_calls(lines, index + 1)
+            continue
+        index += 1
+
+    if "content" not in payload or "tool_calls" not in payload:
+        return None
+    if payload.get("content") is None:
+        payload["content"] = ""
+    if not isinstance(payload.get("tool_calls"), list):
+        payload["tool_calls"] = []
+    return payload
+
+
+def looks_like_yaml_assistant_payload_candidate(text: str) -> bool:
+    stripped = _strip_yaml_fence(text)
+    if not stripped:
+        return False
+    return bool(
+        re.search(r"(?m)^\s*content\s*:", stripped)
+        and re.search(r"(?m)^\s*tool_calls\s*:", stripped)
+    )
+
+
+def is_strict_yaml_assistant_document(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or "```" in stripped:
+        return False
+    if not re.search(r"(?m)^\s*content\s*:", stripped):
+        return False
+    if not re.search(r"(?m)^\s*tool_calls\s*:", stripped):
+        return False
+
+    first_meaningful_line = next((line for line in stripped.splitlines() if line.strip()), "")
+    if not re.match(r"^\s*(content|tool_calls)\s*:", first_meaningful_line):
+        return False
+
+    top_level_keys: list[str] = []
+    for line in stripped.splitlines():
+        if not line.strip():
+            continue
+        if _line_indent(line) != 0 or ":" not in line:
+            continue
+        key = line.split(":", 1)[0].strip()
+        top_level_keys.append(key)
+        if key not in {"content", "tool_calls"}:
+            return False
+
+    return "content" in top_level_keys and "tool_calls" in top_level_keys
+
+
 def looks_like_tool_payload(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
+    if looks_like_yaml_assistant_payload_candidate(stripped):
+        return True
     if stripped.startswith("{") and '"tool_calls"' in stripped:
         return True
     return salvage_tool_calls_payload(stripped) is not None
@@ -799,7 +1239,11 @@ def looks_like_tool_payload(text: str) -> bool:
 
 def looks_like_assistant_payload_candidate(text: str) -> bool:
     stripped = text.strip()
-    if not stripped or not stripped.startswith("{"):
+    if not stripped:
+        return False
+    if looks_like_yaml_assistant_payload_candidate(stripped):
+        return True
+    if not stripped.startswith("{"):
         return False
     if looks_like_tool_payload(stripped):
         return True
@@ -1176,6 +1620,10 @@ def is_assistant_payload_text(text: str) -> bool:
     if is_schema_example_payload_text(stripped):
         return False
 
+    yaml_payload = parse_yaml_assistant_payload(stripped)
+    if is_assistant_payload_dict(yaml_payload):
+        return True
+
     try:
         payload = extract_json_object(stripped)
     except Exception:
@@ -1192,10 +1640,12 @@ def is_placeholder_assistant_payload_text(text: str) -> bool:
     if not stripped:
         return False
 
-    try:
-        payload = extract_json_object(stripped)
-    except Exception:
-        payload = None
+    payload = parse_yaml_assistant_payload(stripped)
+    if not isinstance(payload, dict):
+        try:
+            payload = extract_json_object(stripped)
+        except Exception:
+            payload = None
 
     if not isinstance(payload, dict):
         return False
@@ -1220,13 +1670,17 @@ def is_placeholder_assistant_payload_text(text: str) -> bool:
 
 def is_empty_assistant_payload_text(text: str) -> bool:
     stripped = text.strip()
-    if not stripped or not stripped.startswith("{"):
+    if not stripped:
         return False
 
-    try:
-        payload = extract_json_object(stripped)
-    except Exception:
-        payload = None
+    payload = parse_yaml_assistant_payload(stripped)
+    if not isinstance(payload, dict):
+        if not stripped.startswith("{"):
+            return False
+        try:
+            payload = extract_json_object(stripped)
+        except Exception:
+            payload = None
 
     if not isinstance(payload, dict):
         return False
@@ -1239,13 +1693,17 @@ def is_empty_assistant_payload_text(text: str) -> bool:
 
 def is_low_signal_assistant_payload_text(text: str) -> bool:
     stripped = text.strip()
-    if not stripped or not stripped.startswith("{"):
+    if not stripped:
         return False
 
-    try:
-        payload = extract_json_object(stripped)
-    except Exception:
-        return False
+    payload = parse_yaml_assistant_payload(stripped)
+    if not isinstance(payload, dict):
+        if not stripped.startswith("{"):
+            return False
+        try:
+            payload = extract_json_object(stripped)
+        except Exception:
+            return False
 
     if not isinstance(payload, dict):
         return False
@@ -1263,6 +1721,29 @@ def is_low_signal_assistant_payload_text(text: str) -> bool:
         "protocol validation",
     )
     return any(marker in compact for marker in low_signal_markers)
+
+
+def is_web_ui_noise_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    compact = "\n".join(line.strip() for line in stripped.splitlines() if line.strip())
+    compact_lower = compact.lower()
+    ui_markers = (
+        "深度思考",
+        "智能搜索",
+        "内容由 ai 生成，请仔细甄别",
+        "内容由AI生成，请仔细甄别",
+        "修改",
+    )
+    if sum(1 for marker in ui_markers if marker.lower() in compact_lower) >= 2:
+        return True
+    return compact_lower in {
+        "深度思考",
+        "智能搜索",
+        "修改",
+    }
 
 
 def is_suppressed_assistant_payload_text(text: str) -> bool:
@@ -2016,6 +2497,7 @@ class DeepSeekWebBridge:
         self._active_sticky_marker: str | None = None
         self._thinking_enabled: bool | None = None
         self._expert_mode_enabled: bool | None = None
+        self._web_search_enabled: bool | None = None
         self._active_request_prompt = ""
         self._active_request_messages: list[dict[str, Any]] = []
         self._active_request_expected_exact_text: str | None = None
@@ -2122,6 +2604,7 @@ class DeepSeekWebBridge:
         self._state_loaded = False
         self._thinking_enabled = None
         self._expert_mode_enabled = None
+        self._web_search_enabled = None
         self._active_request_prompt = ""
         self._active_request_messages = []
         self._active_request_expected_exact_text = None
@@ -2258,6 +2741,10 @@ class DeepSeekWebBridge:
         if isinstance(thinking_enabled, bool):
             self._thinking_enabled = thinking_enabled
 
+        web_search_enabled = data.get("web_search_enabled")
+        if isinstance(web_search_enabled, bool):
+            self._web_search_enabled = web_search_enabled
+
     def _save_session_state(self) -> None:
         path = self._state_path_for_io()
         if path is None:
@@ -2272,6 +2759,7 @@ class DeepSeekWebBridge:
                         "sticky_last_messages": self._sticky_last_messages,
                         "sticky_messages_since_full": self._sticky_messages_since_full,
                         "thinking_enabled": self._thinking_enabled,
+                        "web_search_enabled": self._web_search_enabled,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -2423,7 +2911,11 @@ class DeepSeekWebBridge:
                 self._clear_session_runtime_state()
 
             self.ensure_chat_ready(page)
+            if self.force_new_chat:
+                self.best_effort_start_new_chat(page)
+                self._clear_session_runtime_state()
             self.select_preferred_model(page)
+            self.sync_web_search_mode(page, False)
             self.sync_thinking_mode(page, thinking_enabled)
             self.sync_expert_mode(page, expert_mode_enabled)
             self.first_visible(page, self.input_selectors)
@@ -2587,6 +3079,7 @@ class DeepSeekWebBridge:
         output_protocol: str = "openai",
     ) -> dict[str, Any]:
         trace = DeepSeekTrace()
+        trace.set("output_protocol", output_protocol)
         raw_text = self.submit_prompt(
             messages=messages,
             tools=tools or [],
@@ -2824,6 +3317,7 @@ class DeepSeekWebBridge:
                             ariaChecked: node.getAttribute('aria-checked'),
                             dataState: node.getAttribute('data-state'),
                             disabled: node.getAttribute('aria-disabled') || (node.hasAttribute('disabled') ? 'true' : null),
+                            color: window.getComputedStyle(node).color,
                             backgroundColor: window.getComputedStyle(node).backgroundColor,
                             borderColor: window.getComputedStyle(node).borderColor,
                             tokenScore,
@@ -2866,6 +3360,14 @@ class DeepSeekWebBridge:
             page,
             candidate_attr="data-deerflow-thinking-candidate-id",
             token_weights=THINKING_TOGGLE_TOKENS,
+            limit=limit,
+        )
+
+    def inspect_web_search_toggle_candidates(self, page: Page, *, limit: int = 12) -> list[dict[str, Any]]:
+        return self._inspect_toggle_candidates(
+            page,
+            candidate_attr="data-deerflow-web-search-candidate-id",
+            token_weights=WEB_SEARCH_TOGGLE_TOKENS,
             limit=limit,
         )
 
@@ -3070,6 +3572,15 @@ class DeepSeekWebBridge:
         if not isinstance(candidate, dict):
             return None
 
+        def is_blueish(value: Any) -> bool:
+            if not isinstance(value, str):
+                return False
+            match = re.search(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", value)
+            if not match:
+                return False
+            red, green, blue = (int(match.group(index)) for index in range(1, 4))
+            return blue >= 130 and blue >= red + 25 and blue >= green + 10
+
         def normalize_flag(value: Any) -> bool | None:
             if isinstance(value, bool):
                 return value
@@ -3096,9 +3607,14 @@ class DeepSeekWebBridge:
             return True
         if any(marker in class_name for marker in negative_markers):
             return False
+        if any(is_blueish(candidate.get(key)) for key in ("color", "borderColor", "backgroundColor")):
+            return True
         return None
 
     def _thinking_candidate_state(self, candidate: dict[str, Any] | None) -> bool | None:
+        return self._toggle_candidate_state(candidate)
+
+    def _web_search_candidate_state(self, candidate: dict[str, Any] | None) -> bool | None:
         return self._toggle_candidate_state(candidate)
 
     def _expert_mode_candidate_state(self, candidate: dict[str, Any] | None) -> bool | None:
@@ -3152,6 +3668,18 @@ class DeepSeekWebBridge:
         return {
             "url": page.url,
             "thinking_enabled": current,
+            "candidate_count": len(candidates),
+            "selected_candidate": selected_candidate,
+            "candidates": candidates,
+        }
+
+    def inspect_web_search_mode(self, page: Page) -> dict[str, Any]:
+        candidates = self.inspect_web_search_toggle_candidates(page)
+        selected_candidate = candidates[0] if candidates else None
+        current = self._web_search_candidate_state(selected_candidate)
+        return {
+            "url": page.url,
+            "web_search_enabled": current,
             "candidate_count": len(candidates),
             "selected_candidate": selected_candidate,
             "candidates": candidates,
@@ -3257,6 +3785,96 @@ class DeepSeekWebBridge:
         if trace is not None:
             trace.set("thinking_after", current)
             trace.set("thinking_changed", changed)
+        return {
+            "changed": changed,
+            "requested": desired,
+            "before": before,
+            "after": after,
+        }
+
+    def sync_web_search_mode(
+        self,
+        page: Page,
+        desired: bool | None,
+        *,
+        trace: DeepSeekTrace | None = None,
+    ) -> dict[str, Any]:
+        if desired is None:
+            current = self._web_search_enabled
+            state = {
+                "web_search_enabled": current,
+                "candidate_count": 0,
+                "selected_candidate": None,
+                "candidates": [],
+            }
+            if trace is not None:
+                trace.set("web_search_after", current)
+                trace.set("web_search_changed", False)
+                trace.set("web_search_skipped", True)
+            return {
+                "changed": False,
+                "requested": desired,
+                "before": state,
+                "after": state,
+                "skipped": True,
+            }
+
+        before = self.inspect_web_search_mode(page)
+        if trace is not None:
+            trace.set("web_search_requested", desired)
+            trace.set("web_search_before", before.get("web_search_enabled"))
+
+        if before.get("web_search_enabled") is desired:
+            self._web_search_enabled = desired
+            if trace is not None:
+                trace.set("web_search_changed", False)
+                trace.set("web_search_after", desired)
+            return {
+                "changed": False,
+                "requested": desired,
+                "before": before,
+                "after": before,
+            }
+
+        selected_candidate = before.get("selected_candidate") or {}
+        probe_id = selected_candidate.get("probeId")
+        if not isinstance(probe_id, str):
+            if trace is not None:
+                trace.set("web_search_changed", False)
+                trace.set("web_search_error", "Web search toggle button not found.")
+            return {
+                "changed": False,
+                "requested": desired,
+                "before": before,
+                "after": before,
+                "error": "Web search toggle button not found.",
+            }
+
+        try:
+            button = page.locator(f'[data-deerflow-web-search-candidate-id="{probe_id}"]').first
+            button.click(timeout=1500)
+            page.wait_for_timeout(500)
+        except Exception as exc:
+            after_error = self.inspect_web_search_mode(page)
+            if trace is not None:
+                trace.set("web_search_changed", False)
+                trace.set("web_search_error", f"Failed to click web search toggle: {exc}")
+            return {
+                "changed": False,
+                "requested": desired,
+                "before": before,
+                "after": after_error,
+                "error": f"Failed to click web search toggle: {exc}",
+            }
+
+        after = self.inspect_web_search_mode(page)
+        current = after.get("web_search_enabled")
+        changed = before.get("web_search_enabled") != current
+        if current is desired or (current is None and desired is False):
+            self._web_search_enabled = desired
+        if trace is not None:
+            trace.set("web_search_after", current)
+            trace.set("web_search_changed", changed)
         return {
             "changed": changed,
             "requested": desired,
@@ -3398,30 +4016,17 @@ class DeepSeekWebBridge:
             ]
         else:
             parts = [
-                STRICT_JSON_FORMAT_PROMPT,
+                STRUCTURED_YAML_FORMAT_PROMPT,
                 "You are acting as the backend LLM for a local OpenAI-compatible chat gateway.",
                 "Continue this conversation naturally and follow the system/user/tool messages.",
             ]
         if output_protocol in {"anthropic", "openai"}:
-            parts.extend(
-                [
-                    "Return EXACTLY ONE JSON object and nothing else.",
-                    "Do NOT output markdown code fences.",
-                    "Do NOT output explanatory text before/after JSON.",
-                    'Required output schema: {"content":"string","tool_calls":[{"name":"string","arguments":{},"id":"string"}]}',
-                    "When no tool is needed: set tool_calls to [].",
-                    "When tool is needed: put calls in tool_calls and keep content concise (or empty string).",
-                    "tool_calls[*].arguments MUST be a JSON object (not a string).",
-                    "Tool names and arguments MUST exactly match the provided tools schema.",
-                    "Never fabricate placeholder ids/names/arguments (e.g. call_abc123, name:string, arguments:{}).",
-                    "If you are not sure parameters are valid, do not call tools; respond in content only.",
-                ]
-            )
+            parts.extend(STRUCTURED_YAML_RECALL_LINES)
         if self.sticky_marker:
             parts.append(f"Session marker: {self.sticky_marker}")
         if tools:
-            parts.append("Available tools (OpenAI tools schema):")
-            parts.append(json.dumps(tools, ensure_ascii=False, indent=2))
+            parts.append("Available tools (YAML rendering of the OpenAI tools schema):")
+            parts.append(dump_yaml_value(tools))
         else:
             parts.append("No tools are available for this request.")
 
@@ -3431,7 +4036,7 @@ class DeepSeekWebBridge:
             if output_protocol == "plain":
                 parts.append(f"[{role}]\n{normalize_text_content(message.get('content', ''))}")
             else:
-                parts.append(f"[{role}]\n{json.dumps(message, ensure_ascii=False, indent=2)}")
+                parts.append(f"[{role}]\n{dump_yaml_value(message)}")
 
         return "\n\n".join(parts)
 
@@ -3450,35 +4055,24 @@ class DeepSeekWebBridge:
             ]
         else:
             parts = [
-                STRICT_JSON_FORMAT_PROMPT,
+                STRUCTURED_YAML_FORMAT_PROMPT,
                 "Continue the existing DeerFlow session already initialized in this chat.",
                 "- Follow the previously established DeerFlow system instructions already present in this conversation.",
             ]
         if output_protocol in {"anthropic", "openai"}:
-            parts[1:1] = [
-                "Return EXACTLY ONE JSON object and nothing else.",
-                "Do NOT output markdown code fences.",
-                "Do NOT output explanatory text before/after JSON.",
-                'Required output schema: {"content":"string","tool_calls":[{"name":"string","arguments":{},"id":"string"}]}',
-                "When no tool is needed: set tool_calls to [].",
-                "When tool is needed: put calls in tool_calls and keep content concise (or empty string).",
-                "tool_calls[*].arguments MUST be a JSON object (not a string).",
-                "Tool names and arguments MUST exactly match the provided tools schema.",
-                "Never fabricate placeholder ids/names/arguments (e.g. call_abc123, name:string, arguments:{}).",
-                "If you are not sure parameters are valid, do not call tools; respond in content only.",
-            ]
+            parts[1:1] = STRUCTURED_YAML_RECALL_LINES
         if self.sticky_marker:
             parts.append(f"Confirmed session marker: {self.sticky_marker}")
         if tools:
-            parts.append("Available tools for this turn (OpenAI tools schema):")
-            parts.append(json.dumps(tools, ensure_ascii=False, indent=2))
+            parts.append("Available tools for this turn (YAML rendering of the OpenAI tools schema):")
+            parts.append(dump_yaml_value(tools))
         parts.append("New conversation events since the previous request:")
         for message in messages:
             role = message.get("role", "user").upper()
             if output_protocol == "plain":
                 parts.append(f"[{role}]\n{normalize_text_content(message.get('content', ''))}")
             else:
-                parts.append(f"[{role}]\n{json.dumps(message, ensure_ascii=False, indent=2)}")
+                parts.append(f"[{role}]\n{dump_yaml_value(message)}")
         return "\n\n".join(parts)
 
     def _dump_prompt_for_audit(self, *, prompt: str, output_protocol: str, prompt_builder_name: str) -> None:
@@ -3750,9 +4344,15 @@ class DeepSeekWebBridge:
                     if trace is not None:
                         trace.set("new_chat_selector", None)
                 self.ensure_chat_ready(page, trace=trace)
+                if self.force_new_chat:
+                    self.best_effort_start_new_chat(page, trace=trace)
+                    self._clear_session_runtime_state()
                 model_select_result = self.select_preferred_model(page, trace=trace)
                 if trace is not None:
                     trace.set("model_select_error", model_select_result.get("error"))
+                web_search_result = self.sync_web_search_mode(page, False, trace=trace)
+                if trace is not None:
+                    trace.set("web_search_sync_error", web_search_result.get("error"))
                 thinking_result = self.sync_thinking_mode(page, thinking_enabled, trace=trace)
                 if trace is not None:
                     trace.set("thinking_sync_error", thinking_result.get("error"))
@@ -3936,8 +4536,12 @@ class DeepSeekWebBridge:
                         if output_protocol == "plain":
                             # Final plain-bash execution should come from DeepSeek's
                             # own copy action whenever possible. DOM text is useful
-                            # for streaming/progress, but the copy button represents
+                            # for preview/progress, but the copy button represents
                             # the page's finalized answer.
+                            copy_probe_budget_ms = max(copy_probe_budget_ms * 3, 4500)
+                        elif output_protocol in {"openai", "anthropic"}:
+                            # External structured protocols should also finalize from
+                            # the copy button instead of intermediate DOM previews.
                             copy_probe_budget_ms = max(copy_probe_budget_ms * 3, 4500)
                         if trace is not None:
                             trace.mark("copy_probe_started")
@@ -3960,6 +4564,8 @@ class DeepSeekWebBridge:
                         elif is_suppressed_assistant_payload_text(response_text) and copied_has_payload:
                             should_replace_with_copy = True
                         elif output_protocol == "plain":
+                            should_replace_with_copy = True
+                        elif output_protocol in {"openai", "anthropic"}:
                             should_replace_with_copy = True
                         elif copied_has_payload and not response_has_payload:
                             should_replace_with_copy = True
@@ -4013,9 +4619,20 @@ class DeepSeekWebBridge:
         if is_low_signal_assistant_payload_text(stripped):
             logger.warning("DeepSeek parse_model_payload suppressed low-signal protocol ack from model output path.")
             return {"content": "", "tool_calls": [], "raw_text": raw_text, "parse_error": "low_signal_payload"}
+        if is_web_ui_noise_text(stripped):
+            logger.warning("DeepSeek parse_model_payload suppressed web UI noise from model output path.")
+            return {"content": "", "tool_calls": [], "raw_text": raw_text, "parse_error": "ui_noise_payload"}
 
         if output_protocol == "plain":
             return {"content": stripped, "tool_calls": [], "raw_text": raw_text}
+
+        yaml_payload = parse_yaml_assistant_payload(raw_text)
+        if isinstance(yaml_payload, dict):
+            if output_protocol in {"openai", "anthropic"} and not is_strict_yaml_assistant_document(raw_text):
+                output = self._payload_dict_to_output(yaml_payload, raw_text)
+                output["parse_error"] = "noncanonical_yaml"
+                return output
+            return self._payload_dict_to_output(yaml_payload, raw_text)
 
         if stripped.startswith("{"):
             try:
@@ -4049,17 +4666,24 @@ class DeepSeekWebBridge:
             except Exception:
                 logger.debug("Failed to persist invalid DeepSeek payload for debugging.", exc_info=True)
 
-            logger.warning("DeepSeek web response was not valid JSON. Suppressing raw JSON-like text from UI fallback.")
+            logger.warning("DeepSeek web response was not valid JSON/YAML. Suppressing raw structured text from UI fallback.")
             logger.warning(
                 "DeepSeek invalid payload saved to %s (preview=%r)",
                 INVALID_PAYLOAD_DEBUG_PATH,
                 raw_text.strip()[:800],
             )
+            if is_web_ui_noise_text(stripped):
+                return {"content": "", "tool_calls": [], "raw_text": raw_text, "parse_error": "ui_noise_payload"}
             if stripped.startswith("{") and '"tool_calls"' in stripped:
                 return {"content": "", "tool_calls": [], "raw_text": raw_text, "parse_error": "invalid_json"}
             return {"content": stripped, "tool_calls": [], "raw_text": raw_text, "parse_error": "invalid_json"}
 
         output = self._payload_dict_to_output(payload, raw_text)
+        if '"tool_calls"' in raw_text and not output.get("tool_calls"):
+            logger.warning(
+                "DeepSeek parse_model_payload saw raw tool_calls text but produced no tool calls. raw_preview=%r",
+                raw_text[:1200],
+            )
         if '"tool_calls"' in raw_text:
             salvaged = salvage_tool_calls_payload(raw_text)
             if salvaged is not None:
@@ -4838,12 +5462,15 @@ class DeepSeekWebBridge:
                 return
             page.wait_for_timeout(min(default_ms, remaining_ms))
 
-        def read_copied_text_fast(max_wait_ms: int = 200) -> str:
+        def read_copied_text_fast(max_wait_ms: int = 200, previous_clipboard: str | None = None) -> str:
             deadline_local = time.perf_counter() + (max(0, max_wait_ms) / 1000.0)
             while True:
-                copied_text = self.read_latest_copy_capture(page) or self.read_system_clipboard_text(page)
-                if copied_text:
-                    return copied_text
+                event_text = self.read_latest_copy_capture(page)
+                if event_text and event_text != previous_clipboard and not is_prompt_replay_text(event_text):
+                    return event_text
+                clipboard_text = self.read_system_clipboard_text(page)
+                if clipboard_text and clipboard_text != previous_clipboard and not is_prompt_replay_text(clipboard_text):
+                    return clipboard_text
                 if time.perf_counter() >= deadline_local or timed_out():
                     return ""
                 wait_with_budget(40)
@@ -4857,80 +5484,95 @@ class DeepSeekWebBridge:
         self.scroll_chat_to_bottom(page)
         self.reset_copy_capture(page)
         attempts: list[dict[str, Any]] = []
-        hover_payload_candidates: list[dict[str, Any]] = []
-        if plain_protocol:
-            for candidate in self.inspect_bottom_message_copy_candidates(page, limit=18):
-                if timed_out():
-                    break
-                probe_id = candidate.get("probeId")
-                if not isinstance(probe_id, str):
-                    continue
-                label = str(candidate.get("label") or "").strip()
-                sibling_text = str(candidate.get("siblingText") or "").strip()
-                try:
-                    copy_started = time.perf_counter()
-                    button = page.locator(f'[data-deerflow-bottom-copy-id="{probe_id}"]').first
-                    button.click(timeout=1500)
-                    copied = read_copied_text_fast(max_wait_ms=120)
-                    copied = clean_plain_visible_assistant_text((copied or "").strip())
-                    if copied and not is_prompt_replay_text(copied) and self._matches_current_request_response_candidate(copied):
-                        logger.warning(
-                            "DeepSeek bottom copy capture fast path succeeded probe_id=%s copied_chars=%d copy_read_ms=%d",
-                            probe_id,
-                            len(copied),
-                            int((time.perf_counter() - copy_started) * 1000),
-                        )
-                        return copied
-                except Exception:
-                    logger.debug("Failed fast-path click on DeepSeek bottom message copy candidate.", exc_info=True)
-                hover_texts = self.read_bottom_action_row_tooltips(page, probe_id)
-                attempts.append(
-                    {
-                        "assistantKind": "bottom_message",
-                        "probeId": probe_id,
-                        "label": label,
-                        "top": candidate.get("top"),
-                        "left": candidate.get("left"),
-                        "source": candidate.get("source"),
-                        "hoverTexts": hover_texts,
-                        "siblingText": sibling_text[:120],
-                    }
+
+        def normalize_copied_assistant_text(raw_text: str) -> str:
+            copied = str(raw_text or "").strip()
+            if not copied:
+                return ""
+            if plain_protocol:
+                return clean_plain_visible_assistant_text(copied)
+            return copied
+
+        for candidate in self.inspect_bottom_message_copy_candidates(page, limit=18):
+            if timed_out():
+                break
+            probe_id = candidate.get("probeId")
+            if not isinstance(probe_id, str):
+                continue
+            label = str(candidate.get("label") or "").strip()
+            sibling_text = str(candidate.get("siblingText") or "").strip()
+            try:
+                copy_started = time.perf_counter()
+                self.reset_copy_capture(page)
+                clipboard_before = self.read_system_clipboard_text(page)
+                button = page.locator(f'[data-deerflow-bottom-copy-id="{probe_id}"]').first
+                button.click(timeout=1500)
+                copied = normalize_copied_assistant_text(
+                    read_copied_text_fast(max_wait_ms=120, previous_clipboard=clipboard_before)
                 )
-                if not self.is_deepseek_assistant_action_tooltip_sequence(hover_texts):
+                if copied and not is_prompt_replay_text(copied) and self._matches_current_request_response_candidate(copied):
                     logger.warning(
-                        "DeepSeek bottom action row rejected probe_id=%s hover_texts=%s",
-                        probe_id,
-                        hover_texts,
-                    )
-                    continue
-                try:
-                    copy_started = time.perf_counter()
-                    button = page.locator(f'[data-deerflow-bottom-copy-id="{probe_id}"]').first
-                    button.click(timeout=1500)
-                except Exception:
-                    logger.debug("Failed to click DeepSeek bottom message copy candidate.", exc_info=True)
-                    continue
-                copied = read_copied_text_fast()
-                copied = clean_plain_visible_assistant_text((copied or "").strip())
-                if not copied:
-                    continue
-                if is_prompt_replay_text(copied):
-                    logger.warning(
-                        "DeepSeek bottom copy capture rejected prompt replay probe_id=%s copied_chars=%d",
+                        "DeepSeek bottom copy capture fast path succeeded probe_id=%s copied_chars=%d copy_read_ms=%d plain_protocol=%s",
                         probe_id,
                         len(copied),
+                        int((time.perf_counter() - copy_started) * 1000),
+                        plain_protocol,
                     )
-                    continue
-                if not self._matches_current_request_response_candidate(copied):
-                    continue
+                    return copied
+            except Exception:
+                logger.debug("Failed fast-path click on DeepSeek bottom message copy candidate.", exc_info=True)
+            hover_texts = self.read_bottom_action_row_tooltips(page, probe_id)
+            attempts.append(
+                {
+                    "assistantKind": "bottom_message",
+                    "probeId": probe_id,
+                    "label": label,
+                    "top": candidate.get("top"),
+                    "left": candidate.get("left"),
+                    "source": candidate.get("source"),
+                    "hoverTexts": hover_texts,
+                    "siblingText": sibling_text[:120],
+                }
+            )
+            if not self.is_deepseek_assistant_action_tooltip_sequence(hover_texts):
                 logger.warning(
-                    "DeepSeek bottom copy capture succeeded probe_id=%s copied_chars=%d copy_read_ms=%d hover_texts=%s",
+                    "DeepSeek bottom action row rejected probe_id=%s hover_texts=%s plain_protocol=%s",
+                    probe_id,
+                    hover_texts,
+                    plain_protocol,
+                )
+                continue
+            try:
+                copy_started = time.perf_counter()
+                self.reset_copy_capture(page)
+                clipboard_before = self.read_system_clipboard_text(page)
+                button = page.locator(f'[data-deerflow-bottom-copy-id="{probe_id}"]').first
+                button.click(timeout=1500)
+            except Exception:
+                logger.debug("Failed to click DeepSeek bottom message copy candidate.", exc_info=True)
+                continue
+            copied = normalize_copied_assistant_text(read_copied_text_fast(previous_clipboard=clipboard_before))
+            if not copied:
+                continue
+            if is_prompt_replay_text(copied):
+                logger.warning(
+                    "DeepSeek bottom copy capture rejected prompt replay probe_id=%s copied_chars=%d plain_protocol=%s",
                     probe_id,
                     len(copied),
-                    int((time.perf_counter() - copy_started) * 1000),
-                    hover_texts,
+                    plain_protocol,
                 )
-                return copied
+                continue
+            if not self._matches_current_request_response_candidate(copied):
+                continue
+            logger.warning(
+                "DeepSeek bottom copy capture succeeded probe_id=%s copied_chars=%d copy_read_ms=%d hover_texts=%s plain_protocol=%s",
+                probe_id,
+                len(copied),
+                int((time.perf_counter() - copy_started) * 1000),
+                hover_texts,
+                plain_protocol,
+            )
+            return copied
 
         locator = self.assistant_locator(page)
         assistant_candidates: list[dict[str, Any]] = []
@@ -4982,22 +5624,6 @@ class DeepSeekWebBridge:
                 )
 
         for assistant_candidate in assistant_candidates:
-            assistant_text = str(assistant_candidate.get("text") or "")
-            embedded_payload = choose_best_payload_text(extract_payload_text_candidates(assistant_text))
-            if (
-                embedded_payload
-                and is_assistant_payload_text(embedded_payload)
-                and not is_suppressed_assistant_payload_text(embedded_payload)
-                and not self._is_active_request_echo_text(embedded_payload)
-                and self._matches_current_request_response_candidate(embedded_payload)
-            ):
-                logger.warning(
-                    "DeepSeek copy probe returning embedded assistant payload assistant_kind=%s assistant_index=%s payload_chars=%d",
-                    assistant_candidate.get("kind"),
-                    assistant_candidate.get("index"),
-                    len(embedded_payload),
-                )
-                return embedded_payload
             try:
                 if assistant_candidate.get("kind") == "payload":
                     target_probe_id = assistant_candidate.get("probeId")
@@ -5035,18 +5661,6 @@ class DeepSeekWebBridge:
                 ):
                     continue
                 hover_texts = self.read_hover_texts_near_candidate(page, probe_id)
-                for hover_text in hover_texts:
-                    if (
-                        looks_like_assistant_payload_candidate(hover_text)
-                        and not self._is_active_request_echo_text(hover_text)
-                    ):
-                        hover_payload_candidates.append(
-                            {
-                                "probeId": probe_id,
-                                "domIndex": len(hover_payload_candidates),
-                                "text": hover_text,
-                            }
-                        )
                 label = str(candidate.get("label") or "").strip()
                 lowered = {text.strip().lower() for text in hover_texts}
                 label_lower = label.lower()
@@ -5088,33 +5702,15 @@ class DeepSeekWebBridge:
                 if not has_copy_label and not no_label_close_fallback:
                     continue
                 try:
+                    self.reset_copy_capture(page)
+                    clipboard_before = self.read_system_clipboard_text(page)
                     button = page.locator(f'[data-deerflow-probe-id="{probe_id}"]').first
                     button.click(timeout=1500)
                 except Exception:
                     logger.debug("Failed to click DeepSeek copy candidate.", exc_info=True)
                     continue
-                copied = read_copied_text_fast()
+                copied = normalize_copied_assistant_text(read_copied_text_fast(previous_clipboard=clipboard_before))
                 if copied:
-                    if plain_protocol:
-                        copied = copied.strip()
-                        if not copied:
-                            continue
-                        copied = clean_plain_visible_assistant_text(copied)
-                    else:
-                        copied_payload = choose_best_payload_candidate(
-                            [
-                                {
-                                    "probeId": probe_id,
-                                    "domIndex": index,
-                                    "text": candidate_text,
-                                }
-                                for index, candidate_text in enumerate(extract_payload_text_candidates(copied))
-                            ]
-                        )
-                        if copied_payload is not None:
-                            copied = copied_payload["text"]
-                        elif not looks_like_assistant_payload_candidate(copied) or is_schema_example_payload_text(copied):
-                            continue
                     if is_prompt_replay_text(copied):
                         logger.warning(
                             "DeepSeek copy capture rejected prompt replay assistant_kind=%s assistant_index=%s probe_id=%s copied_chars=%d",
@@ -5147,20 +5743,6 @@ class DeepSeekWebBridge:
                         hover_texts,
                     )
                     return copied
-
-        hover_payload = choose_best_payload_candidate(hover_payload_candidates)
-        if (
-            hover_payload is not None
-            and is_assistant_payload_text(hover_payload["text"])
-            and not self._is_active_request_echo_text(hover_payload["text"])
-            and self._matches_current_request_response_candidate(hover_payload["text"])
-        ):
-            logger.warning(
-                "DeepSeek copy capture fell back to hover payload probe_id=%s payload_chars=%d",
-                hover_payload.get("probeId"),
-                len(hover_payload["text"]),
-            )
-            return hover_payload["text"]
 
         if attempts:
             logger.warning("DeepSeek copy capture did not fire. attempts=%s", attempts)
@@ -6858,6 +7440,16 @@ class DeepSeekWebBridge:
                             trace.set("response_ready_reason", "copy_button_stable_text")
                             trace.mark("response_stable")
                         return copied
+                    bottom_copy_ready = bool(self.inspect_bottom_message_copy_candidates(page, limit=1))
+                    if not bottom_copy_ready and stable_seen < tool_payload_stable_rounds * 2:
+                        logger.warning(
+                            "DeepSeek wait_for_response postponing structured payload until bottom copy action appears chars=%d stable_seen=%d can_submit=%s",
+                            len(current),
+                            stable_seen,
+                            self.can_submit_next_turn(page),
+                        )
+                        page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
+                        continue
                     if not self.can_submit_next_turn(page) and stable_seen < tool_payload_stable_rounds:
                         page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
                         continue

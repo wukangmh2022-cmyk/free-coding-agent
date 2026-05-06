@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import base64
 import concurrent.futures
+import html as html_lib
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -17,7 +20,8 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
@@ -27,6 +31,15 @@ from starlette.responses import StreamingResponse
 from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema import validate as jsonschema_validate
 
+if "DEEPSEEK_WEB_DISABLE_PROXY" not in os.environ:
+    _raw_provider_proxy = os.environ.get(
+        "DEEPSEEK_PROVIDER_USE_SYSTEM_PROXY",
+        os.environ.get("AGENT_QT_USE_SYSTEM_PROXY", "0"),
+    )
+    _provider_proxy_enabled = str(_raw_provider_proxy or "").strip().lower() not in {"0", "false", "off", "no", ""}
+    os.environ["DEEPSEEK_WEB_DISABLE_PROXY"] = "0" if _provider_proxy_enabled else "1"
+
+import deerflow.models.deepseek_web_bridge as deepseek_web_bridge_module
 from deerflow.models.deepseek_web_bridge import DeepSeekWebBridge
 
 logger = logging.getLogger(__name__)
@@ -44,6 +57,8 @@ def _looks_like_prompt_replay_text(text: str) -> bool:
         "continue the existing plain bash agent session already initialized in this chat",
         "return exactly one json object and nothing else",
         "plain bash agent 模式",
+        "you are opencode, an interactive cli tool",
+        "opencode request completed.",
     )
     if any(marker in lowered for marker in markers):
         return True
@@ -53,8 +68,53 @@ def _looks_like_prompt_replay_text(text: str) -> bool:
         "new conversation events since the previous request",
         "runner 会执行你返回的 fenced bash 终端命令块",
         "available tools (openai tools schema)",
+        "[system]\nrole:",
+        "[assistant]\nrole:",
     )
     return sum(1 for hint in hints if hint in lowered) >= 2
+
+
+def _sanitize_retry_preview_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    toxic_markers = (
+        "you are opencode, an interactive cli tool",
+        "opencode request completed.",
+        "[system]",
+        "[assistant]",
+        "[user]",
+        'role: "system"',
+        'role: "assistant"',
+        'role: "user"',
+        "conversation:",
+        "new conversation events since the previous request:",
+    )
+    if any(marker in lowered for marker in toxic_markers):
+        return "（上一轮输出包含对话转储或系统回显，已省略具体内容。请重新执行上一条请求，并严格只输出合法 YAML。）"
+
+    kept_lines: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if kept_lines and kept_lines[-1]:
+                kept_lines.append("")
+            continue
+        lowered_line = stripped.lower()
+        if (
+            stripped in {"[SYSTEM]", "[USER]", "[ASSISTANT]"}
+            or lowered_line.startswith("role:")
+            or lowered_line.startswith("content:")
+            or "opencode request completed." in lowered_line
+        ):
+            continue
+        kept_lines.append(stripped)
+        if len("\n".join(kept_lines)) >= 600:
+            break
+
+    cleaned = "\n".join(kept_lines).strip()
+    return cleaned[:600] if cleaned else "（上一轮输出预览已省略；请重新执行上一条请求，并严格只输出合法 YAML。）"
 
 
 def _looks_like_web_busy_text(text: str) -> bool:
@@ -113,6 +173,35 @@ def _int_env(name: str, default: int, *, minimum: int = 1, maximum: int = 8) -> 
     return max(minimum, min(maximum, value))
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "off", "no", ""}
+
+
+def _proxy_env_snapshot() -> dict[str, str]:
+    return {
+        key: value
+        for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+        if (value := os.environ.get(key))
+    }
+
+
+PROVIDER_PROXY_ENV_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+PROVIDER_USE_SYSTEM_PROXY = _bool_env(
+    "DEEPSEEK_PROVIDER_USE_SYSTEM_PROXY",
+    _bool_env("AGENT_QT_USE_SYSTEM_PROXY", False),
+)
+if _bool_env("DEEPSEEK_WEB_DISABLE_PROXY", False):
+    PROVIDER_USE_SYSTEM_PROXY = False
+if not PROVIDER_USE_SYSTEM_PROXY:
+    for _proxy_key in PROVIDER_PROXY_ENV_KEYS:
+        os.environ.pop(_proxy_key, None)
+os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
+os.environ.setdefault("no_proxy", os.environ["NO_PROXY"])
+
+
 def _selector_tuple_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     raw = os.environ.get(name)
     if raw is None:
@@ -168,15 +257,79 @@ DEEPSEEK_WEB_PROTOCOL_RETRIES = _int_env(
 )
 PROVIDER_WEB_SEARCH_MAX_RESULTS = _int_env(
     "DEEPSEEK_PROVIDER_WEB_SEARCH_MAX_RESULTS",
-    5,
+    10,
     minimum=1,
-    maximum=10,
+    maximum=25,
 )
 PROVIDER_WEB_SEARCH_MAX_STEPS = _int_env(
     "DEEPSEEK_PROVIDER_WEB_SEARCH_MAX_STEPS",
     3,
     minimum=1,
     maximum=6,
+)
+PROVIDER_WEB_SEARCH_ATTEMPTS = _int_env(
+    "DEEPSEEK_PROVIDER_WEB_SEARCH_ATTEMPTS",
+    3,
+    minimum=1,
+    maximum=10,
+)
+PROVIDER_WEB_SEARCH_RETRY_DELAY_S = _int_env(
+    "DEEPSEEK_PROVIDER_WEB_SEARCH_RETRY_DELAY_S",
+    1,
+    minimum=0,
+    maximum=60,
+)
+PROVIDER_WEB_SEARCH_DEFAULT_BACKENDS = (
+    "so360,sogou,sm,duckduckgo,bing,google,brave"
+    if PROVIDER_USE_SYSTEM_PROXY
+    else "so360,sogou,sm,duckduckgo"
+)
+PROVIDER_WEB_SEARCH_BACKENDS = tuple(
+    backend.strip()
+    for backend in os.environ.get(
+        "DEEPSEEK_PROVIDER_WEB_SEARCH_BACKENDS",
+        PROVIDER_WEB_SEARCH_DEFAULT_BACKENDS,
+    ).split(",")
+    if backend.strip()
+) or ("auto",)
+PROVIDER_WEB_SEARCH_DIRECT_TIMEOUT_S = _int_env(
+    "DEEPSEEK_PROVIDER_WEB_SEARCH_DIRECT_TIMEOUT_S",
+    8,
+    minimum=2,
+    maximum=60,
+)
+PROVIDER_WEB_SEARCH_BROWSER_ENABLED = os.environ.get("DEEPSEEK_PROVIDER_WEB_SEARCH_BROWSER_ENABLED", "0").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+PROVIDER_WEB_SEARCH_BROWSER_ENGINE = os.environ.get("DEEPSEEK_PROVIDER_WEB_SEARCH_BROWSER_ENGINE", "baidu").strip().lower() or "baidu"
+PROVIDER_WEB_SEARCH_BROWSER_TIMEOUT_S = _int_env(
+    "DEEPSEEK_PROVIDER_WEB_SEARCH_BROWSER_TIMEOUT_S",
+    45,
+    minimum=5,
+    maximum=120,
+)
+PROVIDER_WEB_SEARCH_BROWSER_GRACE_S = _int_env(
+    "DEEPSEEK_PROVIDER_WEB_SEARCH_BROWSER_GRACE_S",
+    15,
+    minimum=0,
+    maximum=30,
+)
+PROVIDER_WEB_SEARCH_EAGER = os.environ.get("DEEPSEEK_PROVIDER_WEB_SEARCH_EAGER", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+PROVIDER_WEB_FETCH_MAX_BYTES = _int_env(
+    "DEEPSEEK_PROVIDER_WEB_FETCH_MAX_BYTES",
+    800_000,
+    minimum=50_000,
+    maximum=5_000_000,
 )
 DEFAULT_RESPONSES_STORE = os.environ.get("DEEPSEEK_LOCAL_RESPONSES_STORE", "1").strip().lower() not in {
     "0",
@@ -932,10 +1085,12 @@ def _should_retry_protocol_payload(payload: dict[str, Any], *, output_protocol: 
     parse_error = payload.get("parse_error")
     return parse_error in {
         "invalid_json",
+        "noncanonical_yaml",
         "prompt_replay",
         "placeholder_payload",
         "empty_payload",
         "low_signal_payload",
+        "ui_noise_payload",
     }
 
 
@@ -946,13 +1101,23 @@ def _with_protocol_retry_message(
     attempt: int,
 ) -> list[dict[str, Any]]:
     raw_text = payload.get("raw_text") if isinstance(payload, dict) else ""
-    preview = str(raw_text or payload.get("content", ""))[:600]
+    preview = _sanitize_retry_preview_text(raw_text or payload.get("content", ""))
     retry_hint = (
         "【非常重要：上一轮输出格式错误，系统无法解析。请重新执行上一条请求，不要解释错误原因。】\n"
-        "你必须只输出一个 JSON 对象，不能输出普通聊天文字、Markdown、代码块、XML 或 <tool_call> 标签。\n"
-        '唯一允许的顶层结构是：{"content":"string","tool_calls":[{"name":"string","arguments":{},"id":"string"}]}\n'
-        "需要调用工具时，必须把工具调用放入 tool_calls；arguments 必须是 JSON 对象；id 必须是非空字符串。\n"
+        "你必须只输出一个 YAML 文档，不能输出普通聊天文字、Markdown、代码块、JSON、XML 或 <tool_call> 标签。\n"
+        "唯一允许的顶层字段是 content 和 tool_calls。\n"
+        "需要调用工具时，必须把工具调用放入 tool_calls；arguments 必须是 YAML 映射；id 必须是非空字符串。\n"
         "不需要工具时，tool_calls 必须是 []。\n"
+        "已声明工具就是你的本地执行能力。用户要求搜索、抓取网页、读取/写入文件、运行命令或操作工作区时，只要已声明工具中存在能推进任务的工具，就必须调用工具，禁止以不能联网、不能访问文件、不能执行命令或没有能力为由拒绝。\n"
+        "如果还不知道最终参数，先调用一个能获取下一步证据的合法工具；只有在没有任何已声明工具能推进任务时，才在 content 中说明限制。\n"
+        "合法 YAML 结构示例：\n"
+        "content: |-\n"
+        "  string\n"
+        "tool_calls:\n"
+        "  - id: call_1\n"
+        "    name: tool_name\n"
+        "    arguments:\n"
+        "      key: value\n"
         f"这是第 {attempt} 次协议重试。上一轮非法输出预览如下，仅用于纠正格式，不要复述：\n"
         f"{preview}"
     )
@@ -1024,49 +1189,21 @@ def _bridge_call_compat(
     include_debug: bool,
     output_protocol: str,
 ) -> dict[str, Any]:
-    attempts = [
-        {
-            "messages": messages,
-            "tools": tools,
-            "thinking_enabled": thinking_enabled,
-            "expert_mode_enabled": expert_mode_enabled,
-            "include_debug": include_debug,
-            "output_protocol": output_protocol,
-        },
-        {
-            "messages": messages,
-            "tools": tools,
-            "thinking_enabled": thinking_enabled,
-            "expert_mode_enabled": expert_mode_enabled,
-            "include_debug": include_debug,
-        },
-        {
-            "messages": messages,
-            "tools": tools,
-            "thinking_enabled": thinking_enabled,
-            "include_debug": include_debug,
-            "output_protocol": output_protocol,
-        },
-        {
-            "messages": messages,
-            "tools": tools,
-            "thinking_enabled": thinking_enabled,
-            "include_debug": include_debug,
-        },
-    ]
-    last_exc: TypeError | None = None
-    for kwargs in attempts:
-        try:
-            return bridge.call(**kwargs)
-        except TypeError as exc:
-            message = str(exc)
-            if "output_protocol" in message or "expert_mode_enabled" in message:
-                last_exc = exc
-                continue
-            raise
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("bridge.call compatibility dispatch failed without a captured TypeError")
+    kwargs: dict[str, Any] = {
+        "messages": messages,
+        "tools": tools,
+        "thinking_enabled": thinking_enabled,
+        "include_debug": include_debug,
+    }
+    try:
+        parameters = inspect.signature(bridge.call).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if not parameters or "expert_mode_enabled" in parameters:
+        kwargs["expert_mode_enabled"] = expert_mode_enabled
+    if not parameters or "output_protocol" in parameters:
+        kwargs["output_protocol"] = output_protocol
+    return bridge.call(**kwargs)
 
 
 def _run_in_playwright_worker(operation):
@@ -1278,6 +1415,29 @@ class ResponsesRequest(BaseModel):
     reasoning: dict[str, Any] | None = None
     store: bool | None = None
     prompt_cache_retention: str | None = None
+
+
+class DirectWebSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    query: str
+    max_results: int = PROVIDER_WEB_SEARCH_MAX_RESULTS
+    allowed_domains: list[str] | None = None
+
+
+class DirectWebFetchRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    url: str
+    include_html: bool = False
+    max_bytes: int = PROVIDER_WEB_FETCH_MAX_BYTES
+
+
+class ProviderProxyModeRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    use_system_proxy: bool = False
+    proxy_env: dict[str, str] | None = None
 
 
 class DebugTraceRequest(ChatCompletionRequest):
@@ -1635,9 +1795,12 @@ RESPONSES_TOOL_CALLING_HINT = (
 )
 RESPONSES_WEB_SEARCH_TOOL_TYPES = {"web_search", "web_search_preview"}
 PROVIDER_WEB_SEARCH_TOOL_NAME = "web_search"
+PROVIDER_WEB_FETCH_TOOL_NAME = "web_fetch"
+PROVIDER_WEB_TOOL_NAMES = {PROVIDER_WEB_SEARCH_TOOL_NAME, PROVIDER_WEB_FETCH_TOOL_NAME}
 PROVIDER_WEB_SEARCH_TOOL_HINT = (
     "When the user needs current or external information, call the function tool "
     f'"{PROVIDER_WEB_SEARCH_TOOL_NAME}" with a concrete query instead of answering from memory. '
+    f"After search results provide a relevant URL, call {PROVIDER_WEB_FETCH_TOOL_NAME} to fetch and clean that page before summarizing, crawling, or saving web content. "
     "After tool results arrive, use them and cite the listed sources."
 )
 def normalize_responses_text(value: Any) -> str:
@@ -1789,6 +1952,34 @@ def build_provider_web_search_tool(web_search_tools: list[dict[str, Any]]) -> di
     }
 
 
+def build_provider_web_fetch_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": PROVIDER_WEB_FETCH_TOOL_NAME,
+            "description": (
+                "Fetch a specific web page URL and return cleaned readable text extracted from the page. "
+                "Use this after web_search when the user asks to crawl, inspect, summarize, or save original web pages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The absolute http(s) URL to fetch.",
+                    },
+                    "include_html": {
+                        "type": "boolean",
+                        "description": "Whether to include the raw fetched HTML in the result. Defaults to false.",
+                    },
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 def _normalize_tool_call_arguments(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -1810,6 +2001,59 @@ def _latest_user_text(messages: list[dict[str, Any]]) -> str:
             return content.strip()
     return ""
 
+
+def _unwrap_subtask_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    match = re.search(r"\bSubtask:\s*(.+)$", raw, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return raw
+
+
+def _extract_explicit_search_query(text: str) -> str:
+    raw = _unwrap_subtask_text(text)
+    if not raw:
+        return ""
+    patterns = (
+        r"""web_search[^"'“”\n]{0,80}["“](.{2,120}?)["”]""",
+        r"""搜索[^"'“”\n]{0,40}["“](.{2,120}?)["”]""",
+        r"""search[^"'“”\n]{0,40}["“](.{2,120}?)["”]""",
+    )
+    for source in (raw, str(text or "").strip()):
+        for pattern in patterns:
+            match = re.search(pattern, source, flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            candidate = " ".join(match.group(1).split())
+            if candidate and len(candidate) <= 120:
+                return candidate
+    return ""
+
+
+def _resolve_eager_web_search_query(messages: list[dict[str, Any]]) -> str:
+    latest = _latest_user_text(messages)
+    if not latest:
+        return ""
+    explicit = _extract_explicit_search_query(latest)
+    if explicit:
+        return explicit
+    unwrapped = _unwrap_subtask_text(latest)
+    lowered = unwrapped.lower()
+    wrapper_markers = (
+        "you are codexweb.",
+        "complete this subtask in isolation.",
+        "use the current workspace only.",
+        "the configured working directory is exactly:",
+        "evidence protocol:",
+    )
+    if any(marker in lowered for marker in wrapper_markers):
+        return ""
+    if len(unwrapped) > 500:
+        return ""
+    return unwrapped
+
 def _domain_allowed(url: str, allowed_domains: list[str]) -> bool:
     if not allowed_domains:
         return True
@@ -1819,7 +2063,513 @@ def _domain_allowed(url: str, allowed_domains: list[str]) -> bool:
     return any(hostname == domain or hostname.endswith(f".{domain}") for domain in allowed_domains)
 
 
-def perform_provider_web_search(
+def _plain_text_from_html(value: str) -> str:
+    return html_lib.unescape(re.sub(r"<[^>]+>", " ", value or "")).strip()
+
+
+def _query_keywords(query: str) -> list[str]:
+    raw = str(query or "").strip()
+    if not raw:
+        return []
+    keywords: list[str] = []
+    for part in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9_.-]{3,}", raw):
+        normalized = part.strip().lower()
+        if normalized:
+            keywords.append(normalized)
+            if re.fullmatch(r"[\u4e00-\u9fff]{6,}", normalized):
+                for size in (4, 6):
+                    for index in range(0, max(0, len(normalized) - size + 1)):
+                        keywords.append(normalized[index : index + size])
+    return list(dict.fromkeys(keywords))
+
+
+def _search_result_relevance_score(query: str, *, title: str, url: str, content: str) -> int:
+    haystack = " ".join([str(title or ""), str(url or ""), str(content or "")]).lower()
+    score = 0
+    for keyword in _query_keywords(query):
+        if keyword in haystack:
+            score += max(1, min(len(keyword), 8))
+    if any(token in haystack for token in ("youtube", "google support", "maps.google", "learn more", "privacy", "terms")):
+        score -= 8
+    return score
+
+
+def _browser_search_queries(query: str) -> list[str]:
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return []
+    keywords = _query_keywords(normalized_query)
+    queries = [normalized_query]
+    primary = ""
+    for keyword in keywords:
+        if re.fullmatch(r"[\u4e00-\u9fff]{4,}|[A-Za-z0-9_.-]{6,}", keyword):
+            primary = keyword
+            break
+    if primary:
+        queries.append(f'"{primary}"')
+        extras = [keyword for keyword in keywords if keyword != primary][:2]
+        if extras:
+            queries.append(" ".join([f'"{primary}"', *extras]))
+    return list(dict.fromkeys(item for item in queries if item.strip()))
+
+
+def _expand_provider_web_search_backends(backends: tuple[str, ...]) -> list[tuple[str, str]]:
+    expanded: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_backend in backends:
+        backend = raw_backend.strip().lower()
+        if not backend:
+            continue
+        candidates: list[tuple[str, str]]
+        if backend == "bing":
+            candidates = [("ddgs", "duckduckgo"), ("ddgs", "yahoo")]
+        elif backend in {"sm", "smcn", "shenma"}:
+            candidates = [("html", "sm")]
+        elif backend in {"so360", "360", "haosou"}:
+            candidates = [("html", "so360")]
+        elif backend in {"sogou"}:
+            candidates = [("html", "sogou")]
+        elif backend in {"baidu", "baidu_html"}:
+            candidates = [("baidu", "baidu")]
+        else:
+            candidates = [("ddgs", backend)]
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            expanded.append(candidate)
+    return expanded or [("ddgs", "auto")]
+
+
+def _normalize_provider_search_results(
+    raw_results: list[dict[str, Any]],
+    *,
+    query: str = "",
+    max_results: int,
+    allowed_domains: list[str],
+) -> list[dict[str, Any]]:
+    normalized_results: list[dict[str, Any]] = []
+    for item in raw_results or []:
+        raw_url = str(item.get("href") or item.get("link") or item.get("url") or "").strip()
+        if not raw_url:
+            continue
+        title = str(item.get("title") or "").strip()
+        content = str(item.get("body") or item.get("snippet") or item.get("content") or "").strip()
+        resolved_url = _extract_direct_url_from_search_result(raw_url, content)
+        effective_url = resolved_url or raw_url
+        if not _domain_allowed(effective_url, allowed_domains):
+            continue
+        if query and _search_result_relevance_score(query, title=title, url=effective_url, content=content) <= 0:
+            continue
+        result_item = {
+            "title": title,
+            "url": effective_url,
+            "content": content,
+        }
+        if resolved_url and resolved_url != raw_url:
+            result_item["source_url"] = raw_url
+        normalized_results.append(result_item)
+        if len(normalized_results) >= max_results:
+            break
+    return normalized_results
+
+
+def _extract_direct_url_from_search_result(raw_url: str, content: str) -> str:
+    candidate = str(raw_url or "").strip()
+    if not candidate:
+        return ""
+    direct_from_content = ""
+    direct_match = re.search(r"Direct URL:\s*(https?://\S+)", str(content or ""), re.I)
+    if direct_match:
+        direct_from_content = direct_match.group(1).strip().rstrip(".,;)]}")
+    if direct_from_content.startswith(("http://", "https://")):
+        return direct_from_content
+    if not _looks_like_search_engine_redirect_url(candidate):
+        return candidate
+    resolved = _resolve_redirect_url(candidate, timeout_s=6).strip()
+    if resolved.startswith(("http://", "https://")) and not _looks_like_search_engine_redirect_url(resolved):
+        return resolved
+    return candidate
+
+
+def _looks_like_search_engine_redirect_url(url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    if host.endswith("so.com") and path.startswith("/link"):
+        return True
+    if host.endswith("sogou.com") and path.startswith("/link"):
+        return True
+    if host.endswith("baidu.com") and path.startswith("/link"):
+        return True
+    if host.endswith("bing.com") and path.startswith("/ck/"):
+        return True
+    return False
+
+
+def _decode_bing_result_url(url: str) -> str:
+    raw_url = str(url or "").strip()
+    parsed = urlparse(raw_url)
+    if "bing.com" not in (parsed.netloc or "").lower() or not parsed.path.startswith("/ck/"):
+        return raw_url
+    encoded = (parse_qs(parsed.query).get("u") or [""])[0]
+    if not encoded:
+        return raw_url
+    if encoded.startswith("a1"):
+        encoded = encoded[2:]
+    try:
+        padded = encoded + "=" * (-len(encoded) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", "ignore")
+        return unquote(decoded).strip() or raw_url
+    except Exception:
+        return raw_url
+
+
+def _ascii_safe_url_for_request(raw_url: str) -> str:
+    parsed = urlparse(str(raw_url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return str(raw_url or "").strip()
+    netloc = parsed.netloc
+    try:
+        netloc.encode("ascii")
+    except UnicodeEncodeError:
+        if parsed.hostname:
+            host = parsed.hostname.encode("idna").decode("ascii")
+            if parsed.port:
+                host = f"{host}:{parsed.port}"
+            if parsed.username:
+                userinfo = quote(unquote(parsed.username), safe="")
+                if parsed.password:
+                    userinfo += ":" + quote(unquote(parsed.password), safe="")
+                host = f"{userinfo}@{host}"
+            netloc = host
+    path = quote(parsed.path or "/", safe="/%:@!$&'()*+,;=")
+    query = quote(parsed.query or "", safe="=&%:/?+,-._~;")
+    fragment = quote(parsed.fragment or "", safe="%:/?+,-._~")
+    return parsed._replace(netloc=netloc, path=path, query=query, fragment=fragment).geturl()
+
+
+class _AsciiSafeRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return super().redirect_request(req, fp, code, msg, headers, _ascii_safe_url_for_request(newurl))
+
+
+def _ascii_safe_opener():
+    return build_opener(_AsciiSafeRedirectHandler)
+
+
+def _resolve_redirect_url(url: str, *, timeout_s: int = 15) -> str:
+    raw_url = str(url or "").strip()
+    if not raw_url.startswith(("http://", "https://")):
+        return raw_url
+    request = Request(
+        _ascii_safe_url_for_request(raw_url),
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            ),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    )
+    try:
+        with _ascii_safe_opener().open(request, timeout=timeout_s) as response:
+            final_url = str(getattr(response, "url", "") or response.geturl() or "").strip()
+            if final_url.startswith(("http://", "https://")) and not _looks_like_search_engine_redirect_url(final_url):
+                return final_url
+            content_type = str(getattr(response, "headers", {}).get("Content-Type", "") or "")
+            charset = getattr(response.headers, "get_content_charset", lambda default=None: None)("utf-8") or "utf-8"
+            try:
+                html_bytes = response.read()
+            except Exception:
+                html_bytes = b""
+            if html_bytes:
+                try:
+                    html_text = html_bytes.decode(charset, "ignore")
+                except Exception:
+                    html_text = html_bytes.decode("utf-8", "ignore")
+                redirected = _extract_js_redirect_url(html_text, final_url or raw_url)
+                if redirected.startswith(("http://", "https://")):
+                    return redirected
+                if "html" in content_type.lower():
+                    meta_match = re.search(
+                        r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\'][^"\']*url=([^"\']+)["\']',
+                        html_text or "",
+                        re.I,
+                    )
+                    if meta_match:
+                        candidate = urljoin(final_url or raw_url, html_lib.unescape(meta_match.group(1).strip()))
+                        if candidate.startswith(("http://", "https://")):
+                            return candidate
+            if final_url.startswith(("http://", "https://")):
+                return final_url
+    except Exception:
+        return raw_url
+    return raw_url
+
+
+def _extract_js_redirect_url(html_text: str, base_url: str) -> str:
+    patterns = (
+        r'window\.location(?:\.replace)?\(\s*["\']([^"\']+)["\']\s*\)',
+        r'location\.href\s*=\s*["\']([^"\']+)["\']',
+        r'location\.replace\(\s*["\']([^"\']+)["\']\s*\)',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, html_text or "", re.I)
+        if match:
+            candidate = urljoin(base_url, html_lib.unescape(match.group(1).strip()))
+            if candidate.startswith(("http://", "https://")):
+                return candidate
+    return ""
+
+
+def _is_search_engine_noise_url(url: str) -> bool:
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname.endswith("bing.com"):
+        return True
+    if hostname.endswith("microsoft.com"):
+        return True
+    return False
+
+
+def perform_bing_browser_web_search(query: str, *, max_results: int) -> list[dict[str, Any]]:
+    from playwright.sync_api import sync_playwright
+
+    search_url = "https://www.bing.com/search?q=" + quote(query)
+    timeout_ms = PROVIDER_WEB_SEARCH_BROWSER_TIMEOUT_S * 1000
+    results: list[dict[str, Any]] = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+                )
+            )
+            page.goto(search_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(800)
+            for item in page.locator("li.b_algo").all()[: max_results * 3]:
+                try:
+                    link = item.locator("h2 a").first
+                    title = (link.inner_text(timeout=1000) or "").strip()
+                    href = _decode_bing_result_url((link.get_attribute("href") or "").strip())
+                    snippet = ""
+                    snippet_locator = item.locator(".b_caption p, p").first
+                    if snippet_locator.count():
+                        snippet = (snippet_locator.inner_text(timeout=1000) or "").strip()
+                except Exception:
+                    continue
+                if not title or not href.startswith(("http://", "https://")) or _is_search_engine_noise_url(href):
+                    continue
+                results.append({"title": title, "href": href, "body": snippet})
+                if len(results) >= max_results:
+                    break
+            if not results:
+                for link in page.locator("#b_results h2 a, main h2 a").all()[: max_results * 3]:
+                    try:
+                        title = (link.inner_text(timeout=1000) or "").strip()
+                        href = _decode_bing_result_url((link.get_attribute("href") or "").strip())
+                    except Exception:
+                        continue
+                    if not title or not href.startswith(("http://", "https://")) or _is_search_engine_noise_url(href):
+                        continue
+                    results.append({"title": title, "href": href, "body": ""})
+                    if len(results) >= max_results:
+                        break
+        finally:
+            browser.close()
+    return results
+
+
+def perform_baidu_browser_web_search(query: str, *, max_results: int) -> list[dict[str, Any]]:
+    from playwright.sync_api import sync_playwright
+
+    search_url = "https://www.baidu.com/s?wd=" + quote(query)
+    timeout_ms = PROVIDER_WEB_SEARCH_BROWSER_TIMEOUT_S * 1000
+    results: list[dict[str, Any]] = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+                )
+            )
+            page.goto(search_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(800)
+            html_text = page.content()
+            if "百度安全验证" in html_text or "wappass.baidu.com" in html_text:
+                raise RuntimeError("Baidu browser search returned security verification page.")
+            for item in page.locator("#content_left .result, #content_left .c-container").all()[: max_results * 3]:
+                try:
+                    link = item.locator("h3 a").first
+                    title = (link.inner_text(timeout=1000) or "").strip()
+                    href = (link.get_attribute("href") or "").strip()
+                    snippet = ""
+                    snippet_locator = item.locator(".c-abstract, .content-right_8Zs40, .c-span-last p, .c-line-clamp1, .c-line-clamp2").first
+                    if snippet_locator.count():
+                        snippet = (snippet_locator.inner_text(timeout=1000) or "").strip()
+                except Exception:
+                    continue
+                if not title or not href.startswith(("http://", "https://")):
+                    continue
+                if _is_search_engine_noise_url(href):
+                    continue
+                results.append({"title": title, "href": href, "body": snippet})
+                if len(results) >= max_results:
+                    break
+        finally:
+            browser.close()
+    return results
+
+
+def perform_baidu_web_search(query: str, *, max_results: int) -> list[dict[str, Any]]:
+    url = "https://www.baidu.com/s?wd=" + quote(query)
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            ),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    )
+    with urlopen(request, timeout=15) as response:
+        html_text = response.read(300_000).decode("utf-8", "ignore")
+    if "百度安全验证" in html_text or "wappass.baidu.com" in html_text:
+        raise RuntimeError("Baidu returned security verification page.")
+
+    results: list[dict[str, Any]] = []
+    for match in re.finditer(r"<h3\b[^>]*>(.*?)</h3>", html_text, re.I | re.S):
+        block = match.group(1)
+        href_match = re.search(r'href=["\']([^"\']+)["\']', block, re.I)
+        title = _plain_text_from_html(block)
+        if not href_match or not title:
+            continue
+        href = urljoin("https://www.baidu.com/", html_lib.unescape(href_match.group(1)))
+        tail = html_text[match.end() : match.end() + 1200]
+        snippet = _plain_text_from_html(tail)
+        results.append({"title": title, "href": href, "body": snippet[:300]})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _fetch_html_text(url: str, *, timeout_s: int = 15) -> str:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            ),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    )
+    with urlopen(request, timeout=timeout_s) as response:
+        content_type = str(response.headers.get("Content-Type") or "")
+        charset_match = re.search(r"charset=([\w.-]+)", content_type, re.I)
+        charset = charset_match.group(1) if charset_match else "utf-8"
+        data = response.read(800_000)
+    try:
+        return data.decode(charset, "ignore")
+    except LookupError:
+        return data.decode("utf-8", "ignore")
+
+
+def perform_sm_web_search(query: str, *, max_results: int) -> list[dict[str, Any]]:
+    from bs4 import BeautifulSoup
+
+    html_text = _fetch_html_text("https://m.sm.cn/s?" + urlencode({"q": query}), timeout_s=15)
+    soup = BeautifulSoup(html_text, "html.parser")
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for link in soup.select("a[href]"):
+        href = str(link.get("href") or "").strip()
+        title = link.get_text(" ", strip=True)
+        if not href.startswith(("http://", "https://")):
+            continue
+        if not title or _is_search_engine_noise_url(href):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        results.append({"title": title, "href": href, "body": ""})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def perform_so360_web_search(query: str, *, max_results: int) -> list[dict[str, Any]]:
+    from bs4 import BeautifulSoup
+
+    search_url = "https://www.so.com/s?" + urlencode({"q": query})
+    html_text = _fetch_html_text(search_url, timeout_s=15)
+    soup = BeautifulSoup(html_text, "html.parser")
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for heading in soup.select("h3 a[href]"):
+        title = heading.get_text(" ", strip=True)
+        href = str(heading.get("href") or "").strip()
+        if not href:
+            continue
+        absolute = urljoin(search_url, href)
+        if not absolute.startswith(("http://", "https://")) or _is_search_engine_noise_url(absolute):
+            continue
+        if not title or absolute in seen:
+            continue
+        seen.add(absolute)
+        snippet = ""
+        parent = heading.parent.parent if heading.parent is not None else None
+        if parent is not None:
+            snippet = parent.get_text(" ", strip=True)[:300]
+        results.append({"title": title, "href": absolute, "body": snippet})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def perform_sogou_web_search(query: str, *, max_results: int) -> list[dict[str, Any]]:
+    from bs4 import BeautifulSoup
+
+    search_url = "https://www.sogou.com/web?" + urlencode({"query": query})
+    html_text = _fetch_html_text(search_url, timeout_s=15)
+    soup = BeautifulSoup(html_text, "html.parser")
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for heading in soup.select("h3 a[href]"):
+        title = heading.get_text(" ", strip=True)
+        href = str(heading.get("href") or "").strip()
+        if not href or not title:
+            continue
+        container = heading.find_parent()
+        direct_href = ""
+        if container is not None:
+            cite = container.find_next("a", class_="citeLinkClass", href=True)
+            if cite is not None:
+                direct_href = str(cite.get("href") or "").strip()
+        absolute = urljoin(search_url, href)
+        if not absolute.startswith(("http://", "https://")) or _is_search_engine_noise_url(absolute):
+            continue
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        snippet = ""
+        if container is not None:
+            snippet = container.get_text(" ", strip=True)[:300]
+        if direct_href and direct_href.startswith(("http://", "https://")):
+            snippet = f"{snippet}\nDirect URL: {direct_href}".strip()
+        results.append({"title": title, "href": absolute, "body": snippet})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def perform_direct_provider_web_search(
     query: str,
     *,
     max_results: int,
@@ -1834,32 +2584,451 @@ def perform_provider_web_search(
     if not normalized_query:
         return {"query": "", "total_results": 0, "results": []}
 
-    ddgs = DDGS(timeout=30)
-    raw_results = ddgs.text(
-        normalized_query,
-        region="wt-wt",
-        safesearch="moderate",
-        max_results=max_results * 3 if allowed_domains else max_results,
-    )
-    normalized_results: list[dict[str, Any]] = []
-    for item in raw_results or []:
-        url = str(item.get("href") or item.get("link") or "").strip()
-        if not url or not _domain_allowed(url, allowed_domains):
+    errors: list[str] = []
+    saw_raw_results = False
+    for backend_kind, backend in _expand_provider_web_search_backends(PROVIDER_WEB_SEARCH_BACKENDS):
+        try:
+            if backend_kind == "baidu":
+                raw_results = perform_baidu_web_search(
+                    normalized_query,
+                    max_results=max_results * 3 if allowed_domains else max_results,
+                )
+            elif backend_kind == "html":
+                if backend == "sm":
+                    raw_results = perform_sm_web_search(
+                        normalized_query,
+                        max_results=max_results * 3 if allowed_domains else max_results,
+                    )
+                elif backend == "so360":
+                    raw_results = perform_so360_web_search(
+                        normalized_query,
+                        max_results=max_results * 3 if allowed_domains else max_results,
+                    )
+                elif backend == "sogou":
+                    raw_results = perform_sogou_web_search(
+                        normalized_query,
+                        max_results=max_results * 3 if allowed_domains else max_results,
+                    )
+                else:
+                    raise RuntimeError(f"Unsupported html search backend: {backend}")
+            else:
+                ddgs = DDGS(timeout=PROVIDER_WEB_SEARCH_DIRECT_TIMEOUT_S)
+                raw_results = ddgs.text(
+                    normalized_query,
+                    region="wt-wt",
+                    safesearch="moderate",
+                    backend=backend,
+                    max_results=max_results * 3 if allowed_domains else max_results,
+                )
+        except Exception as exc:
+            errors.append(f"{backend}: {str(exc)[:300]}")
+            logger.info("provider web_search backend failed backend=%s query=%r error=%s", backend, normalized_query[:160], str(exc)[:300])
             continue
-        normalized_results.append(
-            {
-                "title": str(item.get("title") or "").strip(),
-                "url": url,
-                "content": str(item.get("body") or item.get("snippet") or "").strip(),
-            }
+        saw_raw_results = saw_raw_results or bool(raw_results)
+        normalized_results = _normalize_provider_search_results(
+            raw_results,
+            query=normalized_query,
+            max_results=max_results,
+            allowed_domains=allowed_domains,
         )
-        if len(normalized_results) >= max_results:
-            break
+        if raw_results and not normalized_results:
+            errors.append(f"{backend}: returned {len(raw_results)} raw results but 0 matched filters")
+            continue
+        if raw_results:
+            logger.warning(
+                "provider web_search backend succeeded backend=%s query=%r results=%d",
+                backend,
+                normalized_query[:160],
+                len(normalized_results),
+            )
+            return {
+                "query": normalized_query,
+                "total_results": len(normalized_results),
+                "results": normalized_results,
+                "backend": backend,
+            }
+    if not saw_raw_results:
+        raise RuntimeError("; ".join(errors) or "No results found.")
     return {
         "query": normalized_query,
-        "total_results": len(normalized_results),
-        "results": normalized_results,
+        "total_results": 0,
+        "results": [],
+        "error": "; ".join(errors),
     }
+
+
+def perform_browser_provider_web_search(
+    query: str,
+    *,
+    max_results: int,
+    allowed_domains: list[str],
+) -> dict[str, Any]:
+    normalized_query = (query or "").strip()
+    if not normalized_query:
+        return {"query": "", "total_results": 0, "results": []}
+    browser_search_fn = {
+        "bing": perform_bing_browser_web_search,
+        "baidu": perform_baidu_browser_web_search,
+    }.get(PROVIDER_WEB_SEARCH_BROWSER_ENGINE)
+    if browser_search_fn is None:
+        raise RuntimeError(f"Unsupported browser search engine: {PROVIDER_WEB_SEARCH_BROWSER_ENGINE}")
+    errors: list[str] = []
+    for browser_query in _browser_search_queries(normalized_query):
+        try:
+            raw_results = browser_search_fn(
+                browser_query,
+                max_results=max_results * 3 if allowed_domains else max_results,
+            )
+            normalized_results = _normalize_provider_search_results(
+                raw_results,
+                query=normalized_query,
+                max_results=max_results,
+                allowed_domains=allowed_domains,
+            )
+        except Exception as exc:
+            errors.append(f"{browser_query[:80]}: {str(exc)[:200]}")
+            continue
+        if not normalized_results:
+            errors.append(f"{browser_query[:80]}: no usable results")
+            continue
+        logger.warning(
+            "provider web_search browser succeeded engine=%s query=%r browser_query=%r results=%d",
+            PROVIDER_WEB_SEARCH_BROWSER_ENGINE,
+            normalized_query[:160],
+            browser_query[:160],
+            len(normalized_results),
+        )
+        return {
+            "query": normalized_query,
+            "total_results": len(normalized_results),
+            "results": normalized_results,
+            "backend": f"browser:{PROVIDER_WEB_SEARCH_BROWSER_ENGINE}",
+        }
+    raise RuntimeError(f"Browser {PROVIDER_WEB_SEARCH_BROWSER_ENGINE} returned no usable results. " + "; ".join(errors[:3]))
+
+
+def perform_provider_web_search(
+    query: str,
+    *,
+    max_results: int,
+    allowed_domains: list[str],
+) -> dict[str, Any]:
+    if not PROVIDER_WEB_SEARCH_BROWSER_ENABLED:
+        return perform_direct_provider_web_search(
+            query,
+            max_results=max_results,
+            allowed_domains=allowed_domains,
+        )
+
+    errors: list[str] = []
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ProviderWebSearch")
+    futures: dict[concurrent.futures.Future[dict[str, Any]], str] = {
+        executor.submit(
+            perform_browser_provider_web_search,
+            query,
+            max_results=max_results,
+            allowed_domains=allowed_domains,
+        ): "browser:bing",
+        executor.submit(
+            perform_direct_provider_web_search,
+            query,
+            max_results=max_results,
+            allowed_domains=allowed_domains,
+        ): "direct",
+    }
+    try:
+        pending = set(futures)
+        fallback_result: dict[str, Any] | None = None
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=PROVIDER_WEB_SEARCH_BROWSER_TIMEOUT_S,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            for future in done:
+                source = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    errors.append(f"{source}: {str(exc)[:300]}")
+                    logger.info("provider web_search parallel source failed source=%s query=%r error=%s", source, str(query or "")[:160], str(exc)[:300])
+                    continue
+                if isinstance(result, dict) and result.get("results"):
+                    if source == "browser:bing":
+                        for leftover in pending:
+                            leftover.cancel()
+                        return result
+                    fallback_result = result
+                    if pending and PROVIDER_WEB_SEARCH_BROWSER_GRACE_S > 0:
+                        grace_done, pending = concurrent.futures.wait(
+                            pending,
+                            timeout=PROVIDER_WEB_SEARCH_BROWSER_GRACE_S,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for grace_future in grace_done:
+                            grace_source = futures[grace_future]
+                            try:
+                                grace_result = grace_future.result()
+                            except Exception as exc:
+                                errors.append(f"{grace_source}: {str(exc)[:300]}")
+                                logger.info("provider web_search parallel source failed source=%s query=%r error=%s", grace_source, str(query or "")[:160], str(exc)[:300])
+                                continue
+                            if isinstance(grace_result, dict) and grace_result.get("results"):
+                                if grace_source == "browser:bing":
+                                    for leftover in pending:
+                                        leftover.cancel()
+                                    return grace_result
+                                fallback_result = grace_result
+                    for leftover in pending:
+                        leftover.cancel()
+                    return fallback_result
+                errors.append(f"{source}: no usable results")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    raise RuntimeError("; ".join(errors) or "No results found.")
+
+
+def perform_provider_web_fetch(
+    url: str,
+    *,
+    include_html: bool = False,
+    max_bytes: int = PROVIDER_WEB_FETCH_MAX_BYTES,
+) -> dict[str, Any]:
+    return _perform_provider_web_fetch(
+        url,
+        include_html=include_html,
+        max_bytes=max_bytes,
+        _redirect_depth=0,
+    )
+
+
+def _perform_provider_web_fetch(
+    url: str,
+    *,
+    include_html: bool = False,
+    max_bytes: int = PROVIDER_WEB_FETCH_MAX_BYTES,
+    _redirect_depth: int = 0,
+) -> dict[str, Any]:
+    normalized_url = str(url or "").strip()
+    parsed = urlparse(normalized_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(f"Invalid URL for web_fetch: {normalized_url!r}")
+
+    capped_bytes = max(50_000, min(int(max_bytes or PROVIDER_WEB_FETCH_MAX_BYTES), PROVIDER_WEB_FETCH_MAX_BYTES))
+    request = Request(
+        _ascii_safe_url_for_request(normalized_url),
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    )
+    with _ascii_safe_opener().open(request, timeout=30) as response:
+        body = response.read(capped_bytes)
+        content_type = str(response.headers.get("Content-Type") or "")
+        status = int(getattr(response, "status", 200) or 200)
+
+    charset_match = re.search(r"charset=([\w.-]+)", content_type, re.I)
+    charset = charset_match.group(1) if charset_match else "utf-8"
+    try:
+        html_text = body.decode(charset, "ignore")
+    except LookupError:
+        html_text = body.decode("utf-8", "ignore")
+
+    if _redirect_depth < 2:
+        js_redirect_url = _extract_js_redirect_url(html_text, normalized_url)
+        if js_redirect_url and js_redirect_url != normalized_url:
+            return _perform_provider_web_fetch(
+                js_redirect_url,
+                include_html=include_html,
+                max_bytes=max_bytes,
+                _redirect_depth=_redirect_depth + 1,
+            )
+
+    title_match = re.search(r"<title\b[^>]*>(.*?)</title>", html_text, re.I | re.S)
+    title = _plain_text_from_html(title_match.group(1)) if title_match else ""
+    captcha_hit = bool(
+        re.search(r"(请输入验证码|验证码下载附件|附件下载|createimage\.jsp|codeValue|changeCodeImg)", html_text, re.I)
+        and re.search(r"(验证码|codeValue|createimage\.jsp)", html_text, re.I)
+    )
+    if captcha_hit:
+        img_match = re.search(r"<img[^>]+(?:id=['\"]codeimg['\"][^>]*src|src)=['\"]([^'\"]*createimage\.jsp[^'\"]*)['\"]", html_text, re.I)
+        captcha_img_url = urljoin(normalized_url, img_match.group(1)) if img_match else ""
+        content = "下载受阻：该页面要求输入验证码，未获取到真实附件。"
+        if captcha_img_url:
+            content += f"\n验证码图片：{captcha_img_url}"
+        content += "\n建议：保留该附件 URL 清单，由用户在浏览器中输入验证码下载，或接入浏览器自动化人工确认流程。"
+        return {
+            "url": normalized_url,
+            "status": status,
+            "content_type": content_type,
+            "title": title or "附件下载需要验证码",
+            "content": content,
+            "bytes": len(body),
+            "captcha_required": True,
+            "captcha_image_url": captcha_img_url,
+        }
+    cleaned_text = ""
+    try:
+        import trafilatura
+
+        cleaned_text = trafilatura.extract(
+            html_text,
+            url=normalized_url,
+            favor_recall=True,
+            include_links=True,
+        ) or ""
+    except Exception as exc:
+        logger.info("provider web_fetch trafilatura failed url=%r error=%s", normalized_url[:240], str(exc)[:300])
+    if not cleaned_text:
+        cleaned_text = re.sub(r"\s+", " ", _plain_text_from_html(html_text)).strip()
+    supplemental_links = _extract_representative_page_links(html_text, normalized_url, cleaned_text, limit=14)
+    if supplemental_links:
+        links_block = "页面关键链接：\n" + "\n".join(f"- {item}" for item in supplemental_links)
+        cleaned_text = (cleaned_text.strip() + "\n\n" + links_block).strip() if cleaned_text.strip() else links_block
+
+    result: dict[str, Any] = {
+        "url": normalized_url,
+        "status": status,
+        "content_type": content_type,
+        "title": title,
+        "content": cleaned_text,
+        "bytes": len(body),
+    }
+    if include_html:
+        result["html"] = html_text
+    return result
+
+
+def _extract_representative_page_links(
+    html_text: str,
+    base_url: str,
+    cleaned_text: str,
+    *,
+    limit: int = 14,
+) -> list[str]:
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    base_host = str(urlparse(base_url).netloc or "").lower()
+    existing_urls = set(re.findall(r"https?://[^\s)\]]+", str(cleaned_text or "")))
+    seen_urls: set[str] = set()
+    scored: list[tuple[int, str]] = []
+    keyword_re = re.compile(r"(通知|公告|新闻|招标|采购|调研|公示|学校|学院|列表|详情)", re.I)
+    attachment_url_re = re.compile(
+        r"(\.(?:docx?|xlsx?|pptx?|pdf|zip|rar|7z)(?:$|[\s?&#）)]|%[0-9a-f]{2})|"
+        r"(?:^|[/?&=_-])(?:download|attach(?:ment)?|file|files|doc|docs)(?:$|[/?&=_-])|"
+        r"(?:^|[?&])(?:fileid|wbfileid|attachid|attachmentid|filename|filepath|file|path)=)",
+        re.I,
+    )
+
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href") or "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        absolute = urljoin(base_url, html_lib.unescape(href))
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        url_like_download = bool(attachment_url_re.search(f"{absolute} {parsed.path}")) or anchor.has_attr("download")
+        text = _plain_text_from_html(anchor.get_text(" ", strip=True))
+        if not text:
+            text = _plain_text_from_html(str(anchor.get("title") or "")).strip()
+        if not text and url_like_download:
+            text = unquote(str(parsed.path or "").rsplit("/", 1)[-1] or "下载链接") or "下载链接"
+        if not text:
+            continue
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) < 2:
+            continue
+        absolute = absolute.strip()
+        if absolute in seen_urls or absolute in existing_urls:
+            continue
+        seen_urls.add(absolute)
+
+        score = 0
+        host = str(parsed.netloc or "").lower()
+        path = str(parsed.path or "")
+        if host == base_host:
+            score += 40
+        elif host.endswith("." + base_host):
+            score += 30
+        else:
+            score += 5
+        is_attachment = url_like_download
+        if is_attachment:
+            score += 90
+        if path.endswith((".htm", ".html", ".shtml")):
+            score += 18
+        if "/info/" in path or "/index/" in path:
+            score += 12
+        if keyword_re.search(text) or keyword_re.search(path):
+            score += 20
+        if 2 <= len(text) <= 18:
+            score += 12
+        elif len(text) <= 36:
+            score += 6
+        if re.search(r"\d{4}[-/]\d{2}[-/]\d{2}", text):
+            score += 4
+
+        label = f"下载链接：{text}" if is_attachment and not re.search(r"^(附件|下载|download)", text, re.I) else text
+        scored.append((score, f"{label} -> {absolute}"))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [item for _, item in scored[: max(1, int(limit or 14))]]
+
+
+async def perform_provider_web_search_with_retries(
+    query: str,
+    *,
+    max_results: int,
+    allowed_domains: list[str],
+    request_id: str,
+    context: str,
+) -> dict[str, Any]:
+    last_exc: Exception | None = None
+    for attempt in range(1, PROVIDER_WEB_SEARCH_ATTEMPTS + 1):
+        try:
+            result = await asyncio.to_thread(
+                perform_provider_web_search,
+                query,
+                max_results=max_results,
+                allowed_domains=allowed_domains,
+            )
+            if attempt > 1:
+                logger.warning(
+                    "provider[%s] web_search recovered context=%s attempt=%d results=%d",
+                    request_id,
+                    context,
+                    attempt,
+                    len(result.get("results", []) if isinstance(result, dict) else []),
+                )
+            return result
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= PROVIDER_WEB_SEARCH_ATTEMPTS:
+                break
+            logger.warning(
+                "provider[%s] web_search failed context=%s attempt=%d/%d: %s",
+                request_id,
+                context,
+                attempt,
+                PROVIDER_WEB_SEARCH_ATTEMPTS,
+                str(exc)[:300],
+            )
+            if PROVIDER_WEB_SEARCH_RETRY_DELAY_S > 0:
+                await asyncio.sleep(PROVIDER_WEB_SEARCH_RETRY_DELAY_S)
+    assert last_exc is not None
+    raise last_exc
 
 
 def build_provider_web_search_item(
@@ -1888,6 +3057,34 @@ def build_provider_web_search_item(
         "status": "completed",
         "action": action,
     }
+
+
+def build_provider_web_search_context(search_results: list[dict[str, Any]]) -> str:
+    compact_results: list[dict[str, Any]] = []
+    for search_result in search_results:
+        if not isinstance(search_result, dict):
+            continue
+        compact_results.append(
+            {
+                "query": search_result.get("query", ""),
+                "error": search_result.get("error", ""),
+                "results": [
+                    {
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "snippet": item.get("content", ""),
+                    }
+                    for item in search_result.get("results", [])
+                    if isinstance(item, dict)
+                ],
+            }
+        )
+    return (
+        "Provider-side web search has already been executed locally using DDGS. "
+        "Use the following search results as current external evidence, cite URLs when relevant, "
+        "and do not call a web_search tool for the same query again.\n"
+        f"{json.dumps(compact_results, ensure_ascii=False, indent=2)}"
+    )
 
 
 def _dedupe_search_results(search_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1945,7 +3142,7 @@ def _filter_internal_web_search_calls(payload: dict[str, Any]) -> dict[str, Any]
     filtered = [
         tool_call
         for tool_call in tool_calls
-        if not (isinstance(tool_call, dict) and tool_call.get("name") == PROVIDER_WEB_SEARCH_TOOL_NAME)
+        if not (isinstance(tool_call, dict) and tool_call.get("name") in PROVIDER_WEB_TOOL_NAMES)
     ]
     if len(filtered) == len(tool_calls):
         return payload
@@ -2094,12 +3291,12 @@ async def resolve_provider_web_search(
         provider_calls = [
             tool_call
             for tool_call in raw_tool_calls
-            if isinstance(tool_call, dict) and tool_call.get("name") == PROVIDER_WEB_SEARCH_TOOL_NAME
+            if isinstance(tool_call, dict) and tool_call.get("name") in PROVIDER_WEB_TOOL_NAMES
         ]
         non_provider_tool_calls = [
             tool_call
             for tool_call in raw_tool_calls
-            if isinstance(tool_call, dict) and tool_call.get("name") != PROVIDER_WEB_SEARCH_TOOL_NAME
+            if isinstance(tool_call, dict) and tool_call.get("name") not in PROVIDER_WEB_TOOL_NAMES
         ]
         synthesized_provider_call = False
 
@@ -2122,27 +3319,44 @@ async def resolve_provider_web_search(
         tool_messages: list[dict[str, Any]] = []
         for tool_call in provider_calls:
             tool_call_id = str(tool_call.get("id") or f"call_{uuid.uuid4().hex}")
+            tool_name = str(tool_call.get("name") or PROVIDER_WEB_SEARCH_TOOL_NAME)
             arguments = _normalize_tool_call_arguments(tool_call.get("arguments"))
-            query = str(arguments.get("query") or "").strip() or _latest_user_text(request_messages)
-            if not query:
-                continue
-            search_result = await asyncio.to_thread(
-                perform_provider_web_search,
-                query,
-                max_results=max_results,
-                allowed_domains=allowed_domains,
-            )
-            search_results.append(search_result)
-            web_search_items.append(
-                build_provider_web_search_item(search_result, include_sources=include_sources)
-            )
+            if tool_name == PROVIDER_WEB_FETCH_TOOL_NAME:
+                url = str(arguments.get("url") or "").strip()
+                if not url:
+                    continue
+                fetch_result = await asyncio.to_thread(
+                    perform_provider_web_fetch,
+                    url,
+                    include_html=bool(arguments.get("include_html")),
+                )
+                tool_result: dict[str, Any] = {
+                    "type": "web_fetch",
+                    **fetch_result,
+                }
+            else:
+                query = str(arguments.get("query") or "").strip() or _latest_user_text(request_messages)
+                if not query:
+                    continue
+                search_result = await perform_provider_web_search_with_retries(
+                    query,
+                    max_results=max_results,
+                    allowed_domains=allowed_domains,
+                    request_id=request_id,
+                    context="responses-tool-call",
+                )
+                search_results.append(search_result)
+                web_search_items.append(
+                    build_provider_web_search_item(search_result, include_sources=include_sources)
+                )
+                tool_result = search_result
             assistant_tool_calls.append(
                 {
                     "id": tool_call_id,
                     "type": "function",
                     "function": {
-                        "name": PROVIDER_WEB_SEARCH_TOOL_NAME,
-                        "arguments": json.dumps({"query": query}, ensure_ascii=False),
+                        "name": tool_name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
                     },
                 }
             )
@@ -2150,7 +3364,7 @@ async def resolve_provider_web_search(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": json.dumps(search_result, ensure_ascii=False),
+                    "content": json.dumps(tool_result, ensure_ascii=False),
                 }
             )
 
@@ -2185,6 +3399,54 @@ async def resolve_provider_web_search(
         )
 
     return _filter_internal_web_search_calls(payload), web_search_items, search_results
+
+
+async def resolve_provider_web_search_eager(
+    *,
+    request_messages: list[dict[str, Any]],
+    web_search_tools: list[dict[str, Any]],
+    request_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    if not web_search_tools:
+        return request_messages, [], []
+
+    query = _latest_user_text(request_messages)
+    if not query:
+        return request_messages, [], []
+
+    max_results = _extract_max_results(web_search_tools)
+    allowed_domains = _extract_allowed_domains(web_search_tools)
+    try:
+        search_result = await perform_provider_web_search_with_retries(
+            query,
+            max_results=max_results,
+            allowed_domains=allowed_domains,
+            request_id=request_id,
+            context="responses-eager",
+        )
+    except Exception as exc:
+        logger.exception("provider[%s] eager web_search failed query=%r", request_id, query)
+        search_result = {
+            "query": query,
+            "total_results": 0,
+            "results": [],
+            "error": str(exc),
+        }
+
+    web_search_items = [build_provider_web_search_item(search_result, include_sources=True)]
+    search_results = [search_result]
+    updated_messages = _append_system_hint(
+        request_messages,
+        build_provider_web_search_context(search_results),
+    )
+    logger.warning(
+        "provider[%s] eager web_search completed query=%r results=%d allowed_domains=%s",
+        request_id,
+        query[:240],
+        len(search_result.get("results", []) if isinstance(search_result, dict) else []),
+        allowed_domains,
+    )
+    return updated_messages, web_search_items, search_results
 
 
 def build_responses_body(
@@ -2414,6 +3676,89 @@ def _type_matches_json_schema(value: Any, expected_type: str) -> bool:
     if expected_type == "array":
         return isinstance(value, list)
     return True
+
+
+def _coerce_string_for_json_schema_type(value: Any, expected_type: str) -> tuple[Any, bool]:
+    if not isinstance(value, str):
+        return value, False
+    raw = value.strip()
+    if expected_type == "integer" and re.fullmatch(r"[+-]?\d+", raw):
+        try:
+            return int(raw), True
+        except ValueError:
+            return value, False
+    if expected_type == "number" and re.fullmatch(r"[+-]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[eE][+-]?\d+)?", raw):
+        try:
+            return (float(raw) if re.search(r"[.eE]", raw) else int(raw)), True
+        except ValueError:
+            return value, False
+    if expected_type == "boolean":
+        lowered = raw.lower()
+        if lowered == "true":
+            return True, True
+        if lowered == "false":
+            return False, True
+    return value, False
+
+
+def _coerce_arguments_for_schema_scalar_types(value: Any, schema: Any) -> tuple[Any, bool]:
+    if not isinstance(schema, dict):
+        return value, False
+
+    schema_type = schema.get("type")
+    if schema_type == "object" and isinstance(value, dict):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return value, False
+        updated = dict(value)
+        rewritten = False
+        for key, prop_schema in properties.items():
+            if key not in updated or not isinstance(prop_schema, dict):
+                continue
+            prop_type = prop_schema.get("type")
+            prop_types = prop_type if isinstance(prop_type, list) else [prop_type]
+            coerced = updated[key]
+            coerced_rewritten = False
+            for expected_type in prop_types:
+                if not isinstance(expected_type, str):
+                    continue
+                candidate, candidate_rewritten = _coerce_string_for_json_schema_type(coerced, expected_type)
+                if candidate_rewritten and _type_matches_json_schema(candidate, expected_type):
+                    coerced = candidate
+                    coerced_rewritten = True
+                    break
+            if coerced_rewritten:
+                updated[key] = coerced
+                rewritten = True
+                continue
+            nested_value, nested_rewritten = _coerce_arguments_for_schema_scalar_types(updated[key], prop_schema)
+            if nested_rewritten:
+                updated[key] = nested_value
+                rewritten = True
+        return updated, rewritten
+
+    if schema_type == "array" and isinstance(value, list):
+        item_schema = schema.get("items")
+        if not isinstance(item_schema, dict):
+            return value, False
+        updated_items = []
+        rewritten = False
+        for item in value:
+            nested_value, nested_rewritten = _coerce_arguments_for_schema_scalar_types(item, item_schema)
+            updated_items.append(nested_value)
+            rewritten = rewritten or nested_rewritten
+        return updated_items, rewritten
+
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            nested_value, nested_rewritten = _coerce_arguments_for_schema_scalar_types(value, variant)
+            if nested_rewritten:
+                return nested_value, True
+
+    return value, False
 
 
 def _schema_allows_null(schema: Any) -> bool:
@@ -2677,6 +4022,13 @@ def validate_tool_calls_against_schemas(payload: dict[str, Any], tools: list[dic
             arguments = normalized_arguments
             rewritten = True
 
+        typed_arguments, typed_rewritten = _coerce_arguments_for_schema_scalar_types(arguments, schema)
+        if typed_rewritten and isinstance(typed_arguments, dict):
+            tool_call = dict(tool_call)
+            tool_call["arguments"] = typed_arguments
+            arguments = typed_arguments
+            rewritten = True
+
         if isinstance(required, list):
             missing = [key for key in required if key not in arguments]
             if missing:
@@ -2735,12 +4087,14 @@ def run_bridge_with_spec(
     original_sticky_reanchor_messages = bridge.sticky_reanchor_messages
     original_session_state_path = bridge.session_state_path
     original_reuse_persisted_chat = bridge.reuse_persisted_chat
+    original_fast_new_chat = bridge.fast_new_chat
     try:
         bridge.force_new_chat = spec.force_new_chat
         bridge.sticky_marker = spec.sticky_marker
         bridge.sticky_reanchor_messages = spec.sticky_reanchor_messages
         bridge.session_state_path = spec.session_state_path
         bridge.reuse_persisted_chat = spec.reuse_persisted_chat
+        bridge.fast_new_chat = spec.fast_new_chat
         return operation()
     finally:
         bridge.force_new_chat = original_force_new_chat
@@ -2748,11 +4102,131 @@ def run_bridge_with_spec(
         bridge.sticky_reanchor_messages = original_sticky_reanchor_messages
         bridge.session_state_path = original_session_state_path
         bridge.reuse_persisted_chat = original_reuse_persisted_chat
+        bridge.fast_new_chat = original_fast_new_chat
+
+
+def provider_capabilities_payload() -> dict[str, Any]:
+    return {
+        "interfaces": {
+            "openai_chat_completions": {
+                "path": "/v1/chat/completions",
+                "method": "POST",
+                "output_protocols": ["plain", "openai"],
+                "default_output_protocol": "openai",
+                "plain_output_protocol": {
+                    "output_protocol": "plain",
+                    "extra_body": {"output_protocol": "plain"},
+                },
+            },
+            "openai_responses": {
+                "path": "/v1/responses",
+                "method": "POST",
+                "output_protocol": "openai",
+                "tools": ["web_search", "web_search_preview", "web_fetch"],
+            },
+            "direct_web_search": {
+                "path": "/v1/web-search",
+                "method": "POST",
+                "description": "Provider-side direct web search. Does not call the web LLM or use any output protocol.",
+            },
+            "direct_web_fetch": {
+                "path": "/v1/web-fetch",
+                "method": "POST",
+                "description": "Provider-side direct URL fetch and trafilatura cleanup. Does not call the web LLM or use any output protocol.",
+            },
+            "anthropic_messages": {
+                "path": "/v1/messages",
+                "method": "POST",
+                "output_protocol": "anthropic",
+            },
+        },
+        "output_protocols": {
+            "plain": {
+                "description": "Plain bash-agent output for Agent Qt local runner. Use /v1/chat/completions with output_protocol=plain.",
+                "endpoint": "/v1/chat/completions",
+            },
+            "openai": {
+                "description": "OpenAI-compatible JSON/tool_calls bridge output. Used by /v1/chat/completions and /v1/responses.",
+                "endpoints": ["/v1/chat/completions", "/v1/responses"],
+            },
+            "anthropic": {
+                "description": "Anthropic-compatible tool_use bridge output. Used by /v1/messages.",
+                "endpoint": "/v1/messages",
+            },
+        },
+        "defaults": {
+            "chat_completions_output_protocol": "openai",
+            "responses_output_protocol": "openai",
+            "messages_output_protocol": "anthropic",
+            "app_internal_web_research_path": "/v1/web-search",
+            "web_ui_search_enabled": False,
+            "use_system_proxy": PROVIDER_USE_SYSTEM_PROXY,
+            "web_search_backends": list(PROVIDER_WEB_SEARCH_BACKENDS),
+        },
+    }
+
+
+def apply_provider_proxy_mode(use_system_proxy: bool, proxy_env: dict[str, str] | None = None) -> dict[str, Any]:
+    global PROVIDER_USE_SYSTEM_PROXY, PROVIDER_WEB_SEARCH_BACKENDS
+
+    PROVIDER_USE_SYSTEM_PROXY = bool(use_system_proxy)
+    os.environ["DEEPSEEK_PROVIDER_USE_SYSTEM_PROXY"] = "1" if PROVIDER_USE_SYSTEM_PROXY else "0"
+    os.environ["AGENT_QT_USE_SYSTEM_PROXY"] = "1" if PROVIDER_USE_SYSTEM_PROXY else "0"
+    os.environ["DEEPSEEK_WEB_DISABLE_PROXY"] = "0" if PROVIDER_USE_SYSTEM_PROXY else "1"
+    deepseek_web_bridge_module.DISABLE_SYSTEM_PROXY = not PROVIDER_USE_SYSTEM_PROXY
+    if PROVIDER_USE_SYSTEM_PROXY:
+        for key, value in (proxy_env or {}).items():
+            if key in PROVIDER_PROXY_ENV_KEYS and str(value or "").strip():
+                os.environ[key] = str(value).strip()
+    else:
+        for key in PROVIDER_PROXY_ENV_KEYS:
+            os.environ.pop(key, None)
+    os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
+    os.environ.setdefault("no_proxy", os.environ["NO_PROXY"])
+    if not os.environ.get("DEEPSEEK_PROVIDER_WEB_SEARCH_BACKENDS", "").strip():
+        backends_raw = (
+            "so360,sogou,sm,duckduckgo,bing,google,brave"
+            if PROVIDER_USE_SYSTEM_PROXY
+            else "so360,sogou,sm,duckduckgo"
+        )
+        PROVIDER_WEB_SEARCH_BACKENDS = tuple(item.strip() for item in backends_raw.split(",") if item.strip())
+    close_bridges()
+    logger.warning(
+        "Provider proxy mode updated use_system_proxy=%s search_backends=%s proxy_env_keys=%s",
+        PROVIDER_USE_SYSTEM_PROXY,
+        ",".join(PROVIDER_WEB_SEARCH_BACKENDS),
+        ",".join(sorted(_proxy_env_snapshot())),
+    )
+    return {
+        "use_system_proxy": PROVIDER_USE_SYSTEM_PROXY,
+        "web_search_backends": list(PROVIDER_WEB_SEARCH_BACKENDS),
+        "proxy_env_keys": sorted(_proxy_env_snapshot()),
+    }
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, Any]:
+    return {"status": "ok", "capabilities": provider_capabilities_payload()}
+
+
+@app.get("/status")
+async def provider_status() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "default_model": DEFAULT_MODEL_ID,
+        "models": list(MODEL_SPECS.keys()),
+        "capabilities": provider_capabilities_payload(),
+        "proxy": {
+            "use_system_proxy": PROVIDER_USE_SYSTEM_PROXY,
+            "web_search_backends": list(PROVIDER_WEB_SEARCH_BACKENDS),
+            "proxy_env_keys": sorted(_proxy_env_snapshot()),
+        },
+    }
+
+
+@app.post("/debug/proxy-mode")
+async def debug_proxy_mode(request: ProviderProxyModeRequest) -> dict[str, Any]:
+    return {"status": "ok", **apply_provider_proxy_mode(request.use_system_proxy, request.proxy_env)}
 
 
 @app.post("/debug/open-login")
@@ -2808,6 +4282,55 @@ async def list_models() -> dict[str, Any]:
     }
 
 
+@app.post("/v1/web-search", response_model=None)
+async def direct_web_search(request: DirectWebSearchRequest) -> dict[str, Any]:
+    if not is_interface_enabled("openai"):
+        raise HTTPException(status_code=404, detail="OpenAI-compatible endpoints are disabled by interface mode.")
+    max_results = max(1, min(int(request.max_results or PROVIDER_WEB_SEARCH_MAX_RESULTS), PROVIDER_WEB_SEARCH_MAX_RESULTS))
+    allowed_domains = [
+        str(domain or "").strip().lower().strip(".")
+        for domain in (request.allowed_domains or [])
+        if str(domain or "").strip()
+    ]
+    try:
+        result = await perform_provider_web_search_with_retries(
+            request.query,
+            max_results=max_results,
+            allowed_domains=allowed_domains,
+            request_id=uuid.uuid4().hex[:8],
+            context="direct-web-search",
+        )
+    except Exception as exc:
+        logger.exception("provider direct web-search failed query=%r", request.query)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "object": "web_search.result",
+        "status": "completed",
+        **result,
+    }
+
+
+@app.post("/v1/web-fetch", response_model=None)
+async def direct_web_fetch(request: DirectWebFetchRequest) -> dict[str, Any]:
+    if not is_interface_enabled("openai"):
+        raise HTTPException(status_code=404, detail="OpenAI-compatible endpoints are disabled by interface mode.")
+    try:
+        result = await asyncio.to_thread(
+            perform_provider_web_fetch,
+            request.url,
+            include_html=bool(request.include_html),
+            max_bytes=max(50_000, min(int(request.max_bytes or PROVIDER_WEB_FETCH_MAX_BYTES), PROVIDER_WEB_FETCH_MAX_BYTES)),
+        )
+    except Exception as exc:
+        logger.exception("provider direct web-fetch failed url=%r", request.url)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "object": "web_fetch.result",
+        "status": "completed",
+        **result,
+    }
+
+
 @app.post("/v1/responses", response_model=None)
 async def responses(request: ResponsesRequest):
     if not is_interface_enabled("openai"):
@@ -2817,15 +4340,25 @@ async def responses(request: ResponsesRequest):
     resolved_model = spec.model_id
     request_id = uuid.uuid4().hex[:8]
     request_tools, request_web_search_tools = split_responses_tools(request.tools)
+    eager_web_search = bool(request_web_search_tools and PROVIDER_WEB_SEARCH_EAGER)
     bridge_tools = list(request_tools)
-    if request_web_search_tools:
+    if request_web_search_tools and not eager_web_search:
         bridge_tools.append(build_provider_web_search_tool(request_web_search_tools))
+        bridge_tools.append(build_provider_web_fetch_tool())
     request_messages = responses_input_to_chat_messages(
         request.input,
         request.instructions,
         has_tools=bool(bridge_tools),
     )
-    if request_web_search_tools:
+    web_search_items: list[dict[str, Any]] = []
+    search_results: list[dict[str, Any]] = []
+    if request_web_search_tools and eager_web_search:
+        request_messages, web_search_items, search_results = await resolve_provider_web_search_eager(
+            request_messages=request_messages,
+            web_search_tools=request_web_search_tools,
+            request_id=request_id,
+        )
+    elif request_web_search_tools:
         request_messages = _append_system_hint(request_messages, PROVIDER_WEB_SEARCH_TOOL_HINT)
     if not request_messages:
         request_messages = [{"role": "user", "content": ""}]
@@ -2838,13 +4371,15 @@ async def responses(request: ResponsesRequest):
         spec=spec,
     )
     logger.warning(
-        "provider[%s] /v1/responses start model=%s stream=%s messages=%d tools=%d thinking_enabled=%s",
+        "provider[%s] /v1/responses start model=%s stream=%s messages=%d tools=%d thinking_enabled=%s web_search_tools=%d eager_web_search=%s",
         request_id,
         resolved_model,
         request.stream,
         len(request_messages),
         len(bridge_tools),
         request_thinking_enabled,
+        len(request_web_search_tools),
+        eager_web_search,
     )
 
     try:
@@ -2881,17 +4416,20 @@ async def responses(request: ResponsesRequest):
     )
 
     raise_if_web_busy_payload(payload, request_id, "/v1/responses")
-    payload, web_search_items, search_results = await resolve_provider_web_search(
-        payload=payload,
-        pool=pool,
-        spec=spec,
-        request_id=request_id,
-        request_messages=request_messages,
-        bridge_tools=bridge_tools,
-        request_thinking_enabled=request_thinking_enabled,
-        request_expert_mode_enabled=request_expert_mode_enabled,
-        web_search_tools=request_web_search_tools,
-    )
+    if request_web_search_tools and not eager_web_search:
+        payload, web_search_items, search_results = await resolve_provider_web_search(
+            payload=payload,
+            pool=pool,
+            spec=spec,
+            request_id=request_id,
+            request_messages=request_messages,
+            bridge_tools=bridge_tools,
+            request_thinking_enabled=request_thinking_enabled,
+            request_expert_mode_enabled=request_expert_mode_enabled,
+            web_search_tools=request_web_search_tools,
+        )
+    else:
+        payload = _filter_internal_web_search_calls(payload)
     payload = apply_text_tool_call_fallback(payload, request_tools)
     payload = validate_tool_calls_against_schemas(payload, request_tools)
     message, tool_calls, _ = build_openai_assistant_message(payload)
@@ -3423,24 +4961,22 @@ def stream_chat_completion_chunks(
             }
             yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
     elif content:
-        for piece in iter_simulated_stream_pieces(content):
-            content_chunk = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": piece},
-                        "finish_reason": None,
-                        "logprobs": None,
-                    }
-                ],
-                "system_fingerprint": None,
-            }
-            yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
-            time.sleep(0.03)
+        content_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": content},
+                    "finish_reason": None,
+                    "logprobs": None,
+                }
+            ],
+            "system_fingerprint": None,
+        }
+        yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
 
     final_chunk = {
         "id": chunk_id,
@@ -3509,13 +5045,13 @@ def stream_anthropic_message_events(response_body: dict[str, Any]) -> Iterator[s
                     "content_block": {"type": "text", "text": ""},
                 },
             )
-            for piece in iter_simulated_stream_pieces(text):
+            if text:
                 yield emit(
                     "content_block_delta",
                     {
                         "type": "content_block_delta",
                         "index": index,
-                        "delta": {"type": "text_delta", "text": piece},
+                        "delta": {"type": "text_delta", "text": text},
                     },
                 )
             yield emit("content_block_stop", {"type": "content_block_stop", "index": index})
