@@ -107,13 +107,25 @@ jobs:
           pyinstaller `
             --noconfirm `
             --clean `
-            AgentQT.spec
+            --onefile `
+            --windowed `
+            --name AgentQT `
+            --add-data "plugins;plugins" `
+            --add-data "assets\\app_icon.png;assets" `
+            --add-data "assets\\copy-transparent.png;assets" `
+            --add-data "assets\\copy-transparent.svg;assets" `
+            --add-data "assets\\icon-windowed.ico;assets" `
+            --add-data "assets\\icon-windowed.icns;assets" `
+            --add-data "assets\\homepage;assets\\homepage" `
+            --add-data "assets\\icon.iconset;assets\\icon.iconset" `
+            --icon "assets\\icon-windowed.ico" `
+            agent_qt_stream_quick.py
 
       - name: Prepare release zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release | Out-Null
-          Copy-Item dist\AgentQT\* release\ -Recurse -Force
+          Copy-Item dist\AgentQT.exe release\AgentQT.exe
           Copy-Item README.md release\README.md
           Copy-Item LICENSE release\LICENSE
           @'
