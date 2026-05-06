@@ -2,6 +2,8 @@
 """
 AgentQT
 
+Quick chat view branch cloned from agent_qt.py for isolated iteration.
+
 """
 
 import sys
@@ -43,9 +45,10 @@ from PySide6.QtWidgets import (
     QSpacerItem, QWidgetAction, QAbstractButton, QDialog, QCheckBox, QComboBox,
     QTabWidget
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, QPointF, Property, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, QPointF, Property, QObject, QAbstractListModel, QModelIndex
 from PySide6.QtGui import QFont, QFontMetricsF, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPainterPath, QPen, QColor, QKeySequence, QTextDocument, QImage, QLinearGradient, QRadialGradient, QBrush
 from PySide6.QtCore import QUrl
+from PySide6.QtQuickWidgets import QQuickWidget
 
 try:
     from PySide6.QtSvg import QSvgRenderer
@@ -429,6 +432,13 @@ def parse_boolish(value: object, default: bool = False) -> bool:
 def env_int(name: str, default: int, minimum: int = 1) -> int:
     try:
         return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return default
 
@@ -2066,6 +2076,19 @@ def split_markdown_fenced_blocks(text: str) -> List[Dict[str, str]]:
 
         match = opening_fence(line)
         if match:
+            stripped_line = line.rstrip("\n\r")
+            same_line_match = re.match(r"^\s{0,3}([`~]{3,})([^`\r\n~]*?)\s+(.*?)\s+\1\s*$", stripped_line)
+            if same_line_match:
+                flush_markdown()
+                info = (same_line_match.group(2) or "").strip()
+                code_text = same_line_match.group(3) or ""
+                parts.append({
+                    "type": "code",
+                    "lang": info.split(maxsplit=1)[0] if info else "",
+                    "text": code_text,
+                })
+                index += 1
+                continue
             flush_markdown()
             in_code = True
             fence = match.group(1)
@@ -5005,6 +5028,12 @@ AUTOMATION_CONTEXT_ENTRY_CHAR_LIMIT = env_int("AGENT_QT_AUTOMATION_CONTEXT_ENTRY
 AUTOMATION_CONTEXT_PROVIDER_PAYLOAD_BYTES = env_int("AGENT_QT_AUTOMATION_PROVIDER_PAYLOAD_BYTES", 175000, minimum=50000)
 CHAT_HISTORY_INITIAL_RENDER_ENTRIES = env_int("AGENT_QT_HISTORY_INITIAL_RENDER_ENTRIES", 40, minimum=10)
 CHAT_HISTORY_RENDER_BATCH_SIZE = env_int("AGENT_QT_HISTORY_RENDER_BATCH_SIZE", 7, minimum=1)
+QUICK_CHAT_HISTORY_INITIAL_RENDER_ENTRIES = env_int("AGENT_QT_QUICK_HISTORY_INITIAL_RENDER_ENTRIES", 16, minimum=6)
+QUICK_CHAT_HISTORY_RENDER_BATCH_SIZE = env_int("AGENT_QT_QUICK_HISTORY_RENDER_BATCH_SIZE", 4, minimum=1)
+QUICK_CHAT_SEGMENT_ENTRY_LIMIT = env_int("AGENT_QT_QUICK_SEGMENT_ENTRY_LIMIT", 8, minimum=1)
+QUICK_CHAT_SEGMENT_CHAR_BUDGET = env_int("AGENT_QT_QUICK_SEGMENT_CHAR_BUDGET", 24000, minimum=4000)
+QUICK_CHAT_SINGLE_ITEM_CHAR_BUDGET = env_int("AGENT_QT_QUICK_SINGLE_ITEM_CHAR_BUDGET", 9000, minimum=2000)
+QUICK_CHAT_SINGLE_ITEM_LINE_BUDGET = env_int("AGENT_QT_QUICK_SINGLE_ITEM_LINE_BUDGET", 140, minimum=20)
 
 
 def iter_non_fenced_lines(text: str):
@@ -5884,6 +5913,39 @@ def render_diff_html(record: Dict[str, object]) -> str:
         )
     html_rows.extend(["</table>", "</body></html>"])
     return "".join(html_rows)
+
+
+def quick_diff_view_height(record: Dict[str, object]) -> int:
+    if record.get("binary"):
+        return 92
+    rows = record.get("diff_rows") or []
+    if rows:
+        estimated = 28 + min(len(rows), 220) * 22
+        return max(180, min(620, estimated))
+    diff_text = str(record.get("diff") or "")
+    line_count = max(1, len(diff_text.splitlines()))
+    estimated = 28 + min(line_count, 220) * 22
+    return max(180, min(620, estimated))
+
+
+def render_binary_change_html(record: Dict[str, object]) -> str:
+    status = str(record.get("status", "modified") or "modified")
+    status_text = {
+        "added": "新增二进制/Office 文件",
+        "deleted": "删除二进制/Office 文件",
+        "modified": "二进制/Office 文件已修改",
+    }.get(status, "二进制/Office 文件已变更")
+    path = html.escape(str(record.get("path", "")))
+    return (
+        f"<html><body style='margin:0; background:{COLORS['code_bg']}; color:{COLORS['text']}; "
+        "font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;'>"
+        "<div style='padding:12px 14px;'>"
+        f"<div style='font-weight:700; font-size:13px;'>{status_text}</div>"
+        f"<div style='margin-top:6px; color:{COLORS['text_secondary']}; font-size:12px;'>{path}</div>"
+        f"<div style='margin-top:8px; color:{COLORS['text_secondary']}; font-size:12px;'>"
+        "此类文件无法生成逐行文本 diff，但仍可撤销/重做本轮变更。"
+        "</div></div></body></html>"
+    )
 
 def apply_change_records(root: str, records: List[Dict[str, object]], target_key: str, expected_key: str) -> Dict[str, object]:
     conflicts = []
@@ -11678,6 +11740,1335 @@ class MarkdownRenderWorker(QThread):
         }
         self.rendered.emit(self.request_id, self.text, rendered_parts, signatures, stats)
 
+
+def quick_chat_qml_cache_path() -> str:
+    return os.path.join(tempfile.gettempdir(), "agent_qt_quick_chat_view.qml")
+
+
+def quick_markdown_parts_data(text: str) -> List[Dict[str, object]]:
+    display_text = mask_low_value_context_markers_for_display(strip_agent_qt_hidden_blocks(text))
+    parts = split_markdown_fenced_blocks(display_text)
+    rendered: List[Dict[str, object]] = []
+    for part in parts:
+        if part.get("type") == "code":
+            lang = str(part.get("lang") or "").strip().lower() or "text"
+            code = str(part.get("text") or "")
+            rendered.append({
+                "kind": "code",
+                "lang": lang,
+                "text": code,
+                "summary": code_block_summary(lang, code),
+                "maxHeight": 240,
+                "collapsed": compact_code_blocks_by_default(),
+            })
+            continue
+        markdown_text = str(part.get("text") or "")
+        if not markdown_text.strip():
+            continue
+        rendered.append({
+            "kind": "markdown",
+            "text": markdown_text,
+            "html": markdown_with_pipe_tables_to_html(markdown_text),
+        })
+    return rendered
+
+
+def quick_parts_data_from_rendered_parts(parts: List[Dict[str, str]]) -> List[Dict[str, object]]:
+    rendered: List[Dict[str, object]] = []
+    for part in parts:
+        if part.get("type") == "code":
+            lang = str(part.get("lang") or "").strip().lower() or "text"
+            code = str(part.get("text") or "")
+            rendered.append({
+                "kind": "code",
+                "lang": lang,
+                "text": code,
+                "summary": code_block_summary(lang, code),
+                "maxHeight": 240,
+                "collapsed": compact_code_blocks_by_default(),
+            })
+            continue
+        markdown_text = str(part.get("text") or "")
+        if not markdown_text.strip():
+            continue
+        rendered.append({
+            "kind": "markdown",
+            "text": markdown_text,
+            "html": part.get("html") or markdown_with_pipe_tables_to_html(markdown_text),
+        })
+    return rendered
+
+
+def quick_markdown_part_to_source(part: Dict[str, str]) -> str:
+    if part.get("type") == "code":
+        lang = str(part.get("lang") or "").strip()
+        code = str(part.get("text") or "")
+        fence = f"```{lang}\n" if lang else "```\n"
+        return f"{fence}{code}\n```\n"
+    return str(part.get("text") or "")
+
+
+def quick_split_markdown_text_for_history_render(
+    text: str,
+    *,
+    char_budget: int = QUICK_CHAT_SINGLE_ITEM_CHAR_BUDGET,
+    line_budget: int = QUICK_CHAT_SINGLE_ITEM_LINE_BUDGET,
+) -> List[str]:
+    raw = str(text or "")
+    if not raw.strip():
+        return [raw]
+
+    chunks: List[str] = []
+    current_parts: List[str] = []
+    current_chars = 0
+    current_lines = 0
+
+    def flush_current():
+        nonlocal current_parts, current_chars, current_lines
+        if current_parts:
+            chunks.append("".join(current_parts).strip())
+            current_parts = []
+            current_chars = 0
+            current_lines = 0
+
+    def append_piece(piece: str):
+        nonlocal current_chars, current_lines
+        current_parts.append(piece)
+        current_chars += len(piece)
+        current_lines += max(1, piece.count("\n"))
+
+    for part in split_markdown_fenced_blocks(raw):
+        if part.get("type") == "code":
+            lang = str(part.get("lang") or "").strip()
+            code_lines = str(part.get("text") or "").splitlines()
+            if not code_lines:
+                code_lines = [""]
+            start = 0
+            while start < len(code_lines):
+                remaining_lines = max(1, line_budget - current_lines)
+                remaining_chars = max(256, char_budget - current_chars)
+                if current_parts and (remaining_lines < 8 or remaining_chars < 1024):
+                    flush_current()
+                    remaining_lines = line_budget
+                    remaining_chars = char_budget
+                take_lines = max(1, min(len(code_lines) - start, remaining_lines))
+                slice_lines = code_lines[start:start + take_lines]
+                while take_lines > 1 and sum(len(line) + 1 for line in slice_lines) > remaining_chars:
+                    take_lines -= 1
+                    slice_lines = code_lines[start:start + take_lines]
+                code_text = "\n".join(slice_lines)
+                piece = quick_markdown_part_to_source({"type": "code", "lang": lang, "text": code_text})
+                if current_parts and (current_chars + len(piece) > char_budget or current_lines + piece.count("\n") > line_budget):
+                    flush_current()
+                append_piece(piece)
+                start += take_lines
+            continue
+
+        markdown_text = str(part.get("text") or "")
+        lines = markdown_text.splitlines(keepends=True)
+        if not lines:
+            lines = [markdown_text]
+        for line in lines:
+            line_chars = len(line)
+            line_lines = max(1, line.count("\n"))
+            if current_parts and (current_chars + line_chars > char_budget or current_lines + line_lines > line_budget):
+                flush_current()
+            append_piece(line)
+
+    flush_current()
+    return [chunk for chunk in chunks if chunk.strip()] or [raw]
+
+
+def quick_chat_qml_source() -> str:
+    def px(value: int) -> int:
+        return max(10, int(scaled_font_px(value)))
+
+    copy_icon_path = find_bundled_asset("copy-transparent.png")
+    copy_icon_source = QUrl.fromLocalFile(copy_icon_path).toString() if copy_icon_path else ""
+    palette = {
+        "text": COLORS["text"],
+        "text_secondary": COLORS["text_secondary"],
+        "accent": COLORS["accent"],
+        "accent_light": COLORS["accent_light"],
+        "surface": COLORS["surface"],
+        "surface_alt": COLORS["surface_alt"],
+        "code_bg": COLORS["code_bg"],
+        "border": COLORS["border"],
+        "border_strong": COLORS["border_strong"],
+        "danger": COLORS["danger"],
+        "danger_soft": COLORS["danger_soft"],
+        "success": COLORS["success"],
+        "user_bg": COLORS["card_user"],
+        "user_border": COLORS["border"],
+        "copy_icon": copy_icon_source,
+    }
+    return f"""
+import QtQuick 2.15
+import QtQuick.Controls 2.15
+import QtQuick.Layouts 1.15
+
+Rectangle {{
+    id: root
+    signal copyRequested(string itemId)
+    signal actionRequested(string action, string itemId)
+    signal textUpdated(string itemId, string text)
+    property real contentHeight: listView.contentHeight
+    implicitHeight: contentHeight
+    color: "{palette['surface']}"
+
+    ListView {{
+        id: listView
+        width: parent.width
+        height: contentHeight
+        interactive: false
+        clip: false
+        spacing: 10
+        model: chatModel
+
+        delegate: Item {{
+            id: delegateRoot
+            width: listView.width
+            implicitHeight: loader.implicitHeight
+
+            Loader {{
+                id: loader
+                width: parent.width
+                property var itemData: ({{
+                    itemId: itemId,
+                    kind: kind,
+                    title: title,
+                    text: text,
+                    partsData: partsData,
+                    copyText: copyText,
+                    maxContentHeight: maxContentHeight,
+                    roleLabelText: roleLabelText,
+                    statusText: statusText,
+                    actionName: actionName,
+                    statsAdd: statsAdd,
+                    statsDel: statsDel,
+                    undone: undone,
+                    canUndo: canUndo,
+                    canRedo: canRedo,
+                    autoFollow: autoFollow,
+                    inputText: inputText,
+                    placeholderText: placeholderText,
+                    primaryActionText: primaryActionText,
+                    secondaryActionText: secondaryActionText,
+                    hintText: hintText,
+                    filesData: filesData
+                }})
+                onLoaded: {{
+                    if (item) {{
+                        item.itemData = itemData
+                        item.rootWidth = width
+                    }}
+                }}
+                onItemDataChanged: {{
+                    if (item) {{
+                        item.itemData = itemData
+                    }}
+                }}
+                onWidthChanged: {{
+                    if (item) {{
+                        item.rootWidth = width
+                    }}
+                }}
+                sourceComponent: {{
+                    if (kind === "prompt_editor") return promptDelegate;
+                    if (kind === "manual_ai_input") return manualAiDelegate;
+                    if (kind === "user") return userDelegate;
+                    if (kind === "ai" || kind === "preview_ai") return aiDelegate;
+                    if (kind === "notice") return noticeDelegate;
+                    if (kind === "change_summary") return changeDelegate;
+                    return resultDelegate;
+                }}
+            }}
+        }}
+    }}
+
+    Component {{
+        id: promptDelegate
+        Item {{
+            property var itemData: ({{}})
+            property real rootWidth: 0
+            width: rootWidth
+            implicitHeight: promptCard.implicitHeight
+
+            Rectangle {{
+                id: promptCard
+                width: Math.max(260, Math.min(rootWidth * 0.76, rootWidth - 6))
+                anchors.right: parent.right
+                radius: 18
+                color: "{palette['user_bg']}"
+                border.width: 1
+                border.color: "{palette['user_border']}"
+                implicitHeight: promptColumn.implicitHeight + 24
+
+                Column {{
+                    id: promptColumn
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    spacing: 8
+
+                    Text {{
+                        width: parent.width
+                        color: "{palette['text']}"
+                        text: "你"
+                        font.pixelSize: {px(13)}
+                        font.weight: Font.Black
+                    }}
+
+                    Text {{
+                        width: parent.width
+                        color: "{palette['text']}"
+                        text: itemData.text
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        font.pixelSize: {px(13)}
+                        font.weight: Font.DemiBold
+                    }}
+
+                    TextField {{
+                        id: promptInput
+                        width: parent.width
+                        text: itemData.inputText
+                        placeholderText: itemData.placeholderText
+                        font.pixelSize: {px(12)}
+                        color: "{palette['text']}"
+                        selectByMouse: true
+                        onTextEdited: root.textUpdated(itemData.itemId, text)
+                    }}
+
+                    Row {{
+                        spacing: 8
+
+                        Button {{
+                            visible: !!itemData.primaryActionText
+                            text: itemData.primaryActionText
+                            onClicked: root.actionRequested("prompt_primary", itemData.itemId)
+                        }}
+
+                        Button {{
+                            visible: !!itemData.secondaryActionText
+                            text: itemData.secondaryActionText
+                            onClicked: root.actionRequested("prompt_secondary", itemData.itemId)
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+
+    Component {{
+        id: userDelegate
+        Item {{
+            property var itemData: ({{}})
+            property real rootWidth: 0
+            width: rootWidth
+            implicitHeight: userCard.implicitHeight
+
+            Rectangle {{
+                id: userCard
+                width: Math.max(260, Math.min(rootWidth * 0.76, rootWidth - 6))
+                anchors.right: parent.right
+                radius: 18
+                color: "{palette['user_bg']}"
+                border.width: 1
+                border.color: "{palette['user_border']}"
+                implicitHeight: userColumn.implicitHeight + 24
+
+                Column {{
+                    id: userColumn
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    spacing: 4
+
+                    Item {{
+                        width: parent.width
+                        height: copyBtn.visible ? 30 : 0
+                        visible: copyBtn.visible
+
+                        Rectangle {{
+                            id: copyBtn
+                            anchors.right: parent.right
+                            visible: !!itemData.copyText
+                            width: visible ? 30 : 0
+                            height: visible ? 30 : 0
+                            radius: 15
+                            color: copyMouse.containsMouse ? "{palette['surface_alt']}" : "transparent"
+                            border.width: 1
+                            border.color: copyMouse.containsMouse ? "{palette['border']}" : "transparent"
+
+                            Image {{
+                                anchors.centerIn: parent
+                                width: 18
+                                height: 18
+                                source: "{palette['copy_icon']}"
+                                visible: source !== ""
+                                fillMode: Image.PreserveAspectFit
+                                smooth: true
+                            }}
+
+                            Text {{
+                                visible: "{palette['copy_icon']}" === ""
+                                anchors.centerIn: parent
+                                color: "{palette['text_secondary']}"
+                                text: "⧉"
+                                font.pixelSize: {px(14)}
+                                font.weight: Font.Bold
+                            }}
+
+                            MouseArea {{
+                                id: copyMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.copyRequested(itemData.itemId)
+                            }}
+                        }}
+                    }}
+
+                    Text {{
+                        id: userText
+                        width: parent.width
+                        color: "{palette['text']}"
+                        text: itemData.text
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        font.pixelSize: {px(14)}
+                        font.weight: Font.DemiBold
+                    }}
+                }}
+            }}
+        }}
+    }}
+
+    Component {{
+        id: manualAiDelegate
+        Item {{
+            property var itemData: ({{}})
+            property real rootWidth: 0
+            width: rootWidth
+            implicitHeight: card.implicitHeight
+
+            Rectangle {{
+                id: card
+                width: rootWidth
+                radius: 16
+                color: "{palette['surface']}"
+                border.width: 1
+                border.color: "{palette['border']}"
+                implicitHeight: cardColumn.implicitHeight + 24
+
+                Column {{
+                    id: cardColumn
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    spacing: 8
+
+                    Row {{
+                        width: parent.width
+                        spacing: 8
+
+                        Text {{
+                            width: 90
+                            color: "{palette['text']}"
+                            text: itemData.title
+                            font.pixelSize: {px(13)}
+                            font.weight: Font.Black
+                        }}
+
+                        Text {{
+                            width: Math.max(120, parent.width - 210)
+                            color: "{palette['text_secondary']}"
+                            text: itemData.hintText
+                            wrapMode: Text.Wrap
+                            font.pixelSize: {px(12)}
+                            font.weight: Font.DemiBold
+                        }}
+
+                        Button {{
+                            visible: !!itemData.primaryActionText
+                            text: itemData.primaryActionText
+                            onClicked: root.actionRequested("manual_ai_submit", itemData.itemId)
+                        }}
+                    }}
+
+                    TextArea {{
+                        id: aiInput
+                        width: parent.width
+                        height: 190
+                        text: itemData.inputText
+                        placeholderText: itemData.placeholderText
+                        wrapMode: TextArea.Wrap
+                        font.pixelSize: {px(13)}
+                        color: "{palette['text']}"
+                        selectByMouse: true
+                        onTextChanged: root.textUpdated(itemData.itemId, text)
+                    }}
+                }}
+            }}
+        }}
+    }}
+
+    Component {{
+        id: aiDelegate
+        Item {{
+            property var itemData: ({{}})
+            property real rootWidth: 0
+            width: rootWidth
+            implicitHeight: bodyColumn.implicitHeight
+
+            Column {{
+                id: bodyColumn
+                width: parent.width
+                spacing: 10
+
+                Row {{
+                    width: parent.width
+                    spacing: 8
+
+                    Text {{
+                        id: roleLabel
+                        width: Math.max(80, parent.width - (copyBtn.visible ? 38 : 0))
+                        color: "{palette['text']}"
+                        text: itemData.roleLabelText || (itemData.kind === "preview_ai" ? "AI 正在回复" : "AI")
+                        wrapMode: Text.Wrap
+                        font.pixelSize: {px(15)}
+                        font.weight: Font.Black
+                    }}
+
+                    Rectangle {{
+                        id: copyBtn
+                        visible: !!itemData.copyText
+                        width: visible ? 30 : 0
+                        height: visible ? 30 : 0
+                        radius: 15
+                        color: copyMouse.containsMouse ? "{palette['surface_alt']}" : "transparent"
+                        border.width: 1
+                        border.color: copyMouse.containsMouse ? "{palette['border']}" : "transparent"
+
+                        Image {{
+                            anchors.centerIn: parent
+                            width: 18
+                            height: 18
+                            source: "{palette['copy_icon']}"
+                            visible: source !== ""
+                            fillMode: Image.PreserveAspectFit
+                            smooth: true
+                        }}
+
+                        Text {{
+                            visible: "{palette['copy_icon']}" === ""
+                            anchors.centerIn: parent
+                            color: "{palette['text_secondary']}"
+                            text: "⧉"
+                            font.pixelSize: {px(14)}
+                            font.weight: Font.Bold
+                        }}
+
+                        MouseArea {{
+                            id: copyMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.copyRequested(itemData.itemId)
+                        }}
+                    }}
+                }}
+
+                Text {{
+                    id: statusLabel
+                    visible: !!itemData.statusText
+                    width: parent.width
+                    color: "{palette['text_secondary']}"
+                    text: itemData.statusText
+                    wrapMode: Text.Wrap
+                    font.pixelSize: {px(12)}
+                    font.weight: Font.DemiBold
+                }}
+
+                Text {{
+                    id: previewBody
+                    visible: itemData.kind === "preview_ai" && (!itemData.partsData || itemData.partsData.length === 0)
+                    width: parent.width
+                    color: "{palette['text']}"
+                    text: itemData.text || ""
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    font.pixelSize: {px(15)}
+                    font.weight: Font.DemiBold
+                }}
+
+                Repeater {{
+                    visible: itemData.kind !== "preview_ai" || (itemData.partsData && itemData.partsData.length > 0)
+                    model: (itemData.partsData && itemData.partsData.length)
+                        ? itemData.partsData
+                        : [{{ kind: "markdown", html: itemData.text || "", text: itemData.text || "" }}]
+
+                    delegate: Loader {{
+                        width: bodyColumn.width
+                        property var partData: modelData
+                        sourceComponent: partData.kind === "code" ? aiCodePartDelegate : aiMarkdownPartDelegate
+                        onLoaded: {{
+                            if (item) {{
+                                item.partData = partData
+                                item.rootWidth = width
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+
+    Component {{
+        id: aiMarkdownPartDelegate
+        Item {{
+            property var partData: ({{}})
+            property real rootWidth: 0
+            width: rootWidth
+            implicitHeight: markdownBody.implicitHeight
+
+            Text {{
+                id: markdownBody
+                width: parent.width
+                color: "{palette['text']}"
+                text: partData.html || partData.text || ""
+                textFormat: Text.RichText
+                wrapMode: Text.Wrap
+                font.pixelSize: {px(15)}
+                font.weight: Font.DemiBold
+                onLinkActivated: function(link) {{ Qt.openUrlExternally(link) }}
+            }}
+        }}
+    }}
+
+    Component {{
+        id: aiCodePartDelegate
+        Item {{
+            property var partData: ({{}})
+            property real rootWidth: 0
+            property bool collapsed: partData.collapsed === undefined ? true : !!partData.collapsed
+            width: rootWidth
+            implicitHeight: codeFrame.implicitHeight
+
+            Rectangle {{
+                id: codeFrame
+                width: parent.width
+                radius: 10
+                color: "{palette['code_bg']}"
+                border.width: 1
+                border.color: "{palette['border']}"
+                implicitHeight: codeColumn.implicitHeight
+
+                Column {{
+                    id: codeColumn
+                    width: parent.width
+                    spacing: 0
+
+                    Rectangle {{
+                        id: codeHeader
+                        width: parent.width
+                        height: 32
+                        radius: 10
+                        color: "{palette['surface_alt']}"
+                        border.width: 0
+
+                        Rectangle {{
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.bottom: parent.bottom
+                            height: 1
+                            color: "{palette['border']}"
+                        }}
+
+                        Row {{
+                            anchors.fill: parent
+                            anchors.leftMargin: 10
+                            anchors.rightMargin: 8
+                            spacing: 6
+
+                            Text {{
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 18
+                                horizontalAlignment: Text.AlignHCenter
+                                color: "{palette['accent']}"
+                                text: collapsed ? "▸" : "-"
+                                font.pixelSize: {px(13)}
+                                font.weight: Font.Black
+                            }}
+
+                            Text {{
+                                anchors.verticalCenter: parent.verticalCenter
+                                color: "{palette['text_secondary']}"
+                                text: partData.lang || "text"
+                                font.pixelSize: {px(11)}
+                                font.weight: Font.Black
+                            }}
+
+                            Text {{
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: Math.max(80, parent.width - 96)
+                                color: "{palette['text_secondary']}"
+                                text: partData.summary || ""
+                                elide: Text.ElideRight
+                                font.pixelSize: {px(11)}
+                                font.weight: Font.Black
+                            }}
+                        }}
+
+                        MouseArea {{
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: collapsed = !collapsed
+                        }}
+                    }}
+
+                    Flickable {{
+                        id: codeFlick
+                        width: parent.width
+                        visible: !collapsed
+                        height: collapsed ? 0 : Math.min(partData.maxHeight || 240, Math.max(52, codeBody.paintedHeight + 22))
+                        contentWidth: Math.max(width, codeBody.paintedWidth + 24)
+                        contentHeight: codeBody.paintedHeight + 20
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        interactive: contentHeight > height || contentWidth > width
+
+                        TextEdit {{
+                            id: codeBody
+                            x: 12
+                            y: 10
+                            width: Math.max(codeFlick.width - 24, paintedWidth + 2)
+                            text: partData.text || ""
+                            color: "{palette['text']}"
+                            font.family: "SF Mono, Menlo, monospace"
+                            font.pixelSize: {px(12)}
+                            font.weight: Font.DemiBold
+                            wrapMode: TextEdit.NoWrap
+                            readOnly: true
+                            selectByMouse: true
+                            textFormat: TextEdit.PlainText
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+
+    Component {{
+        id: resultDelegate
+        Item {{
+            property var itemData: ({{}})
+            property real rootWidth: 0
+            width: rootWidth
+            implicitHeight: titleLabel.implicitHeight + resultFrame.implicitHeight + 8
+
+            Text {{
+                id: titleLabel
+                visible: !!itemData.title
+                anchors.left: parent.left
+                anchors.right: copyBtn.left
+                anchors.rightMargin: copyBtn.visible ? 8 : 0
+                color: "{palette['text']}"
+                text: itemData.title
+                font.pixelSize: {px(14)}
+                font.weight: Font.Black
+            }}
+
+            Rectangle {{
+                id: copyBtn
+                visible: !!itemData.copyText
+                anchors.right: parent.right
+                anchors.top: parent.top
+                width: visible ? 30 : 0
+                height: visible ? 30 : 0
+                radius: 15
+                color: copyMouse.containsMouse ? "{palette['surface_alt']}" : "transparent"
+                border.width: 1
+                border.color: copyMouse.containsMouse ? "{palette['border']}" : "transparent"
+
+                Image {{
+                    anchors.centerIn: parent
+                    width: 18
+                    height: 18
+                    source: "{palette['copy_icon']}"
+                    visible: source !== ""
+                    fillMode: Image.PreserveAspectFit
+                    smooth: true
+                }}
+
+                Text {{
+                    visible: "{palette['copy_icon']}" === ""
+                    anchors.centerIn: parent
+                    color: "{palette['text_secondary']}"
+                    text: "⧉"
+                    font.pixelSize: {px(14)}
+                    font.weight: Font.Bold
+                }}
+
+                MouseArea {{
+                    id: copyMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.copyRequested(itemData.itemId)
+                }}
+            }}
+
+            Rectangle {{
+                id: resultFrame
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: titleLabel.visible ? titleLabel.bottom : parent.top
+                anchors.topMargin: titleLabel.visible ? 8 : 0
+                radius: 14
+                color: "{palette['code_bg']}"
+                border.width: 1
+                border.color: "{palette['border']}"
+                implicitHeight: flick.height + 24
+
+                Flickable {{
+                    id: flick
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: 12
+                    height: Math.min(itemData.maxContentHeight > 0 ? itemData.maxContentHeight : 210, Math.max(58, resultText.contentHeight + 6))
+                    contentWidth: width
+                    contentHeight: resultText.contentHeight
+                    boundsBehavior: Flickable.StopAtBounds
+                    clip: true
+                    interactive: contentHeight > height
+
+                    onContentHeightChanged: {{
+                        if (itemData.autoFollow && contentHeight > height) {{
+                            contentY = Math.max(0, contentHeight - height)
+                        }}
+                    }}
+
+                    TextEdit {{
+                        id: resultText
+                        width: flick.width
+                        readOnly: true
+                        selectByMouse: true
+                        wrapMode: TextEdit.Wrap
+                        textFormat: TextEdit.PlainText
+                        color: "{palette['text']}"
+                        text: itemData.text
+                        font.family: "SF Mono"
+                        font.pixelSize: {px(12)}
+                        font.weight: Font.DemiBold
+                    }}
+                }}
+            }}
+        }}
+    }}
+
+    Component {{
+        id: noticeDelegate
+        Item {{
+            property var itemData: ({{}})
+            property real rootWidth: 0
+            width: rootWidth
+            implicitHeight: noticeButton.implicitHeight
+
+            Rectangle {{
+                id: noticeButton
+                width: rootWidth
+                radius: 12
+                color: noticeMouse.containsMouse ? "{palette['accent_light']}" : "{palette['surface_alt']}"
+                border.width: 1
+                border.color: noticeMouse.containsMouse ? "{palette['accent']}" : "{palette['border']}"
+                implicitHeight: noticeText.implicitHeight + 22
+
+                Text {{
+                    id: noticeText
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    color: "{palette['text_secondary']}"
+                    text: itemData.text
+                    wrapMode: Text.Wrap
+                    font.pixelSize: {px(12)}
+                    font.weight: Font.Black
+                }}
+
+                MouseArea {{
+                    id: noticeMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: itemData.actionName ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: {{
+                        if (itemData.actionName) root.actionRequested(itemData.actionName, itemData.itemId)
+                    }}
+                }}
+            }}
+        }}
+    }}
+
+    Component {{
+        id: changeDelegate
+        Item {{
+            property var itemData: ({{}})
+            property real rootWidth: 0
+            width: rootWidth
+            implicitHeight: changeFrame.implicitHeight
+
+            Rectangle {{
+                id: changeFrame
+                width: rootWidth
+                radius: 16
+                color: "{palette['surface']}"
+                border.width: 1
+                border.color: "{palette['border']}"
+                implicitHeight: changeColumn.implicitHeight + 24
+
+                Column {{
+                    id: changeColumn
+                    anchors.fill: parent
+                    anchors.margins: 14
+                    spacing: 8
+
+                    Item {{
+                        width: parent.width
+                        implicitHeight: Math.max(30, titleText.implicitHeight, rightCluster.implicitHeight)
+
+                        Row {{
+                            id: rightCluster
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: 8
+
+                            Text {{
+                                visible: !!itemData.statsAdd
+                                color: itemData.undone ? "{palette['text_secondary']}" : "{palette['success']}"
+                                text: itemData.statsAdd
+                                font.pixelSize: {px(12)}
+                                font.weight: Font.Black
+                            }}
+
+                            Text {{
+                                visible: !!itemData.statsDel
+                                color: itemData.undone ? "{palette['text_secondary']}" : "{palette['danger']}"
+                                text: itemData.statsDel
+                                font.pixelSize: {px(12)}
+                                font.weight: Font.Black
+                            }}
+
+                            Rectangle {{
+                                visible: itemData.undone
+                                radius: 9
+                                color: "{palette['surface_alt']}"
+                                border.width: 1
+                                border.color: "{palette['border']}"
+                                implicitWidth: statusText.implicitWidth + 16
+                                implicitHeight: 26
+
+                                Text {{
+                                    id: statusText
+                                    anchors.centerIn: parent
+                                    color: "{palette['text_secondary']}"
+                                    text: "已撤销"
+                                    font.pixelSize: {px(11)}
+                                    font.weight: Font.Black
+                                }}
+                            }}
+
+                            Rectangle {{
+                                visible: itemData.canUndo || itemData.canRedo
+                                radius: 10
+                                color: undoMouse.containsMouse
+                                    ? (itemData.canRedo ? "{palette['accent_light']}" : "{palette['danger_soft']}")
+                                    : "{palette['surface']}"
+                                border.width: 1
+                                border.color: itemData.canRedo ? "{palette['accent']}" : "#ffd0d2"
+                                implicitWidth: undoText.implicitWidth + 24
+                                implicitHeight: 30
+
+                                Text {{
+                                    id: undoText
+                                    anchors.centerIn: parent
+                                    color: itemData.canRedo ? "{palette['accent']}" : "{palette['danger']}"
+                                    text: itemData.canRedo ? "Redo" : "Undo"
+                                    font.pixelSize: {px(12)}
+                                    font.weight: Font.Black
+                                }}
+
+                                MouseArea {{
+                                    id: undoMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: root.actionRequested(itemData.canRedo ? "redo_change" : "undo_change", itemData.itemId)
+                                }}
+                            }}
+                        }}
+
+                        Text {{
+                            id: titleText
+                            anchors.left: parent.left
+                            anchors.right: rightCluster.left
+                            anchors.rightMargin: 10
+                            anchors.verticalCenter: parent.verticalCenter
+                            color: "{palette['text']}"
+                            text: itemData.title
+                            wrapMode: Text.Wrap
+                            font.pixelSize: {px(13)}
+                            font.weight: Font.Black
+                        }}
+                    }}
+
+                    Repeater {{
+                        model: itemData.filesData || []
+
+                        delegate: Rectangle {{
+                            id: fileWrapper
+                            property bool expanded: !!modelData.expanded
+                            width: changeColumn.width
+                            radius: 12
+                            color: "{palette['code_bg']}"
+                            border.width: 1
+                            border.color: "{palette['border']}"
+                            implicitHeight: fileColumn.implicitHeight + 16
+
+                            Column {{
+                                id: fileColumn
+                                width: parent.width - 20
+                                x: 10
+                                y: 8
+                                spacing: 8
+
+                                Item {{
+                                    id: headerRow
+                                    width: parent.width
+                                    height: Math.max(22, pathText.implicitHeight, statsCluster.implicitHeight)
+
+                                    Text {{
+                                        id: chevronText
+                                        anchors.left: parent.left
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 12
+                                        horizontalAlignment: Text.AlignHCenter
+                                        text: fileWrapper.expanded ? "⌄" : "›"
+                                        color: "{palette['text_secondary']}"
+                                        font.pixelSize: {px(12)}
+                                        font.weight: Font.Black
+                                    }}
+
+                                    Row {{
+                                        id: statsCluster
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        spacing: 10
+
+                                        Text {{
+                                            id: addStat
+                                            visible: !!modelData.addText
+                                            text: modelData.addText
+                                            color: itemData.undone
+                                                ? "{palette['text_secondary']}"
+                                                : (modelData.binary ? "{palette['text_secondary']}" : "{palette['success']}")
+                                            font.pixelSize: {px(12)}
+                                            font.weight: Font.Black
+                                            font.strikeout: itemData.undone
+                                        }}
+
+                                        Text {{
+                                            id: delStat
+                                            visible: !!modelData.delText
+                                            text: modelData.delText
+                                            color: itemData.undone ? "{palette['text_secondary']}" : "{palette['danger']}"
+                                            font.pixelSize: {px(12)}
+                                            font.weight: Font.Black
+                                            font.strikeout: itemData.undone
+                                        }}
+                                    }}
+
+                                    Text {{
+                                        id: pathText
+                                        anchors.left: chevronText.right
+                                        anchors.leftMargin: 7
+                                        anchors.right: statsCluster.left
+                                        anchors.rightMargin: 10
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: modelData.path || ""
+                                        color: itemData.undone
+                                            ? "{palette['text_secondary']}"
+                                            : (fileMouse.containsMouse ? "{palette['accent']}" : "{palette['text']}")
+                                        font.pixelSize: {px(12)}
+                                        font.weight: Font.ExtraBold
+                                        font.strikeout: itemData.undone
+                                        wrapMode: Text.Wrap
+                                    }}
+
+                                    MouseArea {{
+                                        id: fileMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {{
+                                            root.actionRequested("toggle_change_detail", itemData.itemId + "::" + index)
+                                        }}
+                                    }}
+                                }}
+
+                                Rectangle {{
+                                    id: detailBox
+                                    visible: fileWrapper.expanded
+                                    width: parent.width
+                                    radius: 10
+                                    color: "{palette['code_bg']}"
+                                    border.width: 1
+                                    border.color: "{palette['border']}"
+                                    height: visible ? ((modelData.diffHeight || 260) + 2) : 0
+
+                                    Flickable {{
+                                        anchors.fill: parent
+                                        anchors.margins: 1
+                                        contentWidth: width
+                                        contentHeight: diffText.contentHeight
+                                        boundsBehavior: Flickable.StopAtBounds
+                                        clip: true
+                                        interactive: contentHeight > height
+
+                                        TextEdit {{
+                                            id: diffText
+                                            width: parent.width
+                                            readOnly: true
+                                            selectByMouse: true
+                                            wrapMode: TextEdit.Wrap
+                                            textFormat: TextEdit.RichText
+                                            color: "{palette['text']}"
+                                            text: modelData.diffHtml || "<span style='color:{palette['text_secondary']}'>正在加载 diff...</span>"
+                                            font.family: "Menlo"
+                                            font.pixelSize: {px(12)}
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+}}
+"""
+
+
+class QuickChatListModel(QAbstractListModel):
+    ItemIdRole = Qt.ItemDataRole.UserRole + 1
+    KindRole = Qt.ItemDataRole.UserRole + 2
+    TitleRole = Qt.ItemDataRole.UserRole + 3
+    TextRole = Qt.ItemDataRole.UserRole + 4
+    CopyTextRole = Qt.ItemDataRole.UserRole + 5
+    MaxContentHeightRole = Qt.ItemDataRole.UserRole + 6
+    RoleLabelRole = Qt.ItemDataRole.UserRole + 7
+    StatusTextRole = Qt.ItemDataRole.UserRole + 8
+    ActionNameRole = Qt.ItemDataRole.UserRole + 9
+    StatsAddRole = Qt.ItemDataRole.UserRole + 10
+    StatsDelRole = Qt.ItemDataRole.UserRole + 11
+    UndoneRole = Qt.ItemDataRole.UserRole + 12
+    CanUndoRole = Qt.ItemDataRole.UserRole + 13
+    CanRedoRole = Qt.ItemDataRole.UserRole + 14
+    AutoFollowRole = Qt.ItemDataRole.UserRole + 15
+    InputTextRole = Qt.ItemDataRole.UserRole + 16
+    PlaceholderTextRole = Qt.ItemDataRole.UserRole + 17
+    PrimaryActionTextRole = Qt.ItemDataRole.UserRole + 18
+    SecondaryActionTextRole = Qt.ItemDataRole.UserRole + 19
+    HintTextRole = Qt.ItemDataRole.UserRole + 20
+    FilesDataRole = Qt.ItemDataRole.UserRole + 21
+    PartsDataRole = Qt.ItemDataRole.UserRole + 22
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items: List[Dict[str, object]] = []
+        self._roles = {
+            self.ItemIdRole: b"itemId",
+            self.KindRole: b"kind",
+            self.TitleRole: b"title",
+            self.TextRole: b"text",
+            self.CopyTextRole: b"copyText",
+            self.MaxContentHeightRole: b"maxContentHeight",
+            self.RoleLabelRole: b"roleLabelText",
+            self.StatusTextRole: b"statusText",
+            self.ActionNameRole: b"actionName",
+            self.StatsAddRole: b"statsAdd",
+            self.StatsDelRole: b"statsDel",
+            self.UndoneRole: b"undone",
+            self.CanUndoRole: b"canUndo",
+            self.CanRedoRole: b"canRedo",
+            self.AutoFollowRole: b"autoFollow",
+            self.InputTextRole: b"inputText",
+            self.PlaceholderTextRole: b"placeholderText",
+            self.PrimaryActionTextRole: b"primaryActionText",
+            self.SecondaryActionTextRole: b"secondaryActionText",
+            self.HintTextRole: b"hintText",
+            self.FilesDataRole: b"filesData",
+            self.PartsDataRole: b"partsData",
+        }
+
+    def roleNames(self):
+        return self._roles
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._items)
+
+    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        row = index.row()
+        if row < 0 or row >= len(self._items):
+            return None
+        item = self._items[row]
+        key = self._roles.get(role, b"").decode("utf-8")
+        return item.get(key)
+
+    def _normalize_item(self, item: Dict[str, object]) -> Dict[str, object]:
+        normalized = dict(item)
+        normalized.setdefault("itemId", uuid.uuid4().hex)
+        normalized.setdefault("kind", "result")
+        normalized.setdefault("title", "")
+        normalized.setdefault("text", "")
+        normalized.setdefault("copyText", "")
+        normalized.setdefault("maxContentHeight", 210)
+        normalized.setdefault("roleLabelText", "")
+        normalized.setdefault("statusText", "")
+        normalized.setdefault("actionName", "")
+        normalized.setdefault("statsAdd", "")
+        normalized.setdefault("statsDel", "")
+        normalized.setdefault("undone", False)
+        normalized.setdefault("canUndo", False)
+        normalized.setdefault("canRedo", False)
+        normalized.setdefault("autoFollow", False)
+        normalized.setdefault("inputText", "")
+        normalized.setdefault("placeholderText", "")
+        normalized.setdefault("primaryActionText", "")
+        normalized.setdefault("secondaryActionText", "")
+        normalized.setdefault("hintText", "")
+        normalized.setdefault("filesData", [])
+        normalized.setdefault("partsData", [])
+        return normalized
+
+    def clear(self):
+        self.beginResetModel()
+        self._items = []
+        self.endResetModel()
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def append_item(self, item: Dict[str, object]) -> str:
+        return self.insert_item(len(self._items), item)
+
+    def insert_item(self, index: int, item: Dict[str, object]) -> str:
+        normalized = self._normalize_item(item)
+        row = max(0, min(index, len(self._items)))
+        self.beginInsertRows(QModelIndex(), row, row)
+        self._items.insert(row, normalized)
+        self.endInsertRows()
+        return str(normalized["itemId"])
+
+    def remove_item(self, item_id: str) -> bool:
+        row = self.index_of(item_id)
+        if row < 0:
+            return False
+        self.beginRemoveRows(QModelIndex(), row, row)
+        self._items.pop(row)
+        self.endRemoveRows()
+        return True
+
+    def update_item(self, item_id: str, patch: Dict[str, object]) -> bool:
+        row = self.index_of(item_id)
+        if row < 0:
+            return False
+        self._items[row].update(patch)
+        idx = self.index(row, 0)
+        self.dataChanged.emit(idx, idx, list(self._roles.keys()))
+        return True
+
+    def item(self, item_id: str) -> Optional[Dict[str, object]]:
+        row = self.index_of(item_id)
+        if row < 0:
+            return None
+        return self._items[row]
+
+    def index_of(self, item_id: str) -> int:
+        for row, item in enumerate(self._items):
+            if str(item.get("itemId") or "") == str(item_id or ""):
+                return row
+        return -1
+
+
+class QuickChatView(QQuickWidget):
+    copy_requested = Signal(str)
+    action_requested = Signal(str, str)
+    text_updated = Signal(str, str)
+
+    def __init__(self, model: QuickChatListModel, parent=None):
+        super().__init__(parent)
+        self.model = model
+        self._qml_path = quick_chat_qml_cache_path()
+        self.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+        self.setClearColor(QColor(COLORS["surface"]))
+        self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, False)
+        self.setStyleSheet(f"background: {COLORS['surface']}; border: none;")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.rootContext().setContextProperty("chatModel", self.model)
+        self.model.rowsInserted.connect(self.schedule_layout_sync)
+        self.model.rowsRemoved.connect(self.schedule_layout_sync)
+        self.model.modelReset.connect(self.schedule_layout_sync)
+        self.model.dataChanged.connect(self.schedule_layout_sync)
+        self.statusChanged.connect(self.on_status_changed)
+        self.reload_theme()
+
+    def reload_theme(self):
+        self.setClearColor(QColor(COLORS["surface"]))
+        self.setStyleSheet(f"background: {COLORS['surface']}; border: none;")
+        try:
+            os.makedirs(os.path.dirname(self._qml_path), exist_ok=True)
+            with open(self._qml_path, "w", encoding="utf-8") as f:
+                f.write(quick_chat_qml_source())
+        except OSError:
+            logger.warning("Unable to write quick chat qml cache.", exc_info=True)
+            return
+        url = QUrl.fromLocalFile(self._qml_path)
+        url.setQuery(f"v={int(time.time() * 1000)}")
+        self.setSource(url)
+        root = self.rootObject()
+        if root is not None:
+            root.copyRequested.connect(self.copy_requested.emit)
+            root.actionRequested.connect(self.action_requested.emit)
+            root.textUpdated.connect(self.text_updated.emit)
+        self.schedule_layout_sync()
+
+    def on_status_changed(self, status):
+        if status != QQuickWidget.Status.Error:
+            return
+        for error in self.errors():
+            logger.warning("Quick chat qml error: %s", error.toString())
+
+    def schedule_layout_sync(self, *_args):
+        for delay in (0, 20, 80):
+            QTimer.singleShot(delay, self.sync_to_content_height)
+
+    def sync_to_content_height(self):
+        root = self.rootObject()
+        if root is None:
+            return
+        try:
+            content_height = float(root.property("contentHeight") or 0.0)
+        except (TypeError, ValueError):
+            content_height = 0.0
+        target = max(12, int(content_height))
+        if self.height() != target:
+            self.setFixedHeight(target)
+        self.updateGeometry()
+
 # ============================================================
 # 对话气泡
 # ============================================================
@@ -13127,23 +14518,7 @@ class ChangeSummaryCard(QFrame):
         return wrapper
 
     def render_binary_change_html(self, record: Dict[str, object]) -> str:
-        status = str(record.get("status", "modified") or "modified")
-        status_text = {
-            "added": "新增二进制/Office 文件",
-            "deleted": "删除二进制/Office 文件",
-            "modified": "二进制/Office 文件已修改",
-        }.get(status, "二进制/Office 文件已变更")
-        path = html.escape(str(record.get("path", "")))
-        return (
-            f"<html><body style='margin:0; background:{COLORS['code_bg']}; color:{COLORS['text']}; "
-            "font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;'>"
-            "<div style='padding:12px 14px;'>"
-            f"<div style='font-weight:700; font-size:13px;'>{status_text}</div>"
-            f"<div style='margin-top:6px; color:{COLORS['text_secondary']}; font-size:12px;'>{path}</div>"
-            f"<div style='margin-top:8px; color:{COLORS['text_secondary']}; font-size:12px;'>"
-            "此类文件无法生成逐行文本 diff，但仍可撤销/重做本轮变更。"
-            "</div></div></body></html>"
-        )
+        return render_binary_change_html(record)
 
     def refresh_visual_settings(self):
         for record, diff_view in zip(self.records, self.detail_widgets):
@@ -14627,7 +16002,7 @@ class ChatPage(QWidget):
         self.pending_terminal_launches: List[Dict[str, object]] = []
         self.pending_execution_should_continue_automation = False
         self.history_entries: List[Dict[str, object]] = []
-        self.result_bubble: Optional[ExecutionLogPanel] = None
+        self.result_bubble = None
         self.worker: Optional[ExecuteWorker] = None
         self.worker_thread_id = ""
         self.thread_run_states: Dict[str, Dict[str, object]] = {}
@@ -14669,13 +16044,17 @@ class ChatPage(QWidget):
         self.automation_preview_worker: Optional[AutomationPreviewWorker] = None
         self.automation_preview_retired_workers: List[AutomationPreviewWorker] = []
         self.automation_preview_serial = 0
-        self.automation_preview_bubble: Optional[QFrame] = None
+        self.automation_preview_bubble = None
         self.automation_preview_thread_id = ""
         self.automation_preview_started_at = 0.0
         self.automation_preview_pending_text = ""
         self.automation_preview_last_rendered_text = ""
         self.automation_preview_last_chars = 0
         self.automation_preview_dots = 0
+        self.automation_preview_markdown_worker: Optional[MarkdownRenderWorker] = None
+        self.automation_preview_markdown_request_id = 0
+        self.automation_preview_markdown_pending = False
+        self.automation_preview_markdown_target_text = ""
         self.automation_preview_render_timer = QTimer(self)
         self.automation_preview_render_timer.setSingleShot(True)
         self.automation_preview_render_timer.timeout.connect(self.flush_automation_preview_render)
@@ -14702,7 +16081,7 @@ class ChatPage(QWidget):
         self.history_expand_cursor = 0
         self.history_expand_insert_index = 0
         self.history_expand_pending = False
-        self.history_trim_notice: Optional[QPushButton] = None
+        self.history_trim_notice = None
         self.chat_scrollbar_visible = True
         self.chat_scrollbar_fade_timer = QTimer(self)
         self.chat_scrollbar_fade_timer.setSingleShot(True)
@@ -14749,6 +16128,9 @@ class ChatPage(QWidget):
         self.automation_send_btn: Optional[QToolButton] = None
         self.automation_context_mode_btn: Optional[QToolButton] = None
         self.automation_skill_btn: Optional[QToolButton] = None
+        self.manual_ai_composer: Optional[QFrame] = None
+        self.manual_ai_input: Optional[QTextEdit] = None
+        self.manual_ai_confirm_btn: Optional[QPushButton] = None
         self.skill_generation_worker: Optional[AutomationChatWorker] = None
         self.last_automation_provider_compaction = "none"
         self.last_automation_history_compacted = False
@@ -14757,7 +16139,12 @@ class ChatPage(QWidget):
         self.preferences_dialog: Optional[QDialog] = None
         self.chat_column_max_width = 1480
         self.chat_column_width_ratio = 0.94
-        self.user_bubble_width_ratio = 0.75
+        self.user_bubble_width_ratio = 0.82
+        self.quick_chat_enabled = True
+        self.quick_change_records: Dict[str, Dict[str, object]] = {}
+        self.quick_prompt_records: Dict[str, Dict[str, object]] = {}
+        self.quick_history_segment_models: List[QuickChatListModel] = []
+        self.quick_history_segment_views: List[QuickChatView] = []
         self.setup_ui()
         if wechat_bridge_enabled_setting():
             QTimer.singleShot(0, self.start_wechat_bridge_quietly)
@@ -14990,6 +16377,11 @@ class ChatPage(QWidget):
         self.chat_column_layout.setContentsMargins(14, 14, 14, 14)
         self.chat_root_layout.addWidget(self.chat_column, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self.chat_layout = self.chat_column_layout
+        self.quick_chat_model = QuickChatListModel(self)
+        self.quick_chat_view = QuickChatView(self.quick_chat_model, self.chat_column)
+        self.configure_quick_chat_view(self.quick_chat_view)
+        self.quick_chat_view.setVisible(False)
+        self.chat_layout.addWidget(self.quick_chat_view)
         self.scroll_area.setWidget(self.chat_container)
         self.scroll_area.viewport().setStyleSheet("background: transparent; border: none;")
         self.scroll_area.viewport().installEventFilter(self)
@@ -15088,6 +16480,49 @@ class ChatPage(QWidget):
         composer_layout.addWidget(self.automation_send_btn, 0, Qt.AlignmentFlag.AlignBottom)
         right_layout.addWidget(self.automation_composer, 0)
 
+        self.manual_ai_composer = QFrame()
+        self.manual_ai_composer.setObjectName("manualAiComposer")
+        self.manual_ai_composer.setVisible(False)
+        self.manual_ai_composer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.manual_ai_composer.setStyleSheet(f"""
+            QFrame#manualAiComposer {{
+                background: {COLORS['surface']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 18px;
+            }}
+        """)
+        manual_layout = QVBoxLayout(self.manual_ai_composer)
+        manual_layout.setContentsMargins(12, 10, 12, 10)
+        manual_layout.setSpacing(8)
+        manual_header = QHBoxLayout()
+        manual_header.setContentsMargins(0, 0, 0, 0)
+        manual_header.setSpacing(8)
+        manual_title = QLabel("AI 回复区")
+        manual_title.setStyleSheet(f"color: {COLORS['text']}; font-weight: 900; font-size: 13px; background: transparent; border: none;")
+        manual_hint = QLabel("粘贴完整输出，包含 Bash 与后续代码块。")
+        manual_hint.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; background: transparent; border: none;")
+        manual_header.addWidget(manual_title)
+        manual_header.addSpacing(4)
+        manual_header.addWidget(manual_hint)
+        manual_header.addStretch(1)
+        self.manual_ai_confirm_btn = QPushButton("确定执行", cursor=Qt.PointingHandCursor)
+        self.manual_ai_confirm_btn.setFixedHeight(30)
+        self.manual_ai_confirm_btn.setStyleSheet(self.ai_response_confirm_button_style())
+        self.manual_ai_confirm_btn.clicked.connect(self.process_manual_ai_response)
+        manual_header.addWidget(self.manual_ai_confirm_btn)
+        manual_layout.addLayout(manual_header)
+        self.manual_ai_input = QTextEdit()
+        self.manual_ai_input.setPlaceholderText("在此粘贴 AI 的完整输出（含代码块）...")
+        self.manual_ai_input.setFixedHeight(160)
+        self.manual_ai_input.setAcceptRichText(False)
+        self.manual_ai_input.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.manual_ai_input.customContextMenuRequested.connect(
+            lambda pos, editor=self.manual_ai_input: show_chinese_edit_menu(editor, editor.mapToGlobal(pos))
+        )
+        self.manual_ai_input.setStyleSheet(self.ai_manual_input_style())
+        manual_layout.addWidget(self.manual_ai_input)
+        right_layout.addWidget(self.manual_ai_composer, 0)
+
         self.empty_state = QLabel("新会话会先生成提示词气泡；点击气泡右上角的跳过继续。", alignment=Qt.AlignCenter)
         self.empty_state.setStyleSheet(f"""
             QLabel {{
@@ -15099,6 +16534,7 @@ class ChatPage(QWidget):
             }}
         """)
         self.chat_layout.addWidget(self.empty_state)
+        self.refresh_chat_mode_visibility()
         
         body.addWidget(right_panel, 1)
         layout.addLayout(body, 1)
@@ -15183,6 +16619,488 @@ class ChatPage(QWidget):
         if self.chat_column.width() != desired:
             self.chat_column.setFixedWidth(desired)
         self.update_user_bubble_widths()
+        if hasattr(self, "quick_chat_view"):
+            self.quick_chat_view.schedule_layout_sync()
+
+    def is_quick_chat_active(self) -> bool:
+        return bool(self.quick_chat_enabled)
+
+    def refresh_chat_mode_visibility(self):
+        quick_active = self.is_quick_chat_active()
+        if hasattr(self, "quick_chat_view"):
+            self.quick_chat_view.setVisible(quick_active and self.quick_chat_model.count() > 0)
+            self.quick_chat_view.schedule_layout_sync()
+        for view in getattr(self, "quick_history_segment_views", []):
+            view.setVisible(quick_active)
+            view.schedule_layout_sync()
+        self.update_manual_ai_composer_state()
+
+    def configure_quick_chat_view(self, view: QuickChatView):
+        view.copy_requested.connect(self.handle_quick_chat_copy)
+        view.action_requested.connect(self.handle_quick_chat_action)
+        view.text_updated.connect(self.handle_quick_chat_text_updated)
+
+    def quick_chat_views(self) -> List[QuickChatView]:
+        views = list(getattr(self, "quick_history_segment_views", []))
+        live_view = getattr(self, "quick_chat_view", None)
+        if live_view is not None:
+            views.append(live_view)
+        return views
+
+    def quick_chat_models(self) -> List[QuickChatListModel]:
+        models = list(getattr(self, "quick_history_segment_models", []))
+        live_model = getattr(self, "quick_chat_model", None)
+        if live_model is not None:
+            models.append(live_model)
+        return models
+
+    def quick_view_for_model(self, model: QuickChatListModel) -> Optional[QuickChatView]:
+        live_model = getattr(self, "quick_chat_model", None)
+        if model is live_model:
+            return getattr(self, "quick_chat_view", None)
+        for idx, segment_model in enumerate(getattr(self, "quick_history_segment_models", [])):
+            if segment_model is model:
+                if idx < len(self.quick_history_segment_views):
+                    return self.quick_history_segment_views[idx]
+                break
+        return None
+
+    def quick_find_item(self, item_id: str) -> tuple[Optional[QuickChatListModel], Optional[Dict[str, object]]]:
+        if not item_id:
+            return None, None
+        for model in self.quick_chat_models():
+            item = model.item(item_id)
+            if item is not None:
+                return model, item
+        return None, None
+
+    def quick_chat_count(self) -> int:
+        return self.quick_chat_model.count() if hasattr(self, "quick_chat_model") else 0
+
+    def quick_insert_item(self, item: Dict[str, object], insert_index: Optional[int] = None) -> str:
+        self.hide_empty_state()
+        row = self.quick_chat_count() if insert_index is None else insert_index
+        item_id = self.quick_chat_model.insert_item(row, item)
+        self.quick_chat_view.setVisible(self.is_quick_chat_active())
+        self.quick_chat_view.schedule_layout_sync()
+        return item_id
+
+    def quick_append_item(self, item: Dict[str, object]) -> str:
+        return self.quick_insert_item(item, None)
+
+    def quick_remove_item(self, item_id: str):
+        if not item_id:
+            return
+        model, _item = self.quick_find_item(item_id)
+        if model is not None and model.remove_item(item_id):
+            self.quick_change_records.pop(item_id, None)
+            self.quick_prompt_records.pop(item_id, None)
+            view = self.quick_view_for_model(model)
+            if view is not None:
+                if model is self.quick_chat_model and model.count() <= 0:
+                    view.setVisible(False)
+                view.schedule_layout_sync()
+
+    def quick_update_item(self, item_id: str, patch: Dict[str, object]) -> bool:
+        model, existing = self.quick_find_item(item_id)
+        if existing:
+            kind = str(patch.get("kind") or existing.get("kind") or "")
+            if kind == "ai" and "partsData" not in patch:
+                next_text = str(patch.get("text") if "text" in patch else existing.get("text") or "")
+                patch = dict(patch)
+                patch["partsData"] = quick_markdown_parts_data(next_text)
+        if model is None:
+            return False
+        updated = model.update_item(item_id, patch)
+        if updated:
+            view = self.quick_view_for_model(model)
+            if view is not None:
+                view.schedule_layout_sync()
+        return updated
+
+    def quick_result_item(self, text: str, *, title: str = "执行结果", auto_follow: bool = False, max_height: int = 210) -> Dict[str, object]:
+        return {
+            "kind": "result",
+            "title": title,
+            "text": mask_low_value_context_markers_for_display(text),
+            "copyText": f"复制{title}" if title else "复制",
+            "maxContentHeight": max_height,
+            "autoFollow": auto_follow,
+        }
+
+    def quick_ai_item(
+        self,
+        text: str,
+        *,
+        role_label: str = "AI",
+        status_text: str = "",
+        preview: bool = False,
+    ) -> Dict[str, object]:
+        return {
+            "kind": "preview_ai" if preview else "ai",
+            "roleLabelText": role_label,
+            "statusText": status_text,
+            "text": text,
+            "partsData": [] if preview else quick_markdown_parts_data(text),
+            "copyText": "" if preview else "复制 AI 输出",
+            "maxContentHeight": QT_WIDGET_MAX_HEIGHT,
+        }
+
+    def quick_user_item(self, text: str, *, copy_text: str = "复制用户内容") -> Dict[str, object]:
+        return {
+            "kind": "user",
+            "text": text,
+            "copyText": copy_text,
+            "maxContentHeight": 0,
+        }
+
+    def quick_notice_item(self, text: str, *, action_name: str = "") -> Dict[str, object]:
+        return {
+            "kind": "notice",
+            "text": text,
+            "actionName": action_name,
+            "maxContentHeight": 0,
+        }
+
+    def quick_change_files_data(self, records: List[Dict[str, object]], *, render_details: bool = False) -> List[Dict[str, object]]:
+        file_items: List[Dict[str, object]] = []
+        for index, record in enumerate(records):
+            path = str(record.get("path") or "(unknown)")
+            is_binary = bool(record.get("binary"))
+            add_text = f"+{int(record.get('additions') or 0)}"
+            del_text = f"-{int(record.get('deletions') or 0)}"
+            if is_binary:
+                add_text = {"added": "added", "deleted": "deleted"}.get(str(record.get("status", "")), "changed")
+                del_text = ""
+                detail_html = render_binary_change_html(record) if render_details else ""
+                detail_height = quick_diff_view_height(record)
+            else:
+                detail_html = render_diff_html(record) if render_details else ""
+                detail_height = quick_diff_view_height(record)
+            file_items.append({
+                "index": index,
+                "path": path,
+                "binary": is_binary,
+                "addText": add_text,
+                "delText": del_text,
+                "diffHtml": detail_html,
+                "diffHeight": detail_height,
+                "detailLoaded": bool(detail_html),
+                "expanded": False,
+            })
+        return file_items
+
+    def quick_change_item_payload(
+        self,
+        records: List[Dict[str, object]],
+        *,
+        undone: bool = False,
+    ) -> Dict[str, object]:
+        text_records = [r for r in records if not r.get("binary")]
+        binary_count = len(records) - len(text_records)
+        additions = sum(int(r.get("additions") or 0) for r in text_records)
+        deletions = sum(int(r.get("deletions") or 0) for r in text_records)
+        lines: List[str] = []
+        for record in records:
+            path = str(record.get("path") or "(unknown)")
+            if record.get("binary"):
+                lines.append(f"{path} · binary")
+            else:
+                lines.append(f"{path}  +{int(record.get('additions') or 0)}  -{int(record.get('deletions') or 0)}")
+        return {
+            "kind": "change_summary",
+            "title": f"{len(records)} files changed",
+            "text": "\n".join(lines),
+            "statsAdd": (f"+{additions}" if text_records else (f"{binary_count} binary" if binary_count else "")),
+            "statsDel": (f"-{deletions}" if text_records else ""),
+            "undone": bool(undone),
+            "canUndo": not bool(undone),
+            "canRedo": bool(undone),
+            "filesData": self.quick_change_files_data(records),
+            "maxContentHeight": 0,
+        }
+
+    def quick_change_item(
+        self,
+        records: List[Dict[str, object]],
+        *,
+        history_entry_id: str = "",
+        undone: bool = False,
+    ) -> Dict[str, object]:
+        item = self.quick_change_item_payload(records, undone=undone)
+        item_id = str(item.get("itemId") or uuid.uuid4().hex)
+        item["itemId"] = item_id
+        self.quick_change_records[item_id] = {
+            "records": records,
+            "history_entry_id": history_entry_id,
+            "undone": bool(undone),
+        }
+        return item
+
+    def refresh_quick_change_visuals(self):
+        for item_id, payload in list(self.quick_change_records.items()):
+            model, _item = self.quick_find_item(item_id)
+            if model is None:
+                self.quick_change_records.pop(item_id, None)
+                continue
+            records = list(payload.get("records") or [])
+            undone = bool(payload.get("undone"))
+            patch = self.quick_change_item_payload(records, undone=undone)
+            patch.pop("kind", None)
+            self.quick_update_item(item_id, patch)
+
+    def handle_quick_chat_copy(self, item_id: str):
+        _model, item = self.quick_find_item(item_id)
+        if not item:
+            return
+        prompt_payload = self.quick_prompt_records.get(str(item_id or ""))
+        if prompt_payload:
+            full_prompt = str(prompt_payload.get("full_prompt") or "")
+            if full_prompt:
+                QApplication.clipboard().setText(self.display_prompt_text(full_prompt))
+                return
+        QApplication.clipboard().setText(strip_agent_qt_hidden_blocks(str(item.get("text") or "")))
+
+    def handle_quick_chat_action(self, action: str, item_id: str):
+        action = str(action or "").strip()
+        if action == "expand_history":
+            self.expand_hidden_history()
+            return
+        if action == "toggle_change_detail":
+            self.toggle_quick_change_detail(item_id)
+            return
+        if action == "load_change_detail":
+            self.load_quick_change_detail(item_id)
+            return
+        if action == "undo_change":
+            self.undo_quick_changes(item_id)
+            return
+        if action == "redo_change":
+            self.redo_quick_changes(item_id)
+
+    def load_quick_change_detail(self, payload_id: str):
+        item_text, sep, index_text = str(payload_id or "").partition("::")
+        if not sep:
+            return
+        try:
+            record_index = int(index_text)
+        except ValueError:
+            return
+        payload = self.quick_change_records.get(item_text)
+        _model, item = self.quick_find_item(item_text)
+        if not payload or not item:
+            logger.warning("Quick change detail missing payload item_id=%s payload_id=%s", item_text, payload_id)
+            return
+        records = list(payload.get("records") or [])
+        if record_index < 0 or record_index >= len(records):
+            logger.warning(
+                "Quick change detail index out of range item_id=%s index=%d records=%d",
+                item_text,
+                record_index,
+                len(records),
+            )
+            return
+        files_data = list(item.get("filesData") or self.quick_change_files_data(records))
+        while len(files_data) < len(records):
+            files_data.append(self.quick_change_files_data([records[len(files_data)]])[0])
+        file_item = dict(files_data[record_index])
+        if not file_item.get("diffHtml"):
+            record = records[record_index]
+            detail_html = render_binary_change_html(record) if record.get("binary") else render_diff_html(record)
+            if not detail_html.strip():
+                detail_html = (
+                    f"<html><body style='margin:0; background:{COLORS['code_bg']}; color:{COLORS['text_secondary']}; "
+                    "font-family: Menlo, monospace;'><div style='padding:12px;'>无可展示的文本 diff。</div></body></html>"
+                )
+            file_item["diffHtml"] = detail_html
+            file_item["detailLoaded"] = True
+            file_item["diffHeight"] = quick_diff_view_height(record)
+            files_data[record_index] = file_item
+            self.quick_update_item(item_text, {"filesData": files_data})
+            logger.info(
+                "Quick change detail loaded item_id=%s index=%d path=%s binary=%s html_len=%d",
+                item_text,
+                record_index,
+                str(record.get("path") or ""),
+                bool(record.get("binary")),
+                len(detail_html),
+            )
+
+    def toggle_quick_change_detail(self, payload_id: str):
+        item_text, sep, index_text = str(payload_id or "").partition("::")
+        if not sep:
+            return
+        try:
+            record_index = int(index_text)
+        except ValueError:
+            return
+        _model, item = self.quick_find_item(item_text)
+        if not item:
+            return
+        files_data = list(item.get("filesData") or [])
+        if record_index < 0 or record_index >= len(files_data):
+            return
+        file_item = dict(files_data[record_index])
+        expanded = bool(file_item.get("expanded"))
+        file_item["expanded"] = not expanded
+        files_data[record_index] = file_item
+        self.quick_update_item(item_text, {"filesData": files_data})
+        if file_item["expanded"] and not bool(file_item.get("detailLoaded")):
+            self.load_quick_change_detail(payload_id)
+
+    def handle_quick_chat_text_updated(self, item_id: str, text: str):
+        model, _item = self.quick_find_item(item_id)
+        if model is not None:
+            self.quick_update_item(item_id, {"inputText": str(text or "")})
+
+    def quick_history_segment_layout_index(self) -> int:
+        notice = getattr(self, "history_trim_notice", None)
+        if isinstance(notice, QWidget) and notice.parent() is not None:
+            idx = self.chat_layout.indexOf(notice)
+            if idx >= 0:
+                return idx + 1
+        live_view = getattr(self, "quick_chat_view", None)
+        if live_view is not None:
+            idx = self.chat_layout.indexOf(live_view)
+            if idx >= 0:
+                return idx
+        return 0
+
+    def quick_history_entry_char_weight(self, entry: Dict[str, object]) -> int:
+        parts = [str(entry.get("content") or "")]
+        if entry.get("type") == "prompt":
+            parts.append(str(entry.get("context_content") or ""))
+        if entry.get("type") == "result":
+            changes = entry.get("changes")
+            if isinstance(changes, list):
+                parts.append(str(len(changes) * 240))
+        return sum(len(part) for part in parts if part)
+
+    def quick_expand_history_entries_for_render(self, entries: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        expanded: List[Dict[str, object]] = []
+        for entry in entries:
+            if entry.get("type") != "ai":
+                expanded.append(entry)
+                continue
+            content = str(entry.get("content") or "")
+            chunks = quick_split_markdown_text_for_history_render(content)
+            if len(chunks) <= 1:
+                expanded.append(entry)
+                continue
+            for chunk in chunks:
+                chunk_entry = dict(entry)
+                chunk_entry["content"] = chunk
+                expanded.append(chunk_entry)
+        return expanded
+
+    def split_quick_history_segments(self, entries: List[Dict[str, object]]) -> List[List[Dict[str, object]]]:
+        segments: List[List[Dict[str, object]]] = []
+        render_entries = self.quick_expand_history_entries_for_render(entries)
+        current: List[Dict[str, object]] = []
+        current_chars = 0
+        for entry in render_entries:
+            weight = self.quick_history_entry_char_weight(entry)
+            if current and (
+                len(current) >= QUICK_CHAT_SEGMENT_ENTRY_LIMIT
+                or current_chars + weight > QUICK_CHAT_SEGMENT_CHAR_BUDGET
+            ):
+                segments.append(current)
+                current = []
+                current_chars = 0
+            current.append(entry)
+            current_chars += weight
+        if current:
+            segments.append(current)
+        return segments
+
+    def append_quick_history_entry_to_model(self, model: QuickChatListModel, entry: Dict[str, object]):
+        entry_type = entry.get("type")
+        if entry_type == "prompt":
+            full_prompt = str(entry.get("content", ""))
+            display_text = str(entry.get("context_content") or "").strip() or self.prompt_bubble_display_text(full_prompt)
+            if display_text.strip():
+                item_id = model.append_item(
+                    self.quick_user_item(
+                        display_text,
+                        copy_text="" if self.automation_enabled else "复制提示词",
+                    )
+                )
+                self.quick_prompt_records[item_id] = {
+                    "full_prompt": full_prompt,
+                    "history_entry_id": str(entry.get("id") or ""),
+                }
+        elif entry_type == "ai":
+            model.append_item(self.quick_ai_item(str(entry.get("content", ""))))
+        elif entry_type == "result":
+            model.append_item(
+                self.quick_result_item(str(entry.get("content", "")), title="执行结果", max_height=210)
+            )
+            records = []
+            for raw_record in entry.get("changes", []) if isinstance(entry.get("changes"), list) else []:
+                record = deserialize_change_record(raw_record)
+                if record:
+                    records.append(record)
+            if records:
+                change_item = self.quick_change_item(
+                    records,
+                    history_entry_id=str(entry.get("id") or ""),
+                    undone=bool(entry.get("undone", False)),
+                )
+                model.append_item(change_item)
+        elif entry_type == "terminal_result":
+            model.append_item(
+                self.quick_result_item(str(entry.get("content", "")), title="终端执行结果", max_height=210)
+            )
+        elif entry_type == "provider_io":
+            model.append_item(
+                self.quick_result_item(str(entry.get("content", "")), title="Provider 请求失败", max_height=180)
+            )
+
+    def create_quick_history_segment_view(self, entries: List[Dict[str, object]], layout_index: int) -> int:
+        model = QuickChatListModel(self)
+        for entry in entries:
+            self.append_quick_history_entry_to_model(model, entry)
+        view = QuickChatView(model, self.chat_column)
+        self.configure_quick_chat_view(view)
+        self.quick_history_segment_models.append(model)
+        self.quick_history_segment_views.append(view)
+        self.insert_chat_widget(layout_index, view)
+        return layout_index + 1
+
+    def render_quick_history_segments(self, entries: List[Dict[str, object]], layout_index: Optional[int] = None):
+        if not entries:
+            return
+        insert_index = self.quick_history_segment_layout_index() if layout_index is None else layout_index
+        for segment_entries in self.split_quick_history_segments(entries):
+            insert_index = self.create_quick_history_segment_view(segment_entries, insert_index)
+
+    def undo_quick_changes(self, item_id: str):
+        payload = self.quick_change_records.get(str(item_id or ""))
+        if not payload:
+            return
+        records = list(payload.get("records") or [])
+        result = restore_change_records(self.project_root, records)
+        if int(result.get("skipped") or 0) > 0:
+            self.show_change_conflict("Undo", result)
+            return
+        payload["undone"] = True
+        self.quick_update_item(item_id, {"undone": True, "canUndo": False, "canRedo": True})
+        self.update_change_history_state(str(payload.get("history_entry_id") or ""), True)
+        self.sidebar.refresh_tree(self.project_root)
+
+    def redo_quick_changes(self, item_id: str):
+        payload = self.quick_change_records.get(str(item_id or ""))
+        if not payload:
+            return
+        records = list(payload.get("records") or [])
+        result = redo_change_records(self.project_root, records)
+        if int(result.get("skipped") or 0) > 0:
+            self.show_change_conflict("Redo", result)
+            return
+        payload["undone"] = False
+        self.quick_update_item(item_id, {"undone": False, "canUndo": True, "canRedo": False})
+        self.update_change_history_state(str(payload.get("history_entry_id") or ""), False)
+        self.sidebar.refresh_tree(self.project_root)
 
     def user_bubble_width(self) -> int:
         if not hasattr(self, "chat_column"):
@@ -15222,13 +17140,25 @@ class ChatPage(QWidget):
         """)
         notice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.history_trim_notice = notice
-        self.add_chat_widget(notice)
+        if self.is_quick_chat_active():
+            self.insert_chat_widget(self.quick_history_segment_layout_index(), notice)
+        else:
+            self.add_chat_widget(notice)
+
+    def active_history_initial_render_entries(self) -> int:
+        return QUICK_CHAT_HISTORY_INITIAL_RENDER_ENTRIES if self.is_quick_chat_active() else CHAT_HISTORY_INITIAL_RENDER_ENTRIES
+
+    def active_history_render_batch_size(self) -> int:
+        return QUICK_CHAT_HISTORY_RENDER_BATCH_SIZE if self.is_quick_chat_active() else CHAT_HISTORY_RENDER_BATCH_SIZE
 
     def add_context_compaction_notice(self):
         now = time.time()
         if now - self._last_context_compaction_notice_at < 2:
             return
         self._last_context_compaction_notice_at = now
+        if self.is_quick_chat_active():
+            self.quick_append_item(self.quick_notice_item("——————  自动压缩上下文  ———————"))
+            return
         notice = QLabel("——————  自动压缩上下文  ———————")
         notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
         notice.setStyleSheet(f"""
@@ -15989,6 +17919,9 @@ class ChatPage(QWidget):
     def ensure_ai_response_entry(self, focus: bool = False, animate: bool = True, keep_visible: bool = True):
         if self.automation_enabled or self.is_execution_running():
             return
+        if self.is_quick_chat_active():
+            self.update_manual_ai_composer_state(focus=focus)
+            return
         existing_frame = self.find_open_ai_response_frame()
         if existing_frame is None:
             self.add_ai_response_frame(focus=focus, animate=animate, keep_visible=keep_visible)
@@ -15999,6 +17932,8 @@ class ChatPage(QWidget):
                 QTimer.singleShot(60, ai_input.setFocus)
 
     def keep_ai_response_visible(self):
+        if self.is_quick_chat_active():
+            return
         if self.automation_enabled or self.find_open_ai_response_frame() is None:
             return
         for delay in (0, 80, 180):
@@ -17030,6 +18965,10 @@ class ChatPage(QWidget):
         if hasattr(self, "scroll_area"):
             self.scroll_area.setStyleSheet(self.chat_scroll_area_style(self.chat_scrollbar_visible))
             self.scroll_area.viewport().setStyleSheet("background: transparent; border: none;")
+        if hasattr(self, "quick_chat_view"):
+            for view in self.quick_chat_views():
+                view.reload_theme()
+            self.refresh_quick_change_visuals()
         if hasattr(self, "sidebar_resize_overlay"):
             self.sidebar_resize_overlay.setStyleSheet(f"""
                 QLabel {{
@@ -17658,6 +19597,7 @@ class ChatPage(QWidget):
             self.automation_loop_goal = ""
             self.stop_automation_preview(remove_bubble=True)
             self.hide_automation_composer()
+            self.refresh_chat_mode_visibility()
             self.load_history()
             self.update_prompt_tools_responsive()
             return
@@ -17679,6 +19619,7 @@ class ChatPage(QWidget):
         self.automation_enabled = True
         set_automation_enabled_setting(True)
         self.stop_automation_preview(remove_bubble=True)
+        self.refresh_chat_mode_visibility()
         self.load_history()
         self.update_prompt_tools_responsive()
         self.run_automation_setup("start")
@@ -18872,6 +20813,14 @@ class ChatPage(QWidget):
         self.add_status_bubble(f"已删除：{rel_path}")
 
     def refresh_prompt_bubble_buttons(self):
+        if self.is_quick_chat_active():
+            for item_id in list(self.quick_prompt_records.keys()):
+                if self.quick_chat_model.item(item_id) is None:
+                    self.quick_prompt_records.pop(item_id, None)
+                    continue
+                copy_text = "" if self.automation_loop_active else "复制提示词"
+                self.quick_update_item(item_id, {"copyText": copy_text})
+            return
         for idx in range(self.chat_layout.count()):
             widget = self.chat_layout.itemAt(idx).widget()
             if isinstance(widget, ChatBubble) and getattr(widget, "role", "") == "user":
@@ -18901,6 +20850,10 @@ class ChatPage(QWidget):
         self._last_status_message = text
         self._last_status_at = now
         self.hide_empty_state()
+        if self.is_quick_chat_active():
+            self.quick_append_item(self.quick_result_item(text, title="状态", max_height=120))
+            self.scroll_to_bottom()
+            return
         bubble = ExecutionLogPanel(
             text,
             parent=self.chat_container,
@@ -18937,6 +20890,18 @@ class ChatPage(QWidget):
     def add_execution_result_entry(self, content: str, *, context_content: str = ""):
         content = str(content or "").strip()
         if not content:
+            return
+        if self.is_quick_chat_active():
+            self.quick_append_item(self.quick_result_item(content, title="执行结果", max_height=210))
+            context = context_content or build_execution_context_content(content, [])
+            self.append_history({
+                "type": "result",
+                "content": content,
+                "context_content": context,
+                "changes": [],
+                "undone": False,
+            })
+            self.scroll_to_bottom()
             return
         result_bubble = ExecutionLogPanel(
             content,
@@ -19164,19 +21129,39 @@ class ChatPage(QWidget):
             "",
             "Commands:",
         ] + [f"$ {directive}" for directive in cleaned_directives]
-        result_bubble = ExecutionLogPanel(
-            "\n".join(placeholder_lines),
-            parent=self.chat_container,
-            max_content_height=210,
-            title="执行结果",
-        )
-        result_bubble.set_auto_follow(True)
-        self.add_chat_widget(result_bubble, animate=True)
+        placeholder_text = "\n".join(placeholder_lines)
+        if self.is_quick_chat_active():
+            result_bubble = self.quick_append_item(
+                self.quick_result_item(
+                    placeholder_text,
+                    title="执行结果",
+                    auto_follow=True,
+                    max_height=210,
+                )
+            )
+        else:
+            result_bubble = ExecutionLogPanel(
+                placeholder_text,
+                parent=self.chat_container,
+                max_content_height=210,
+                title="执行结果",
+            )
+            result_bubble.set_auto_follow(True)
+            self.add_chat_widget(result_bubble, animate=True)
         self.update_automation_composer_state()
         self.scroll_to_bottom()
         progress_lines: List[str] = []
 
         def update_result_bubble(text: str, *, auto_follow: bool = True):
+            if isinstance(result_bubble, str):
+                self.quick_update_item(
+                    result_bubble,
+                    {
+                        "text": mask_low_value_context_markers_for_display(text),
+                        "autoFollow": auto_follow,
+                    },
+                )
+                return
             result_bubble.update_content(text)
             result_bubble.set_auto_follow(auto_follow)
 
@@ -19279,18 +21264,38 @@ class ChatPage(QWidget):
             "",
             "Commands:",
         ] + [f"$ {directive}" for directive in cleaned_directives]
-        result_bubble = ExecutionLogPanel(
-            "\n".join(placeholder_lines),
-            parent=self.chat_container,
-            max_content_height=210,
-            title="执行结果",
-        )
-        result_bubble.set_auto_follow(True)
-        self.add_chat_widget(result_bubble, animate=True)
+        placeholder_text = "\n".join(placeholder_lines)
+        if self.is_quick_chat_active():
+            result_bubble = self.quick_append_item(
+                self.quick_result_item(
+                    placeholder_text,
+                    title="执行结果",
+                    auto_follow=True,
+                    max_height=210,
+                )
+            )
+        else:
+            result_bubble = ExecutionLogPanel(
+                placeholder_text,
+                parent=self.chat_container,
+                max_content_height=210,
+                title="执行结果",
+            )
+            result_bubble.set_auto_follow(True)
+            self.add_chat_widget(result_bubble, animate=True)
         self.update_automation_composer_state()
         self.scroll_to_bottom()
 
         def update_result_bubble(text: str, *, auto_follow: bool = True):
+            if isinstance(result_bubble, str):
+                self.quick_update_item(
+                    result_bubble,
+                    {
+                        "text": mask_low_value_context_markers_for_display(text),
+                        "autoFollow": auto_follow,
+                    },
+                )
+                return
             result_bubble.update_content(text)
             result_bubble.set_auto_follow(auto_follow)
 
@@ -19709,12 +21714,44 @@ class ChatPage(QWidget):
             return
         self.automation_composer.setVisible(bool(self.automation_enabled))
         self.update_automation_composer_state()
+        self.update_manual_ai_composer_state()
         if focus and self.automation_input is not None:
             QTimer.singleShot(60, self.automation_input.setFocus)
 
     def hide_automation_composer(self):
         if self.automation_composer is not None:
             self.automation_composer.setVisible(False)
+        self.update_manual_ai_composer_state()
+
+    def update_manual_ai_composer_state(self, focus: bool = False):
+        composer = self.manual_ai_composer
+        editor = self.manual_ai_input
+        button = self.manual_ai_confirm_btn
+        if composer is None or editor is None or button is None:
+            return
+        visible = self.is_quick_chat_active() and not self.automation_enabled
+        composer.setVisible(visible)
+        if not visible:
+            return
+        busy = self.is_execution_running() or self.is_automation_request_running()
+        editor.setEnabled(not busy)
+        button.setEnabled(not busy)
+        editor.setPlaceholderText("等待执行完成..." if busy else "在此粘贴 AI 的完整输出（含代码块）...")
+        if focus and not busy:
+            QTimer.singleShot(60, editor.setFocus)
+
+    def process_manual_ai_response(self):
+        if self.automation_enabled:
+            return
+        editor = self.manual_ai_input
+        if editor is None:
+            return
+        text = editor.toPlainText().strip()
+        if not text:
+            editor.setFocus()
+            return
+        editor.clear()
+        self.handle_ai_response_text(text)
 
     def automation_send_button_style(self, busy: bool = False) -> str:
         if busy:
@@ -19788,6 +21825,7 @@ class ChatPage(QWidget):
             self.automation_input.setPlaceholderText(self.automation_context_placeholder_text())
             self.automation_send_btn.setIcon(line_icon("send", "white", 20))
             self.automation_send_btn.setStyleSheet(self.automation_send_button_style(busy=False))
+        self.update_manual_ai_composer_state()
 
     def on_automation_composer_action(self):
         if self.is_automation_busy():
@@ -19888,9 +21926,26 @@ class ChatPage(QWidget):
     ) -> str:
         self.hide_empty_state()
         entry_id = uuid.uuid4().hex
+        visible_text = display_text.strip() or self.prompt_bubble_display_text(full_prompt)
+        if self.is_quick_chat_active():
+            item_id = self.quick_append_item(self.quick_user_item(visible_text))
+            self.quick_prompt_records[item_id] = {
+                "full_prompt": full_prompt,
+                "history_entry_id": entry_id,
+            }
+            entry = {
+                "id": entry_id,
+                "type": "prompt",
+                "content": full_prompt,
+            }
+            if context_content.strip():
+                entry["context_content"] = context_content.strip()
+            self.append_history(entry)
+            self.scroll_to_bottom()
+            return entry_id
         bubble = ChatBubble(
             "user",
-            display_text.strip() or self.prompt_bubble_display_text(full_prompt),
+            visible_text,
             parent=self.chat_container,
             show_copy=False,
             show_prompt_input=False,
@@ -19913,6 +21968,8 @@ class ChatPage(QWidget):
         return entry_id
 
     def remove_empty_automation_prompt_bubbles(self):
+        if self.is_quick_chat_active():
+            return
         for idx in range(self.chat_layout.count() - 1, -1, -1):
             widget = self.chat_layout.itemAt(idx).widget()
             if not isinstance(widget, ChatBubble) or getattr(widget, "role", "") != "user":
@@ -19923,8 +21980,14 @@ class ChatPage(QWidget):
             self.chat_layout.removeWidget(widget)
             widget.deleteLater()
 
-    def create_automation_preview_bubble(self) -> QFrame:
+    def create_automation_preview_bubble(self):
         self.hide_empty_state()
+        if self.is_quick_chat_active():
+            item_id = self.quick_append_item(
+                self.quick_ai_item("", role_label="AI 正在回复", status_text="AI 正在回复...", preview=True)
+            )
+            self.scroll_to_bottom()
+            return item_id
         frame = ChatBubble(
             "ai",
             "",
@@ -19985,10 +22048,16 @@ class ChatPage(QWidget):
         self.automation_preview_pending_text = ""
         self.automation_preview_last_rendered_text = ""
         self.automation_preview_last_chars = 0
+        self.automation_preview_markdown_request_id += 1
+        self.automation_preview_markdown_pending = False
+        self.automation_preview_markdown_target_text = ""
         self.automation_preview_thread_id = ""
         if remove_bubble and self.automation_preview_bubble is not None:
             bubble = self.automation_preview_bubble
             self.automation_preview_bubble = None
+            if isinstance(bubble, str):
+                self.quick_remove_item(bubble)
+                return
             try:
                 bubble.preview_status = None
             except RuntimeError:
@@ -20016,22 +22085,27 @@ class ChatPage(QWidget):
             text = str(getattr(bubble, "content", "") or "").strip()
         if not text:
             return False
-        if isinstance(bubble, ChatBubble):
+        if isinstance(bubble, str):
+            self.finalize_automation_preview_bubble(text)
+        elif isinstance(bubble, ChatBubble):
             self.finalize_automation_preview_bubble(text)
         else:
-            ai_bubble = ChatBubble(
-                "ai",
-                text,
-                show_copy=True,
-                parent=self.chat_container,
-                copy_text="复制 AI 输出",
-                scrollable=True,
-                max_content_height=QT_WIDGET_MAX_HEIGHT,
-                markdown=self.automation_enabled,
-                expand_to_content=True,
-                flat=self.automation_enabled,
-            )
-            self.add_chat_widget(ai_bubble, animate=True)
+            if self.is_quick_chat_active():
+                self.quick_append_item(self.quick_ai_item(text))
+            else:
+                ai_bubble = ChatBubble(
+                    "ai",
+                    text,
+                    show_copy=True,
+                    parent=self.chat_container,
+                    copy_text="复制 AI 输出",
+                    scrollable=True,
+                    max_content_height=QT_WIDGET_MAX_HEIGHT,
+                    markdown=self.automation_enabled,
+                    expand_to_content=True,
+                    flat=self.automation_enabled,
+                )
+                self.add_chat_widget(ai_bubble, animate=True)
         history_entry = {
             "type": "ai",
             "content": text,
@@ -20052,6 +22126,51 @@ class ChatPage(QWidget):
         except ValueError:
             pass
 
+    def finish_automation_preview_markdown_worker(self, worker: MarkdownRenderWorker):
+        if self.automation_preview_markdown_worker is worker:
+            self.automation_preview_markdown_worker = None
+        if self.automation_preview_markdown_pending and self.automation_preview_markdown_target_text:
+            self.automation_preview_markdown_pending = False
+            QTimer.singleShot(0, self.start_automation_preview_markdown_render)
+
+    def start_automation_preview_markdown_render(self):
+        bubble = self.automation_preview_bubble
+        text = str(self.automation_preview_markdown_target_text or "")
+        if not isinstance(bubble, str) or not text:
+            return
+        if self.automation_preview_markdown_worker is not None and self.automation_preview_markdown_worker.isRunning():
+            self.automation_preview_markdown_pending = True
+            return
+        self.automation_preview_markdown_request_id += 1
+        worker = MarkdownRenderWorker(self.automation_preview_markdown_request_id, text)
+        self.automation_preview_markdown_worker = worker
+        worker.rendered.connect(self.apply_automation_preview_markdown_render)
+        worker.finished.connect(lambda worker=worker: self.finish_automation_preview_markdown_worker(worker))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def apply_automation_preview_markdown_render(self, request_id: int, text: str, parts: List[Dict[str, str]], _signatures: List[tuple], _stats: Dict[str, int]):
+        bubble = self.automation_preview_bubble
+        if not isinstance(bubble, str):
+            return
+        if request_id != self.automation_preview_markdown_request_id:
+            return
+        if self.automation_preview_thread_id and self.automation_preview_thread_id != self.thread_id:
+            return
+        if text != str(self.automation_preview_markdown_target_text or ""):
+            self.automation_preview_markdown_pending = True
+            return
+        scroll_state = self.capture_chat_scroll_state()
+        self.quick_update_item(
+            bubble,
+            {
+                "text": text,
+                "partsData": quick_parts_data_from_rendered_parts(parts),
+            },
+        )
+        self.automation_preview_last_rendered_text = text
+        self.stabilize_chat_scroll_after_update(scroll_state)
+
     def update_automation_preview_status(self, chars: Optional[int] = None):
         started = time.perf_counter()
         bubble = self.automation_preview_bubble
@@ -20060,6 +22179,13 @@ class ChatPage(QWidget):
         if chars is not None:
             self.automation_preview_last_chars = max(0, int(chars))
         status = getattr(bubble, "preview_status", None)
+        if isinstance(bubble, str):
+            if self.automation_preview_last_chars > 0:
+                text = f"AI 正在回复... 已生成约 {self.automation_preview_last_chars} 字"
+            else:
+                text = "AI 正在回复..."
+            self.quick_update_item(bubble, {"statusText": text})
+            return
         if status is None:
             return
         if self.automation_preview_last_chars > 0:
@@ -20106,6 +22232,11 @@ class ChatPage(QWidget):
         if not text or text == self.automation_preview_last_rendered_text:
             return
         scroll_state = self.capture_chat_scroll_state()
+        if isinstance(bubble, str):
+            self.automation_preview_markdown_target_text = text
+            self.quick_update_item(bubble, {"text": text})
+            self.start_automation_preview_markdown_render()
+            return
         try:
             bubble.update_content(text)
         except RuntimeError:
@@ -20524,6 +22655,7 @@ class ChatPage(QWidget):
         self.copy_prompt_btn.setText("已添加")
         QTimer.singleShot(1200, self.reset_primary_button_text)
         self.add_prompt_bubble(full_prompt, save=True, animate=True)
+        self.ensure_ai_response_entry(focus=True, animate=False, keep_visible=False)
         self.scroll_to_bottom()
 
     def on_primary_action_button(self):
@@ -20803,11 +22935,31 @@ class ChatPage(QWidget):
         self.copy_prompt_btn.setText("已复制")
         QTimer.singleShot(1200, self.reset_primary_button_text)
         self.add_prompt_bubble(full_prompt, save=True, animate=True)
+        self.ensure_ai_response_entry(focus=True, animate=False, keep_visible=False)
         self.scroll_to_bottom()
 
     def add_prompt_bubble(self, full_prompt: str, save: bool = False, animate: bool = False, insert_index: Optional[int] = None):
         self.hide_empty_state()
         history_entry_id = uuid.uuid4().hex if save else ""
+        if self.is_quick_chat_active():
+            item_id = self.quick_insert_item(
+                self.quick_user_item(
+                    self.prompt_bubble_display_text(full_prompt),
+                    copy_text="" if self.automation_loop_active else "复制提示词",
+                ),
+                insert_index,
+            )
+            self.quick_prompt_records[item_id] = {
+                "full_prompt": full_prompt,
+                "history_entry_id": history_entry_id,
+            }
+            if save:
+                self.append_history({
+                    "id": history_entry_id,
+                    "type": "prompt",
+                    "content": full_prompt,
+                })
+            return item_id
         prompt_bubble = ChatBubble(
             "user",
             self.prompt_bubble_display_text(full_prompt),
@@ -20890,9 +23042,33 @@ class ChatPage(QWidget):
             self.keep_ai_response_visible()
 
     def clear_chat_widgets(self):
+        quick_view = getattr(self, "quick_chat_view", None)
+        self.quick_change_records.clear()
+        self.quick_prompt_records.clear()
+        self.result_bubble = None
+        self.history_trim_notice = None
+        self.automation_preview_bubble = None
+        if hasattr(self, "quick_chat_model"):
+            self.quick_chat_model.clear()
+        for segment_view in list(getattr(self, "quick_history_segment_views", [])):
+            try:
+                idx = self.chat_layout.indexOf(segment_view)
+            except RuntimeError:
+                idx = -1
+            if idx >= 0:
+                item = self.chat_layout.takeAt(idx)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            else:
+                segment_view.deleteLater()
+        self.quick_history_segment_views = []
+        self.quick_history_segment_models = []
         while self.chat_layout.count():
             item = self.chat_layout.takeAt(0)
             widget = item.widget()
+            if widget in {quick_view, self.empty_state}:
+                continue
             if widget and widget is not self.empty_state:
                 if widget is self.automation_preview_bubble:
                     self.automation_preview_bubble = None
@@ -20904,9 +23080,13 @@ class ChatPage(QWidget):
                 widget.deleteLater()
             elif widget is self.empty_state:
                 widget.setParent(None)
-        self.empty_state.setParent(self.chat_container)
+        if quick_view is not None:
+            quick_view.setParent(self.chat_column)
+            self.chat_layout.addWidget(quick_view)
+        self.empty_state.setParent(self.chat_column)
         self.chat_layout.addWidget(self.empty_state)
         self.empty_state.setVisible(True)
+        self.refresh_chat_mode_visibility()
 
     def append_history(self, entry: Dict[str, object]):
         if not entry.get("id"):
@@ -21024,11 +23204,14 @@ class ChatPage(QWidget):
         try:
             self.clear_chat_widgets()
             self.hide_empty_state()
-            loading = QLabel("正在加载会话...")
-            loading.setObjectName("historyLoadingNotice")
-            loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            loading.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none; font-size: 12px; padding: 24px;")
-            self.add_chat_widget(loading)
+            if self.is_quick_chat_active():
+                self.quick_append_item(self.quick_notice_item("正在加载会话..."))
+            else:
+                loading = QLabel("正在加载会话...")
+                loading.setObjectName("historyLoadingNotice")
+                loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                loading.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none; font-size: 12px; padding: 24px;")
+                self.add_chat_widget(loading)
         finally:
             self.setUpdatesEnabled(True)
         worker = HistoryLoadWorker(self.project_root, thread_id, serial)
@@ -21059,14 +23242,26 @@ class ChatPage(QWidget):
                     self.ensure_initial_prompt_bubble()
                 return
             self.hide_empty_state()
-            render_entries = self.history_entries[-CHAT_HISTORY_INITIAL_RENDER_ENTRIES:]
+            initial_count = self.active_history_initial_render_entries()
+            render_entries = self.history_entries[-initial_count:]
             self.history_hidden_entries = self.history_entries[:-len(render_entries)] if render_entries else list(self.history_entries)
             hidden_count = max(0, len(self.history_entries) - len(render_entries))
+            if self.is_quick_chat_active():
+                self.add_history_trim_notice(hidden_count)
+                self.render_quick_history_segments(render_entries)
+                self.history_render_entries = []
+                self.history_render_index = 0
+                self.history_render_cursor = 0
+                self.history_render_insert_index = 0
+                self.history_render_started_at = time.perf_counter()
+                QTimer.singleShot(0, self.finish_history_render)
+                QTimer.singleShot(0, self.force_scroll_to_bottom)
+                return
             self.add_history_trim_notice(hidden_count)
             self.history_render_entries = list(render_entries)
             self.history_render_index = 0
             self.history_render_cursor = len(self.history_render_entries)
-            self.history_render_insert_index = self.chat_layout.count()
+            self.history_render_insert_index = self.quick_chat_count() if self.is_quick_chat_active() else self.chat_layout.count()
             self.history_render_started_at = time.perf_counter()
             QTimer.singleShot(0, self.render_next_history_batch)
         finally:
@@ -21083,7 +23278,7 @@ class ChatPage(QWidget):
             return
         started = time.perf_counter()
         end_index = self.history_render_cursor
-        start_index = max(0, end_index - CHAT_HISTORY_RENDER_BATCH_SIZE)
+        start_index = max(0, end_index - self.active_history_render_batch_size())
         insert_index = self.history_render_insert_index
         self.setUpdatesEnabled(False)
         try:
@@ -21114,7 +23309,7 @@ class ChatPage(QWidget):
             logger.warning(
                 "History render timing entries=%d rendered=%d elapsed_ms=%d",
                 len(self.history_entries),
-                min(len(self.history_entries), CHAT_HISTORY_INITIAL_RENDER_ENTRIES),
+                min(len(self.history_entries), self.active_history_initial_render_entries()),
                 elapsed_ms,
             )
         self.history_render_entries = []
@@ -21129,6 +23324,31 @@ class ChatPage(QWidget):
     def expand_hidden_history(self):
         if not self.history_hidden_entries:
             return
+        if self.is_quick_chat_active():
+            reveal_count = min(self.active_history_initial_render_entries(), len(self.history_hidden_entries))
+            reveal_entries = self.history_hidden_entries[-reveal_count:]
+            self.history_hidden_entries = self.history_hidden_entries[:-reveal_count]
+            notice = self.history_trim_notice
+            insert_index = self.quick_history_segment_layout_index()
+            if isinstance(notice, QPushButton):
+                idx = self.chat_layout.indexOf(notice)
+                if idx >= 0:
+                    insert_index = idx + 1
+            self.render_quick_history_segments(reveal_entries, insert_index)
+            remaining = len(self.history_hidden_entries)
+            if remaining <= 0:
+                if isinstance(notice, QPushButton):
+                    idx = self.chat_layout.indexOf(notice)
+                    if idx >= 0:
+                        item = self.chat_layout.takeAt(idx)
+                        widget = item.widget()
+                        if widget is not None:
+                            widget.deleteLater()
+                self.history_trim_notice = None
+            elif isinstance(notice, QPushButton):
+                notice.setText(f"已折叠较早 {remaining} 条历史。完整历史仍会进入自动化上下文。点击展开")
+                notice.setEnabled(True)
+            return
         if self.history_render_cursor > 0:
             self.history_expand_pending = True
             notice = self.history_trim_notice
@@ -21137,7 +23357,16 @@ class ChatPage(QWidget):
                 notice.setEnabled(False)
             return
         notice = self.history_trim_notice
-        if isinstance(notice, QPushButton):
+        if self.is_quick_chat_active():
+            notice_id = str(notice or "")
+            index = self.quick_chat_model.index_of(notice_id) if notice_id else -1
+            if index >= 0:
+                self.quick_remove_item(notice_id)
+                self.history_expand_insert_index = index
+            else:
+                self.history_expand_insert_index = 0
+            self.history_trim_notice = None
+        elif isinstance(notice, QPushButton):
             try:
                 index = self.chat_layout.indexOf(notice)
             except RuntimeError:
@@ -21164,7 +23393,7 @@ class ChatPage(QWidget):
             return
         end_index = min(
             len(self.history_hidden_entries),
-            self.history_expand_cursor + CHAT_HISTORY_RENDER_BATCH_SIZE,
+            self.history_expand_cursor + self.active_history_render_batch_size(),
         )
         insert_index = self.history_expand_insert_index
         self.setUpdatesEnabled(False)
@@ -21282,6 +23511,13 @@ class ChatPage(QWidget):
 
     def restore_history_entry(self, entry: Dict[str, object], insert_index: Optional[int] = None) -> Optional[int]:
         entry_type = entry.get("type")
+        if self.is_quick_chat_active():
+            next_index = self.quick_chat_count() if insert_index is None else insert_index
+            before = self.quick_chat_count()
+            self.append_quick_history_entry_to_model(self.quick_chat_model, entry)
+            next_index += max(0, self.quick_chat_count() - before)
+            self.quick_chat_view.schedule_layout_sync()
+            return next_index
         if entry_type == "prompt":
             if self.automation_enabled:
                 full_prompt = str(entry.get("content", ""))
@@ -21431,6 +23667,9 @@ class ChatPage(QWidget):
         if self.automation_enabled:
             self.show_automation_composer(focus=focus)
             return
+        if self.is_quick_chat_active():
+            self.update_manual_ai_composer_state(focus=focus)
+            return
         self.hide_empty_state()
         existing_frame = self.find_open_ai_response_frame()
         if existing_frame is not None:
@@ -21499,6 +23738,11 @@ class ChatPage(QWidget):
         return None
 
     def remove_ai_response_frame(self):
+        if self.is_quick_chat_active():
+            if self.manual_ai_input is not None:
+                self.manual_ai_input.clear()
+            self.update_manual_ai_composer_state()
+            return
         frame = self.find_open_ai_response_frame()
         if frame is None:
             return
@@ -21528,8 +23772,24 @@ class ChatPage(QWidget):
         animate_widget_out(ai_frame, remove_input_frame)
         self.handle_ai_response_text(text, insert_index=idx)
 
-    def finalize_automation_preview_bubble(self, text: str) -> Optional[ChatBubble]:
+    def finalize_automation_preview_bubble(self, text: str):
         bubble = self.automation_preview_bubble
+        if isinstance(bubble, str):
+            self.automation_preview_markdown_request_id += 1
+            self.automation_preview_markdown_pending = False
+            self.automation_preview_markdown_target_text = ""
+            self.quick_update_item(
+                bubble,
+                {
+                    "kind": "ai",
+                    "roleLabelText": "AI",
+                    "statusText": "",
+                    "text": strip_automation_done_marker(text),
+                    "copyText": "复制 AI 输出",
+                },
+            )
+            self.automation_preview_bubble = None
+            return bubble
         if not isinstance(bubble, ChatBubble):
             return None
         scroll_state = self.capture_chat_scroll_state()
@@ -21700,7 +23960,25 @@ class ChatPage(QWidget):
             return
         scroll_state = self.capture_chat_scroll_state()
         self.hide_empty_state()
-        if existing_bubble is not None:
+        if self.is_quick_chat_active():
+            if isinstance(existing_bubble, str):
+                ai_bubble = existing_bubble
+                self.quick_update_item(
+                    ai_bubble,
+                    {
+                        "kind": "ai",
+                        "roleLabelText": "AI",
+                        "statusText": "",
+                        "text": display_text,
+                        "copyText": "复制 AI 输出",
+                    },
+                )
+            else:
+                ai_bubble = self.quick_insert_item(
+                    self.quick_ai_item(display_text),
+                    insert_index,
+                )
+        elif existing_bubble is not None:
             ai_bubble = existing_bubble
             ai_bubble.content = display_text
             ai_bubble.update_content(display_text)
@@ -21753,19 +24031,22 @@ class ChatPage(QWidget):
             self.start_web_fetch_extension_run(web_fetch_directives)
             self.scroll_to_bottom()
             return
-        
+
         blocks = scan_all_code_blocks(display_text)
         try:
             commands = extract_bash_commands(display_text, blocks)
         except ValueError as exc:
             rejection_text = f"⚠️ {exc}"
-            warning_bubble = ExecutionLogPanel(
-                rejection_text,
-                parent=self.chat_container,
-                max_content_height=130,
-                title="执行结果",
-            )
-            self.add_chat_widget(warning_bubble, animate=True)
+            if self.is_quick_chat_active():
+                self.quick_append_item(self.quick_result_item(rejection_text, title="执行结果", max_height=130))
+            else:
+                warning_bubble = ExecutionLogPanel(
+                    rejection_text,
+                    parent=self.chat_container,
+                    max_content_height=130,
+                    title="执行结果",
+                )
+                self.add_chat_widget(warning_bubble, animate=True)
             if self.automation_loop_active:
                 context_content = build_execution_context_content(
                     f"Local execution rejected:\n{rejection_text}",
@@ -21810,13 +24091,16 @@ class ChatPage(QWidget):
                     f"自动化循环需要继续时必须输出一个完整的 ```{runtime_environment()['command_block_lang']} "
                     "命令块；如果本轮不输出命令块或代码块而是已完成总结，必须按 completion protocol 在最后一行单独输出完成标记。"
                 )
-                warning_bubble = ExecutionLogPanel(
-                    rejection_text,
-                    parent=self.chat_container,
-                    max_content_height=140,
-                    title="执行结果",
-                )
-                self.add_chat_widget(warning_bubble, animate=True)
+                if self.is_quick_chat_active():
+                    self.quick_append_item(self.quick_result_item(rejection_text, title="执行结果", max_height=140))
+                else:
+                    warning_bubble = ExecutionLogPanel(
+                        rejection_text,
+                        parent=self.chat_container,
+                        max_content_height=140,
+                        title="执行结果",
+                    )
+                    self.add_chat_widget(warning_bubble, animate=True)
                 context_content = build_execution_context_content(
                     f"Local execution rejected:\n{rejection_text}",
                     [],
@@ -21829,27 +24113,36 @@ class ChatPage(QWidget):
                 self.request_next_automation_step(context_content)
                 self.scroll_to_bottom()
                 return
-            warning_bubble = ExecutionLogPanel(
-                f"⚠️ 未识别到可执行命令\n请确保 AI 输出包含 ```{runtime_environment()['command_block_lang']} 代码块",
-                parent=self.chat_container,
-                max_content_height=110,
-                title="执行结果",
-            )
-            self.add_chat_widget(warning_bubble, animate=True)
+            rejection_text = f"⚠️ 未识别到可执行命令\n请确保 AI 输出包含 ```{runtime_environment()['command_block_lang']} 代码块"
+            if self.is_quick_chat_active():
+                self.quick_append_item(self.quick_result_item(rejection_text, title="执行结果", max_height=110))
+            else:
+                warning_bubble = ExecutionLogPanel(
+                    rejection_text,
+                    parent=self.chat_container,
+                    max_content_height=110,
+                    title="执行结果",
+                )
+                self.add_chat_widget(warning_bubble, animate=True)
             self.ensure_ai_response_entry(focus=False, animate=True, keep_visible=False)
             self.scroll_to_bottom()
             return
         if self.automation_loop_active:
             self.refresh_prompt_bubble_buttons()
         
-        self.result_bubble = ExecutionLogPanel(
-            "⏳ 执行中...",
-            parent=self.chat_container,
-            max_content_height=210,
-            title="执行结果",
-        )
-        self.result_bubble.set_auto_follow(True)
-        self.add_chat_widget(self.result_bubble, animate=True)
+        if self.is_quick_chat_active():
+            self.result_bubble = self.quick_append_item(
+                self.quick_result_item("⏳ 执行中...", title="执行结果", auto_follow=True, max_height=210)
+            )
+        else:
+            self.result_bubble = ExecutionLogPanel(
+                "⏳ 执行中...",
+                parent=self.chat_container,
+                max_content_height=210,
+                title="执行结果",
+            )
+            self.result_bubble.set_auto_follow(True)
+            self.add_chat_widget(self.result_bubble, animate=True)
         
         self.cmd_outputs = []
         self.pending_snapshot = {}
@@ -21905,7 +24198,11 @@ class ChatPage(QWidget):
         self.cmd_output_render_dirty = False
         if self.result_bubble is None:
             return
-        self.result_bubble.update_content('\n'.join(self.cmd_outputs))
+        joined = '\n'.join(self.cmd_outputs)
+        if isinstance(self.result_bubble, str):
+            self.quick_update_item(self.result_bubble, {"text": mask_low_value_context_markers_for_display(joined)})
+        else:
+            self.result_bubble.update_content(joined)
     
     def on_long_running(self, cmd: str, cwd: str, name: str, launch_reason: str = "long_running_pattern", kind: str = "unknown"):
         proc = self.terminal_panel.add_process(
@@ -22032,13 +24329,50 @@ class ChatPage(QWidget):
                 log_with_changes = (log_with_changes + "\n\n" + terminal_extension_log).strip()
                 full_log = (full_log + "\n\n" + terminal_extension_log).strip()
         context_content = build_execution_context_content(full_log, change_records, long_running_launches, terminal_launches)
-        self.result_bubble.update_content(log_with_changes)
-        self.result_bubble.set_auto_follow(False)
+        display_log = mask_low_value_context_markers_for_display(log_with_changes)
+        if isinstance(self.result_bubble, str):
+            updated = self.quick_update_item(
+                self.result_bubble,
+                {
+                    "text": display_log,
+                    "autoFollow": False,
+                },
+            )
+            if not updated:
+                self.result_bubble = self.quick_append_item(
+                    self.quick_result_item(display_log, title="执行结果", auto_follow=False, max_height=210)
+                )
+        elif self.result_bubble is not None:
+            try:
+                self.result_bubble.update_content(log_with_changes)
+                self.result_bubble.set_auto_follow(False)
+            except RuntimeError:
+                self.result_bubble = None
+        if self.result_bubble is None:
+            if self.is_quick_chat_active():
+                self.result_bubble = self.quick_append_item(
+                    self.quick_result_item(display_log, title="执行结果", auto_follow=False, max_height=210)
+                )
+            else:
+                self.result_bubble = ExecutionLogPanel(
+                    log_with_changes,
+                    parent=self.chat_container,
+                    max_content_height=210,
+                    title="执行结果",
+                )
+                self.result_bubble.set_auto_follow(False)
+                self.add_chat_widget(self.result_bubble, animate=True)
+        change_item_id = ""
         if change_records:
-            change_card = ChangeSummaryCard(change_records, parent=self.chat_container)
-            change_card.undo_requested.connect(self.undo_changes)
-            change_card.redo_requested.connect(self.redo_changes)
-            self.add_chat_widget(change_card, animate=True)
+            if self.is_quick_chat_active():
+                change_item_id = self.quick_append_item(
+                    self.quick_change_item(change_records, undone=False)
+                )
+            else:
+                change_card = ChangeSummaryCard(change_records, parent=self.chat_container)
+                change_card.undo_requested.connect(self.undo_changes)
+                change_card.redo_requested.connect(self.redo_changes)
+                self.add_chat_widget(change_card, animate=True)
         result_entry = {
             "type": "result",
             "content": log_with_changes,
@@ -22048,7 +24382,12 @@ class ChatPage(QWidget):
         }
         if change_records:
             result_entry["id"] = uuid.uuid4().hex
-            change_card.history_entry_id = result_entry["id"]
+            if change_item_id:
+                payload = self.quick_change_records.get(change_item_id)
+                if payload is not None:
+                    payload["history_entry_id"] = result_entry["id"]
+            else:
+                change_card.history_entry_id = result_entry["id"]
         self.append_history(result_entry)
         self.sidebar.refresh_tree(self.project_root)
         self.update_status_bar()
@@ -22194,7 +24533,7 @@ class ChatPage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Agent. QT智能体 · 你的编程办公调研实验远控助手")
+        self.setWindowTitle("Agent. QT Quick 聊天视图版 · 你的编程办公调研实验远控助手")
         self.setMinimumSize(960, 680)
         self.resize(1120, 820)
         self.setStyleSheet(f"""

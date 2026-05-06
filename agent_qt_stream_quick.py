@@ -46,6 +46,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QProcess, QProcessEnvironment, QPropertyAnimation, QEasingCurve, QSize, QByteArray, QEvent, QRectF, QPoint, QPointF, Property, QObject
 from PySide6.QtGui import QFont, QFontMetricsF, QAction, QDesktopServices, QMouseEvent, QTextCursor, QIcon, QPixmap, QPainter, QPainterPath, QPen, QColor, QKeySequence, QTextDocument, QImage, QLinearGradient, QRadialGradient, QBrush
 from PySide6.QtCore import QUrl
+try:
+    from PySide6.QtQuickWidgets import QQuickWidget
+except Exception:
+    QQuickWidget = None
 
 try:
     from PySide6.QtSvg import QSvgRenderer
@@ -8733,13 +8737,11 @@ class ExecuteWorker(QThread):
     def run(self):
         cwd = self.cwd
         outputs = []
-
         def set_output(index: int, text: str):
             while len(outputs) <= index:
                 outputs.append("")
             outputs[index] = text
             self.replace_output_signal.emit(index, text)
-
         for i, cmd in enumerate(self.commands, 1):
             output_index = i - 1
             if self.isInterruptionRequested():
@@ -11678,6 +11680,296 @@ class MarkdownRenderWorker(QThread):
         }
         self.rendered.emit(self.request_id, self.text, rendered_parts, signatures, stats)
 
+
+def stream_quick_preview_qml_path() -> str:
+    return os.path.join(tempfile.gettempdir(), "agent_qt_stream_quick_preview.qml")
+
+
+def write_stream_quick_preview_qml() -> str:
+    qml = f"""
+import QtQuick 2.15
+
+Rectangle {{
+    id: root
+    color: "{COLORS['surface']}"
+    property string statusText: "AI 正在回复..."
+    property string rawText: ""
+    property var partsData: []
+    property var expandedKeys: ({{}})
+    readonly property bool hasParts: partsData && partsData.length > 0
+    readonly property real wantedHeight: Math.min(Math.max(contentColumn.implicitHeight + 4, 96), 560)
+
+    function isExpanded(key) {{
+        return !!expandedKeys[key]
+    }}
+
+    function toggleExpanded(key) {{
+        var next = {{}}
+        for (var k in expandedKeys)
+            next[k] = expandedKeys[k]
+        next[key] = !next[key]
+        expandedKeys = next
+    }}
+
+    Column {{
+        id: contentColumn
+        width: root.width
+        spacing: 10
+
+        Text {{
+            text: "AI 正在回复"
+            color: "{COLORS['text']}"
+            font.pixelSize: 15
+            font.bold: true
+            wrapMode: Text.Wrap
+        }}
+
+        Text {{
+            text: root.statusText
+            color: "{COLORS['text_secondary']}"
+            font.pixelSize: 12
+            wrapMode: Text.Wrap
+            visible: root.statusText.length > 0
+        }}
+
+        Text {{
+            width: contentColumn.width
+            visible: !root.hasParts && root.rawText.length > 0
+            text: root.rawText
+            color: "{COLORS['text']}"
+            font.pixelSize: 15
+            font.bold: true
+            lineHeight: 1.22
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+        }}
+
+        Repeater {{
+            model: root.hasParts ? root.partsData : []
+            delegate: Item {{
+                id: partItem
+                width: contentColumn.width
+                property string partKind: String(modelData.kind || "")
+                property string partKey: String(modelData.key || index)
+                property bool collapsed: partKind === "code" && !root.isExpanded(partKey)
+                implicitHeight: partKind === "code"
+                    ? codeBlock.implicitHeight
+                    : markdownText.implicitHeight
+
+                Text {{
+                    id: markdownText
+                    width: contentColumn.width
+                    visible: partItem.partKind !== "code"
+                    text: modelData.html || modelData.text || ""
+                    color: "{COLORS['text']}"
+                    font.pixelSize: 15
+                    font.bold: true
+                    lineHeight: 1.22
+                    textFormat: Text.RichText
+                    wrapMode: Text.Wrap
+                }}
+
+                Rectangle {{
+                    id: codeBlock
+                    visible: partItem.partKind === "code"
+                    width: contentColumn.width
+                    radius: 8
+                    color: "{COLORS['surface_alt']}"
+                    border.color: "{COLORS['border']}"
+                    border.width: 1
+                    implicitHeight: codeColumn.implicitHeight
+                    clip: true
+
+                    Column {{
+                        id: codeColumn
+                        width: parent.width
+                        spacing: 0
+
+                        Rectangle {{
+                            id: codeHeader
+                            width: parent.width
+                            height: 34
+                            radius: 8
+                            color: headerMouse.containsMouse ? "{COLORS['accent_light']}" : "{COLORS['surface_alt']}"
+                            Text {{
+                                anchors.left: parent.left
+                                anchors.leftMargin: 14
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: partItem.collapsed ? "▸" : "⌄"
+                                color: "{COLORS['accent']}"
+                                font.pixelSize: 13
+                                font.bold: true
+                            }}
+                            Text {{
+                                anchors.left: parent.left
+                                anchors.leftMargin: 36
+                                anchors.right: parent.right
+                                anchors.rightMargin: 12
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: (modelData.lang || "text") + "  " + (modelData.summary || "")
+                                color: "{COLORS['text_secondary']}"
+                                font.pixelSize: 13
+                                font.bold: true
+                                elide: Text.ElideRight
+                                wrapMode: Text.NoWrap
+                            }}
+                            MouseArea {{
+                                id: headerMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.toggleExpanded(partItem.partKey)
+                            }}
+                        }}
+
+                        Text {{
+                            width: parent.width - 24
+                            x: 12
+                            visible: !partItem.collapsed
+                            text: modelData.text || ""
+                            color: "{COLORS['text']}"
+                            font.family: "Menlo"
+                            font.pixelSize: 13
+                            lineHeight: 1.12
+                            textFormat: Text.PlainText
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 18
+                            elide: Text.ElideRight
+                            topPadding: 10
+                            bottomPadding: 12
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+}}
+"""
+    path = stream_quick_preview_qml_path()
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(qml)
+    except OSError as exc:
+        logger.warning("Failed to write stream quick preview qml: %s", exc)
+    return path
+
+
+def stream_quick_parts_data_from_rendered_parts(parts: List[Dict[str, str]]) -> List[Dict[str, object]]:
+    rendered: List[Dict[str, object]] = []
+    for part in parts:
+        if part.get("type") == "code":
+            lang = str(part.get("lang") or "").strip().lower() or "text"
+            code = str(part.get("text") or "")
+            key = hashlib.sha1((lang + "\n" + code[:2000]).encode("utf-8", errors="ignore")).hexdigest()[:16]
+            rendered.append({
+                "kind": "code",
+                "key": key,
+                "lang": lang,
+                "text": code,
+                "summary": code_block_summary(lang, code),
+            })
+            continue
+        markdown_text = str(part.get("text") or "")
+        if not markdown_text.strip():
+            continue
+        rendered.append({
+            "kind": "markdown",
+            "text": markdown_text,
+            "html": part.get("html") or markdown_with_pipe_tables_to_html(markdown_text),
+        })
+    return rendered
+
+
+def stream_quick_html_from_rendered_parts(parts: List[Dict[str, str]]) -> str:
+    chunks: List[str] = []
+    for part in parts:
+        if part.get("type") == "code":
+            lang = html.escape(str(part.get("lang") or "").strip().lower() or "text")
+            code = str(part.get("text") or "")
+            summary = html.escape(code_block_summary(lang, code))
+            preview_lines = code.splitlines()[:18]
+            code_preview = html.escape("\n".join(preview_lines))
+            if len(code.splitlines()) > len(preview_lines):
+                code_preview += "\n... 已折叠后续内容 ..."
+            header = f"{lang} {summary}".strip()
+            chunks.append(
+                "<br>"
+                f"<table width='100%' cellspacing='0' cellpadding='0' bgcolor='{COLORS['surface_alt']}'>"
+                f"<tr><td bgcolor='{COLORS['accent_light']}' style='padding:7px 10px;'>"
+                f"<font color='{COLORS['text_secondary']}'><b>&#9656;&nbsp; {header}</b></font>"
+                "</td></tr>"
+                "<tr><td style='padding:10px 12px;'>"
+                f"<pre style='white-space:pre-wrap;margin:0;color:{COLORS['text']};font-family:Menlo;font-size:13px;'>{code_preview}</pre>"
+                "</td></tr>"
+                "</table>"
+                "<br>"
+            )
+            continue
+        markdown_text = str(part.get("text") or "")
+        if not markdown_text.strip():
+            continue
+        chunks.append(part.get("html") or markdown_with_pipe_tables_to_html(markdown_text))
+    return "".join(chunks)
+
+
+if QQuickWidget is not None:
+    class StreamingQuickPreview(QQuickWidget):
+        """Small Quick texture used only while the provider is streaming text."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.content = ""
+            self.preview_status = None
+            self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, False)
+            self.setClearColor(QColor(COLORS["surface"]))
+            self.setStyleSheet(f"background: {COLORS['surface']}; border: none;")
+            self.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self.setMinimumHeight(96)
+            self.setMaximumHeight(560)
+            self.setFixedHeight(120)
+            self.setSource(QUrl.fromLocalFile(write_stream_quick_preview_qml()))
+            if self.status() == QQuickWidget.Status.Error:
+                logger.warning("Stream quick preview QML errors: %s", self.errors())
+
+        def set_status_text(self, text: str):
+            root = self.rootObject()
+            if root is not None:
+                root.setProperty("statusText", text or "")
+            self.schedule_height_update()
+
+        def update_content(self, text: str):
+            self.content = strip_agent_qt_hidden_blocks(text or "")
+            root = self.rootObject()
+            if root is not None:
+                root.setProperty("rawText", mask_low_value_context_markers_for_display(self.content))
+            self.schedule_height_update()
+
+        def apply_parts(self, text: str, parts_data: List[Dict[str, object]]):
+            if text != self.content:
+                return
+            root = self.rootObject()
+            if root is not None:
+                root.setProperty("partsData", parts_data)
+            self.schedule_height_update()
+
+        def schedule_height_update(self):
+            QTimer.singleShot(0, self.update_quick_height)
+
+        def update_quick_height(self):
+            try:
+                root = self.rootObject()
+                if root is None:
+                    return
+                wanted = int(float(root.property("wantedHeight") or 120))
+                self.setFixedHeight(max(96, min(560, wanted)))
+                self.updateGeometry()
+            except RuntimeError:
+                return
+else:
+    class StreamingQuickPreview(QFrame):
+        pass
+
 # ============================================================
 # 对话气泡
 # ============================================================
@@ -13298,6 +13590,7 @@ class ThreadCard(QFrame):
         self.deletable = self.thread_id != DEFAULT_THREAD_ID
         self._editing_title = False
         self._rename_cancelled = False
+        self._hovered = False
         self.setObjectName("threadCard")
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedHeight(42)
@@ -13361,11 +13654,10 @@ class ThreadCard(QFrame):
         self.title_label = title
 
     def apply_style(self):
-        bg = COLORS["accent_light"] if self.active else COLORS["surface"]
-        border = COLORS["accent"] if self.active else COLORS["border"]
+        highlighted = self.active or self._hovered
+        bg = COLORS["accent_light"] if highlighted else COLORS["surface"]
+        border = COLORS["accent"] if self.active else (soft_accent_border_color() if self._hovered else COLORS["border"])
         color = COLORS["accent_dark"] if self.active else COLORS["text"]
-        hover_bg = COLORS["accent_light"] if self.active else COLORS["surface_alt"]
-        hover_border = COLORS["accent"] if self.active else COLORS["border_strong"]
         self.setStyleSheet(f"""
             QFrame#threadCard {{
                 background: {bg};
@@ -13373,8 +13665,8 @@ class ThreadCard(QFrame):
                 border-radius: 12px;
             }}
             QFrame#threadCard:hover {{
-                background: {hover_bg};
-                border-color: {hover_border};
+                background: {bg};
+                border-color: {border};
             }}
         """)
         self.title_label.setStyleSheet(f"background: transparent; border: none; color: {color}; font-size: 12px; font-weight: 700;")
@@ -13451,11 +13743,15 @@ class ThreadCard(QFrame):
 
     def enterEvent(self, event):
         super().enterEvent(event)
+        self._hovered = True
+        self.apply_style()
         if self.deletable and not self._editing_title:
             self.delete_btn.setVisible(True)
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
+        self._hovered = False
+        self.apply_style()
         if self.deletable and not self.active and not self._editing_title:
             self.delete_btn.setVisible(False)
 
@@ -13861,6 +14157,7 @@ class Sidebar(QFrame):
             QPushButton:hover {{
                 background: {COLORS['accent_light']};
                 color: {COLORS['accent_dark']};
+                border: 1px solid {soft_accent_border_color()};
             }}
         """
 
@@ -14676,6 +14973,10 @@ class ChatPage(QWidget):
         self.automation_preview_last_rendered_text = ""
         self.automation_preview_last_chars = 0
         self.automation_preview_dots = 0
+        self.automation_preview_markdown_worker: Optional[MarkdownRenderWorker] = None
+        self.automation_preview_markdown_request_id = 0
+        self.automation_preview_markdown_pending = False
+        self.automation_preview_markdown_target_text = ""
         self.automation_preview_render_timer = QTimer(self)
         self.automation_preview_render_timer.setSingleShot(True)
         self.automation_preview_render_timer.timeout.connect(self.flush_automation_preview_render)
@@ -14758,7 +15059,10 @@ class ChatPage(QWidget):
         self.chat_column_max_width = 1480
         self.chat_column_width_ratio = 0.94
         self.user_bubble_width_ratio = 0.75
+        self.stream_quick_preview_pool: List[StreamingQuickPreview] = []
         self.setup_ui()
+        if QQuickWidget is not None:
+            QTimer.singleShot(300, self.warm_stream_quick_preview)
         if wechat_bridge_enabled_setting():
             QTimer.singleShot(0, self.start_wechat_bridge_quietly)
             if wechat_connector_autostart_setting() and self.wechat_connector.account():
@@ -19925,6 +20229,11 @@ class ChatPage(QWidget):
 
     def create_automation_preview_bubble(self) -> QFrame:
         self.hide_empty_state()
+        if QQuickWidget is not None:
+            frame = self.take_stream_quick_preview()
+            self.add_chat_widget(frame, animate=True)
+            self.scroll_to_bottom()
+            return frame
         frame = ChatBubble(
             "ai",
             "",
@@ -19948,6 +20257,80 @@ class ChatPage(QWidget):
         self.scroll_to_bottom()
         return frame
 
+    def warm_stream_quick_preview(self):
+        if QQuickWidget is None or self.stream_quick_preview_pool:
+            return
+        try:
+            preview = StreamingQuickPreview(parent=self.chat_container)
+            preview.hide()
+            preview.update_content("")
+            preview.set_status_text("AI 正在回复...")
+            self.stream_quick_preview_pool.append(preview)
+        except Exception:
+            logger.warning("Failed to warm stream quick preview.", exc_info=True)
+
+    def take_stream_quick_preview(self) -> StreamingQuickPreview:
+        if self.stream_quick_preview_pool:
+            frame = self.stream_quick_preview_pool.pop()
+            frame.setParent(self.chat_container)
+            frame.update_content("")
+            frame.set_status_text("AI 正在回复...")
+            frame.show()
+            return frame
+        return StreamingQuickPreview(parent=self.chat_container)
+
+    def clear_automation_preview_markdown_worker(self):
+        worker = self.automation_preview_markdown_worker
+        if worker is None:
+            self.automation_preview_markdown_pending = False
+            return
+        try:
+            worker.rendered.disconnect(self.apply_automation_preview_markdown_render)
+        except (RuntimeError, TypeError):
+            pass
+        self.automation_preview_markdown_worker = None
+        if worker.isRunning():
+            worker.finished.connect(worker.deleteLater)
+        else:
+            worker.deleteLater()
+        pending = self.automation_preview_markdown_pending
+        self.automation_preview_markdown_pending = False
+        target_text = self.automation_preview_markdown_target_text
+        if pending and target_text and isinstance(self.automation_preview_bubble, StreamingQuickPreview):
+            QTimer.singleShot(0, lambda text=target_text: self.start_automation_preview_markdown_render(text))
+
+    def start_automation_preview_markdown_render(self, text: str):
+        bubble = self.automation_preview_bubble
+        if not isinstance(bubble, StreamingQuickPreview) or QQuickWidget is None:
+            return
+        self.automation_preview_markdown_target_text = text
+        if self.automation_preview_markdown_worker is not None:
+            self.automation_preview_markdown_pending = True
+            return
+        self.automation_preview_markdown_request_id += 1
+        worker = MarkdownRenderWorker(self.automation_preview_markdown_request_id, text)
+        self.automation_preview_markdown_worker = worker
+        worker.rendered.connect(self.apply_automation_preview_markdown_render)
+        worker.finished.connect(self.clear_automation_preview_markdown_worker)
+        worker.start()
+
+    def apply_automation_preview_markdown_render(
+        self,
+        request_id: int,
+        text: str,
+        parts: List[Dict[str, str]],
+        signatures: List[tuple],
+        stats: Dict[str, int],
+    ):
+        bubble = self.automation_preview_bubble
+        if isinstance(bubble, StreamingQuickPreview):
+            try:
+                bubble.apply_parts(text, stream_quick_parts_data_from_rendered_parts(parts))
+            except RuntimeError:
+                pass
+        if text != self.automation_preview_markdown_target_text:
+            self.automation_preview_markdown_pending = True
+
     def start_automation_preview(self):
         self.stop_automation_preview(remove_bubble=True)
         self.automation_preview_serial += 1
@@ -19957,6 +20340,8 @@ class ChatPage(QWidget):
         self.automation_preview_last_rendered_text = ""
         self.automation_preview_last_chars = 0
         self.automation_preview_dots = 0
+        self.automation_preview_markdown_pending = False
+        self.automation_preview_markdown_target_text = ""
         self.automation_preview_thread_id = self.thread_id
         self.automation_preview_bubble = self.create_automation_preview_bubble()
         worker = AutomationPreviewWorker(self.automation_manager, self.effective_automation_model(), self.thread_id, serial)
@@ -19982,6 +20367,8 @@ class ChatPage(QWidget):
             self.automation_preview_worker = None
         self.automation_preview_render_timer.stop()
         self.automation_preview_dots_timer.stop()
+        self.clear_automation_preview_markdown_worker()
+        self.automation_preview_markdown_target_text = ""
         self.automation_preview_pending_text = ""
         self.automation_preview_last_rendered_text = ""
         self.automation_preview_last_chars = 0
@@ -20014,10 +20401,12 @@ class ChatPage(QWidget):
         bubble = self.automation_preview_bubble
         if not text and isinstance(bubble, ChatBubble):
             text = str(getattr(bubble, "content", "") or "").strip()
+        if not text and isinstance(bubble, StreamingQuickPreview):
+            text = str(getattr(bubble, "content", "") or "").strip()
         if not text:
             return False
-        if isinstance(bubble, ChatBubble):
-            self.finalize_automation_preview_bubble(text)
+        if isinstance(bubble, (ChatBubble, StreamingQuickPreview)):
+            ai_bubble = self.finalize_automation_preview_bubble(text)
         else:
             ai_bubble = ChatBubble(
                 "ai",
@@ -20059,13 +20448,22 @@ class ChatPage(QWidget):
             return
         if chars is not None:
             self.automation_preview_last_chars = max(0, int(chars))
-        status = getattr(bubble, "preview_status", None)
-        if status is None:
-            return
         if self.automation_preview_last_chars > 0:
             text = f"AI 正在回复... 已生成约 {self.automation_preview_last_chars} 字"
         else:
             text = "AI 正在回复..."
+        if isinstance(bubble, StreamingQuickPreview):
+            try:
+                bubble.set_status_text(text)
+            except RuntimeError:
+                if self.automation_preview_bubble is bubble:
+                    self.automation_preview_bubble = None
+                self.automation_preview_render_timer.stop()
+                self.automation_preview_dots_timer.stop()
+            return
+        status = getattr(bubble, "preview_status", None)
+        if status is None:
+            return
         try:
             if status.text() != text:
                 status.setText(text)
@@ -20092,7 +20490,10 @@ class ChatPage(QWidget):
 
     def schedule_automation_preview_render(self):
         if not self.automation_preview_render_timer.isActive():
-            delay = 20 if not self.automation_preview_last_rendered_text else 360
+            if isinstance(self.automation_preview_bubble, StreamingQuickPreview):
+                delay = 12 if not self.automation_preview_last_rendered_text else 180
+            else:
+                delay = 20 if not self.automation_preview_last_rendered_text else 360
             self.automation_preview_render_timer.start(delay)
 
     def flush_automation_preview_render(self):
@@ -20108,6 +20509,8 @@ class ChatPage(QWidget):
         scroll_state = self.capture_chat_scroll_state()
         try:
             bubble.update_content(text)
+            if isinstance(bubble, StreamingQuickPreview):
+                self.start_automation_preview_markdown_render(strip_agent_qt_hidden_blocks(text))
         except RuntimeError:
             if self.automation_preview_bubble is bubble:
                 self.automation_preview_bubble = None
@@ -21530,6 +21933,48 @@ class ChatPage(QWidget):
 
     def finalize_automation_preview_bubble(self, text: str) -> Optional[ChatBubble]:
         bubble = self.automation_preview_bubble
+        if isinstance(bubble, StreamingQuickPreview):
+            bar = self.scroll_area.verticalScrollBar()
+            was_at_bottom = self.is_chat_at_bottom()
+            should_follow = self.should_auto_follow_chat_scroll()
+            old_value = bar.value()
+            idx = self.chat_layout.indexOf(bubble)
+            self.automation_preview_bubble = None
+            self.clear_automation_preview_markdown_worker()
+            self.chat_layout.removeWidget(bubble)
+            bubble.hide()
+            bubble.setParent(None)
+            bubble.deleteLater()
+            ai_bubble = ChatBubble(
+                "ai",
+                strip_automation_done_marker(text),
+                show_copy=True,
+                parent=self.chat_container,
+                copy_text="复制 AI 输出",
+                scrollable=True,
+                max_content_height=QT_WIDGET_MAX_HEIGHT,
+                markdown=self.automation_enabled,
+                expand_to_content=True,
+                flat=self.automation_enabled,
+            )
+            if idx >= 0:
+                self.insert_chat_widget(idx, ai_bubble)
+            else:
+                self.add_chat_widget(ai_bubble)
+            if was_at_bottom or should_follow:
+                self.chat_scroll_user_controlled = False
+                for delay in (0, 30, 90, 180, 360):
+                    QTimer.singleShot(delay, self.scroll_to_bottom_now)
+            else:
+                def restore_value(value=old_value):
+                    self.chat_scroll_programmatic = True
+                    try:
+                        bar.setValue(max(bar.minimum(), min(value, bar.maximum())))
+                    finally:
+                        QTimer.singleShot(0, self.clear_programmatic_chat_scroll)
+                for delay in (0, 30, 90):
+                    QTimer.singleShot(delay, restore_value)
+            return ai_bubble
         if not isinstance(bubble, ChatBubble):
             return None
         scroll_state = self.capture_chat_scroll_state()
