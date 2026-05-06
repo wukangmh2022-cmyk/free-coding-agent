@@ -3,10 +3,11 @@
 import sys
 
 exe_icon = 'assets/icon-windowed.ico' if sys.platform.startswith('win') else 'assets/icon-windowed.icns'
+bundle_version = '0.99'
 
 
 a = Analysis(
-    ['agent_qt.py'],
+    ['agent_qt_stream_quick.py'],
     pathex=[],
     binaries=[],
     datas=[('plugins', 'plugins'), ('assets', 'assets')],
@@ -52,4 +53,8 @@ app = BUNDLE(
     name='AgentQT.app',
     icon='assets/icon-windowed.icns',
     bundle_identifier=None,
+    info_plist={
+        'CFBundleShortVersionString': bundle_version,
+        'CFBundleVersion': bundle_version,
+    },
 )

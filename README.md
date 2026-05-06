@@ -150,16 +150,20 @@ Agent Qt 会真实写入文件并执行本地命令。请只执行你理解并�
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed agent_qt.py
+pyinstaller AgentQT.spec
 ```
 
-Qt 运行时体积较大，单文件可执行文件通常不会很小，这是桌面 GUI 程序的正常情况。
+当前打包入口已经切到 `agent_qt_stream_quick.py`，并通过 `AgentQT.spec` 统一管理图标、资源和版本号。`v0.99` 这条功能分支用于非稳定预发布，请不要把它当成长期稳定版。
+
+Qt 运行时体积较大，打包产物通常不会很小，这是桌面 GUI 程序的正常情况。
 
 ## 项目结构
 
 ```text
 .
 ├── agent_qt.py
+├── agent_qt_stream_quick.py
+├── AgentQT.spec
 ├── README.md
 └── docs/
     └── images/
