@@ -244,7 +244,6 @@ DEFAULT_ASSISTANT_SELECTORS = (
     '[data-role="assistant"]',
     ".ds-markdown",
     ".markdown",
-    '[class*="message"]',
 )
 PROMPT_REPLAY_MARKERS = (
     "You are acting as the backend LLM for a local OpenAI-compatible gateway.",
@@ -1821,28 +1820,29 @@ def is_suspicious_incomplete_command_text(text: str) -> bool:
         block.strip()
         for lang, block in fenced_blocks
         if lang.lower().strip() in {"bash", "sh", "shell", "zsh"}
-    ] or [stripped]
-    for shell_text in shell_candidates:
-        if has_unclosed_shell_quote(shell_text) or has_unclosed_shell_compound(shell_text):
-            return True
-    heredoc_markers = re.findall(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_-]*)['\"]?", stripped)
-    if heredoc_markers:
-        lines = [line.strip() for line in stripped.splitlines()]
-        for marker in heredoc_markers:
-            try:
-                marker_line = next(
-                    index for index, line in enumerate(lines) if f"<<{marker}" in line or f"<<'{marker}'" in line or f'<<"{marker}"' in line
-                )
-            except StopIteration:
-                marker_line = -1
-            if marker_line >= 0 and marker not in lines[marker_line + 1 :]:
+    ]
+    # 只有真正存在 bash/sh 围栏时，才做 shell 完整性检查。
+    # 不要把整段 assistant/思考正文当 shell：thinking 里的英文撇号、中文引号会永久触发
+    # 「未闭合引号」，导致 wait_for_response 永远判定截断而卡死。
+    if shell_candidates:
+        for shell_text in shell_candidates:
+            if has_unclosed_shell_quote(shell_text) or has_unclosed_shell_compound(shell_text):
                 return True
-    if stripped.count("'''") % 2 == 1 or stripped.count('"""') % 2 == 1:
-        return True
+        heredoc_markers = re.findall(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_-]*)['\"]?", "\n".join(shell_candidates))
+        if heredoc_markers:
+            lines = [line.strip() for line in stripped.splitlines()]
+            for marker in heredoc_markers:
+                try:
+                    marker_line = next(
+                        index for index, line in enumerate(lines) if f"<<{marker}" in line or f"<<'{marker}'" in line or f'<<"{marker}"' in line
+                    )
+                except StopIteration:
+                    marker_line = -1
+                if marker_line >= 0 and marker not in lines[marker_line + 1 :]:
+                    return True
     if re.search(r"(?:^|\n)\s*(?:for|if|while|with|try|except|class|def)\s*$", stripped):
         return True
     return False
-
 
 def is_transient_thinking_text(text: str) -> bool:
     stripped = text.strip()
@@ -2647,11 +2647,13 @@ class DeepSeekWebBridge:
             return
         with self._response_preview_lock:
             previous_text = str(self._response_preview.get("text") or "")
+            # Thinking can collapse / switch to a short answer: don't freeze preview on shrink.
             if (
                 not done
                 and not error
                 and previous_text
                 and len(text) < max(80, int(len(previous_text) * 0.75))
+                and len(text) < 200
             ):
                 return
             now = time.time()
@@ -2948,6 +2950,47 @@ class DeepSeekWebBridge:
         except Exception:
             return False
         return encoded in prompt or encoded.strip('\"') in prompt
+
+    def _has_active_prompt_overlap(self, text: str) -> bool:
+        stripped = (text or "").strip()
+        prompt = (self._active_request_prompt or "").strip()
+        if len(stripped) < 400 or len(prompt) < 400:
+            return False
+
+        compact_text = re.sub(r"\s+", "", stripped)
+        compact_prompt = re.sub(r"\s+", "", prompt)
+        if len(compact_text) < 400 or len(compact_prompt) < 400:
+            return False
+
+        if compact_text in compact_prompt or compact_prompt in compact_text:
+            return True
+
+        chunk_size = 220
+        step = 900
+        matches = 0
+        for start in range(0, max(1, len(compact_prompt) - chunk_size + 1), step):
+            chunk = compact_prompt[start : start + chunk_size]
+            if len(chunk) < chunk_size:
+                continue
+            if chunk in compact_text:
+                matches += 1
+                if matches >= 2:
+                    return True
+
+        latest_user = re.sub(r"\s+", "", self._latest_active_user_text())
+        if len(latest_user) >= 40 and latest_user in compact_text and len(compact_text) > max(2500, len(latest_user) * 20):
+            return True
+        return False
+
+    def _is_contaminated_response_candidate(self, text: str) -> bool:
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        return (
+            is_prompt_replay_text(stripped)
+            or self._is_active_request_echo_text(stripped)
+            or self._has_active_prompt_overlap(stripped)
+        )
 
     def _latest_active_user_text(self) -> str:
         for message in reversed(self._active_request_messages):
@@ -4624,6 +4667,9 @@ class DeepSeekWebBridge:
             return {"content": "", "tool_calls": [], "raw_text": raw_text, "parse_error": "ui_noise_payload"}
 
         if output_protocol == "plain":
+            if self._is_contaminated_response_candidate(stripped):
+                logger.warning("DeepSeek parse_model_payload suppressed contaminated plain response candidate.")
+                return {"content": "", "tool_calls": [], "raw_text": raw_text, "parse_error": "contaminated_response"}
             return {"content": stripped, "tool_calls": [], "raw_text": raw_text}
 
         yaml_payload = parse_yaml_assistant_payload(raw_text)
@@ -4875,7 +4921,7 @@ class DeepSeekWebBridge:
 
             text = choose_best_assistant_text(texts)
             text = clean_plain_visible_assistant_text(text)
-            if text and not is_prompt_replay_text(text) and not self._is_active_request_echo_text(text):
+            if text and not self._is_contaminated_response_candidate(text):
                 candidates.append({"index": index, "text": text})
 
         return candidates
@@ -4916,7 +4962,7 @@ class DeepSeekWebBridge:
         if candidate is None:
             return {"source": "assistant", "index": -1, "text": ""}
         text = candidate.get("text", "") or ""
-        if is_schema_example_payload_text(text) or is_prompt_replay_text(text):
+        if is_schema_example_payload_text(text) or self._is_contaminated_response_candidate(text):
             return {"source": "assistant", "index": -1, "text": ""}
         return {
             "source": "assistant",
@@ -5466,10 +5512,10 @@ class DeepSeekWebBridge:
             deadline_local = time.perf_counter() + (max(0, max_wait_ms) / 1000.0)
             while True:
                 event_text = self.read_latest_copy_capture(page)
-                if event_text and event_text != previous_clipboard and not is_prompt_replay_text(event_text):
+                if event_text and event_text != previous_clipboard and not self._is_contaminated_response_candidate(event_text):
                     return event_text
                 clipboard_text = self.read_system_clipboard_text(page)
-                if clipboard_text and clipboard_text != previous_clipboard and not is_prompt_replay_text(clipboard_text):
+                if clipboard_text and clipboard_text != previous_clipboard and not self._is_contaminated_response_candidate(clipboard_text):
                     return clipboard_text
                 if time.perf_counter() >= deadline_local or timed_out():
                     return ""
@@ -5510,7 +5556,7 @@ class DeepSeekWebBridge:
                 copied = normalize_copied_assistant_text(
                     read_copied_text_fast(max_wait_ms=120, previous_clipboard=clipboard_before)
                 )
-                if copied and not is_prompt_replay_text(copied) and self._matches_current_request_response_candidate(copied):
+                if copied and not self._is_contaminated_response_candidate(copied) and self._matches_current_request_response_candidate(copied):
                     logger.warning(
                         "DeepSeek bottom copy capture fast path succeeded probe_id=%s copied_chars=%d copy_read_ms=%d plain_protocol=%s",
                         probe_id,
@@ -5554,9 +5600,9 @@ class DeepSeekWebBridge:
             copied = normalize_copied_assistant_text(read_copied_text_fast(previous_clipboard=clipboard_before))
             if not copied:
                 continue
-            if is_prompt_replay_text(copied):
+            if self._is_contaminated_response_candidate(copied):
                 logger.warning(
-                    "DeepSeek bottom copy capture rejected prompt replay probe_id=%s copied_chars=%d plain_protocol=%s",
+                    "DeepSeek bottom copy capture rejected contaminated response candidate probe_id=%s copied_chars=%d plain_protocol=%s",
                     probe_id,
                     len(copied),
                     plain_protocol,
@@ -5586,8 +5632,7 @@ class DeepSeekWebBridge:
             if isinstance(assistant_text, str) and assistant_text.strip():
                 locator_seen = True
             if isinstance(assistant_text, str) and (
-                is_prompt_replay_text(assistant_text)
-                or self._is_active_request_echo_text(assistant_text)
+                self._is_contaminated_response_candidate(assistant_text)
                 or is_transient_thinking_text(assistant_text)
             ):
                 continue
@@ -5711,9 +5756,9 @@ class DeepSeekWebBridge:
                     continue
                 copied = normalize_copied_assistant_text(read_copied_text_fast(previous_clipboard=clipboard_before))
                 if copied:
-                    if is_prompt_replay_text(copied):
+                    if self._is_contaminated_response_candidate(copied):
                         logger.warning(
-                            "DeepSeek copy capture rejected prompt replay assistant_kind=%s assistant_index=%s probe_id=%s copied_chars=%d",
+                            "DeepSeek copy capture rejected contaminated response candidate assistant_kind=%s assistant_index=%s probe_id=%s copied_chars=%d",
                             assistant_candidate.get("kind"),
                             assistant_candidate.get("index"),
                             probe_id,
@@ -5776,9 +5821,7 @@ class DeepSeekWebBridge:
         replay_tail = self._assistant_tail_after_active_prompt(fallback)
         if replay_tail:
             return replay_tail
-        if is_prompt_replay_text(fallback):
-            return ""
-        if self._is_active_request_echo_text(fallback):
+        if self._is_contaminated_response_candidate(fallback):
             return ""
         return fallback
 
@@ -6921,7 +6964,7 @@ class DeepSeekWebBridge:
                     transport_text = ""
                 else:
                     generation_busy_seen = True
-            if transport_text and is_prompt_replay_text(transport_text):
+            if transport_text and self._is_contaminated_response_candidate(transport_text):
                 # Transport channel can occasionally include echoed request-side prompt;
                 # skip these candidates and continue waiting for real assistant content.
                 transport_text = ""
@@ -7010,6 +7053,7 @@ class DeepSeekWebBridge:
                 and current
                 and len(current) > len(best_seen_text)
                 and not is_suppressed_assistant_payload_text(current)
+                and not self._is_contaminated_response_candidate(current)
             ):
                 best_seen_text = current
             if (
@@ -7031,7 +7075,7 @@ class DeepSeekWebBridge:
                     )
                     best_seen_empty_copy_retry_done = True
                 candidate = copied or best_seen_text
-                if candidate and self._matches_current_request_response_candidate(candidate):
+                if candidate and not self._is_contaminated_response_candidate(candidate) and self._matches_current_request_response_candidate(candidate):
                     if plain_protocol and is_likely_truncated_plain_text(candidate):
                         logger.warning(
                             "DeepSeek wait_for_response refused likely truncated best-seen text after assistant DOM disappeared best_chars=%d copied_chars=%d empty_rounds=%d",
@@ -7184,7 +7228,7 @@ class DeepSeekWebBridge:
                 )
                 last_progress_log = now
             if transport_text and not plain_protocol and stable_transport_seen >= self.stable_rounds:
-                if is_prompt_replay_text(transport_text):
+                if self._is_contaminated_response_candidate(transport_text):
                     page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
                     continue
                 if is_empty_assistant_payload_text(transport_text):
@@ -7374,7 +7418,7 @@ class DeepSeekWebBridge:
                     else:
                         stable_copy_text = ""
                         stable_copy_seen = 0
-                    copied_is_reliable = bool(copied) and not self._is_active_request_echo_text(copied)
+                    copied_is_reliable = bool(copied) and not self._is_contaminated_response_candidate(copied)
                     if copied_is_reliable and stable_copy_seen >= 2:
                         if trace is not None:
                             trace.set("response_chars", len(copied))
@@ -7388,7 +7432,7 @@ class DeepSeekWebBridge:
                             stable_copy_seen,
                         )
                         return copied
-                    if copied and self._matches_current_request_response_candidate(copied):
+                    if copied and not self._is_contaminated_response_candidate(copied) and self._matches_current_request_response_candidate(copied):
                         if stable_copy_seen >= 3:
                             if trace is not None:
                                 trace.set("response_chars", len(copied))
@@ -7431,10 +7475,13 @@ class DeepSeekWebBridge:
                         "DeepSeek wait_for_response returning DOM text without incomplete-command postponing chars=%d",
                         len(current),
                     )
-                    return current
+                    if not self._is_contaminated_response_candidate(current):
+                        return current
+                    page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
+                    continue
                 if not plain_protocol and looks_like_assistant_payload_candidate(current):
                     copied = self.try_copy_last_assistant_text(page, plain_protocol=plain_protocol)
-                    if copied and self._matches_current_request_response_candidate(copied):
+                    if copied and not self._is_contaminated_response_candidate(copied) and self._matches_current_request_response_candidate(copied):
                         if trace is not None:
                             trace.set("response_chars", len(copied))
                             trace.set("response_ready_reason", "copy_button_stable_text")
@@ -7461,7 +7508,7 @@ class DeepSeekWebBridge:
                             max_total_ms=max(self.copy_probe_max_ms * 3, 4500),
                             plain_protocol=plain_protocol,
                         )
-                    if copied and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
+                    if copied and not self._is_contaminated_response_candidate(copied) and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
                         if trace is not None:
                             trace.set("response_chars", len(copied))
                             trace.set("response_ready_reason", "copy_button_truncated_stable_retry")
@@ -7472,6 +7519,20 @@ class DeepSeekWebBridge:
                             len(copied),
                         )
                         return copied
+                    # Generation complete + stable: if still misclassified as truncated, release after N rounds.
+                    if plain_generation_complete and stable_seen >= max(self.stable_rounds * 3, 9) and len(current) >= 80:
+                        if trace is not None:
+                            trace.set("response_chars", len(current))
+                            trace.set("response_ready_reason", "plain_truncated_stable_force")
+                            trace.set("plain_truncated_force_stable_seen", stable_seen)
+                            trace.mark("response_stable")
+                        logger.warning(
+                            "DeepSeek wait_for_response accepting stable plain text despite truncated heuristic chars=%d stable_seen=%d copied_chars=%d",
+                            len(current),
+                            stable_seen,
+                            len(copied),
+                        )
+                        return current
                     logger.warning(
                         "DeepSeek wait_for_response postponing likely truncated plain text chars=%d copied_chars=%d",
                         len(current),
@@ -7483,7 +7544,7 @@ class DeepSeekWebBridge:
                     trace.set("response_chars", len(current))
                     trace.set("response_ready_reason", "stable_text")
                     trace.mark("response_stable")
-                if self._matches_current_request_response_candidate(current):
+                if not self._is_contaminated_response_candidate(current) and self._matches_current_request_response_candidate(current):
                     return current
             if plain_protocol and has_advanced and current:
                 plain_generation_status = self.plain_generation_status(page)
@@ -7498,7 +7559,7 @@ class DeepSeekWebBridge:
                         max_total_ms=max(self.copy_probe_max_ms, 1500),
                         plain_protocol=plain_protocol,
                     )
-                    if copied and not is_suspicious_incomplete_command_text(copied) and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
+                    if copied and not self._is_contaminated_response_candidate(copied) and not is_suspicious_incomplete_command_text(copied) and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
                         if trace is not None:
                             trace.set("response_chars", len(copied))
                             trace.set("response_ready_reason", "copy_button_plain_ready")
@@ -7511,7 +7572,7 @@ class DeepSeekWebBridge:
                         return copied
             page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
 
-        if best_seen_text and len(best_seen_text.strip()) >= 200:
+        if best_seen_text and len(best_seen_text.strip()) >= 200 and not self._is_contaminated_response_candidate(best_seen_text):
             if plain_protocol:
                 logger.warning(
                     "DeepSeek wait_for_response timed out with partial plain text; refusing to return incomplete assistant output chars=%d",
