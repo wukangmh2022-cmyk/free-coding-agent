@@ -819,12 +819,13 @@ def agent_qprocess_environment(create: bool = True) -> QProcessEnvironment:
 
 
 def agent_runtime_description() -> str:
+    """系统提示词里的 python 路径：只给路径，不加营销文案。"""
     if not agent_runtime_enabled():
-        return "系统 Python/PATH（Agent 缓存 Python 已关闭）"
+        return "系统 Python/PATH"
     python_bin = ensure_agent_runtime(create=False)
     if python_bin:
-        return f"Agent 缓存 Python ({python_bin})；python/python3/pip/pip3 会优先指向该环境"
-    return f"系统 Python/PATH（未安装 Agent 缓存 Python；可在设置里安装到 {runtime_venv_root()}）"
+        return str(python_bin)
+    return "系统 Python/PATH"
 
 
 def pip_index_args() -> List[str]:
@@ -1569,7 +1570,7 @@ def completion_protocol_text(done_marker: str = AUTOMATION_DONE_MARKER, command_
 
 
 SYSTEM_PROMPT = """你是本地 Agent 执行引擎 AI 助手，运行在 plain bash agent 模式。不要使用 JSON、结构化工具调用或 XML。
-工作区根目录：{project_root}。环境：{os_name}，{shell_name}，bash/POSIX，POSIX 路径；python/python3/pip/pip3 指向 {python_runtime}。{command_rules}
+工作区根目录：{project_root}。环境：{os_name}，{shell_name}，bash/POSIX，POSIX 路径；python/python3/pip/pip3 指向 {python_runtime}。
 
 [输出]
 - 需要操作文件、运行测试、读目录时，回复必须含一个 {command_block_lang} fenced 命令块；命令块外可写 1-3 句说明。runner 执行后返回结果。
@@ -1581,7 +1582,6 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎 AI 助手，运行在 plain b
 - 写文件时，命令块只放带编号占位符，如 <!-- HTML block 1 -->；同语言编号从 1 开始；后续同语言 fenced 代码块提供完整文件内容。
 - 占位符语言与文件内容代码块语言一致：html、svg、css、js、python 等。命令块保持短小；正文超过 10 行必须用占位符 + 后续 fenced。
 - 先建目录再写文件；脚本调用、终端生成/访问文件用绝对路径；代码内可用相对路径。只写工作区根目录，不写 Agent Qt 缓存。非写文件场景不用替换符；输出替换符必须在本回复提供对应内容块。
-{placeholder_example}
 
 [执行/等待]
 - 常驻命令自动进后台终端，不加 &/nohup，不写 pid 文件；启动后本轮结束，下一轮按任务等待 10-30 秒再查；长任务低频复查。
@@ -1595,18 +1595,12 @@ SYSTEM_PROMPT = """你是本地 Agent 执行引擎 AI 助手，运行在 plain b
 - 搜索/调研：命令块写 web_search 搜索话题；已知明确网址用 web_fetch '网址'；保存网页/附件/原始 HTML 用 web_download '网址' 完整绝对输出目录。不要自己写 requests/curl/wget 下载脚本。上轮出现具体 URL，后续 web_fetch 必须逐字复用。
 - 用户要求抓取/爬取/下载到文件夹/全部公告/全部页面/官网列表，或目标数据只在某站点/工作区/本机时，写真实脚本访问目标、处理分页、进详情页并保存。
 - skill：用户提 skill/技能/技巧/有什么技能/有哪些 skill/介绍技能时，优先用 skill list 查看当前技能列表，再按名称、摘要、SKILL.md 路径读取。
-{web_tool_rules}
 
 [数据/风格/上下文]
 - 表格、统计、排行、金额、数量、日志或文件内容，必须用程序读取/搜索/计算真实数据；只抽样时只能说“示例/预览”，不能给总体/定量/比较结论。
 - 不展开隐藏思考链；只给关键判断、验证依据、最终方案和必要指令。
 - 第二段是 Agent Qt 保存的会话上下文，视为连续历史，纯文本，不是 JSON/工具调用协议。第一段系统提示词优先级最高，历史旧写法只作事实参考。
-- 生成前自检：上述规则是否满足；是否需要执行命令；是否写/覆盖文件；命令块是否只放占位符且不含结果/结论/完成标记；完成标记协议是否正确；总结是否说明已完成、结论、剩余/下一步。只输出自检后的最终回复，不输出自检过程。
-{platform_specific_rules}
-
----
-
-{user_prompt}"""
+- 生成前自检：上述规则是否满足；是否需要执行命令；是否写/覆盖文件；命令块是否只放占位符且不含结果/结论/完成标记；完成标记协议是否正确；总结是否说明已完成、结论、剩余/下一步。只输出自检后的最终回复，不输出自检过程。"""
 
 AUTOMATION_FINAL_REMINDER = (
     "生成前自检第一段系统提示词：是否需要执行命令；是否写/覆盖文件；"
@@ -22745,14 +22739,8 @@ class ChatPage(QWidget):
             )
         return SYSTEM_PROMPT.format(
             project_root=self.project_root,
-            user_prompt="当前指令见第三段 plaintext，不要把本段当作用户需求重复执行。",
             done_marker=AUTOMATION_DONE_MARKER,
-            completion_protocol=completion_protocol_text(
-                AUTOMATION_DONE_MARKER,
-                runtime_environment().get("command_block_lang", "bash"),
-            ),
             automation_provider_port=getattr(self.automation_manager, "port", 18765),
-            terminal_registry_path=self.terminal_panel.registry_path() if hasattr(self, "terminal_panel") else terminal_registry_path(self.project_root or os.path.expanduser("~")),
             terminal_logs_url=(self.wechat_bridge.url().rstrip("/") + "/terminallogs") if hasattr(self, "wechat_bridge") else "http://127.0.0.1:8798/terminallogs",
             **runtime_environment(),
         )

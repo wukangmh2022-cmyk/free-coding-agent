@@ -126,6 +126,14 @@ DEFAULT_INPUT_SELECTORS = (
     'textarea[placeholder*="发送"]',
 )
 DEFAULT_SEND_SELECTORS = (
+    # Live DOM verified 2026-09-11: DeepSeek's send control is a
+    # div[role="button"].ds-button--circle.ds-button--primary holding an svg path
+    # that starts with "M8.3125". While enabled it carries NO aria-disabled
+    # attribute, so the old [aria-disabled="false"] requirement never matched --
+    # try_submit then silently degraded to a blind Enter press and
+    # can_submit_next_turn always returned False.
+    '[role="button"]:has(svg path[d^="M8.3125"]):not([aria-disabled="true"])',
+    'div.ds-button--circle.ds-button--primary[role="button"]:not([aria-disabled="true"])',
     '[role="button"][aria-disabled="false"]:has(svg path[d^="M8.3125"])',
     'button[type="submit"]',
     'button:has-text("Send")',
@@ -244,6 +252,7 @@ DEFAULT_ASSISTANT_SELECTORS = (
     '[data-role="assistant"]',
     ".ds-markdown",
     ".markdown",
+    '[class*="message"]',
 )
 PROMPT_REPLAY_MARKERS = (
     "You are acting as the backend LLM for a local OpenAI-compatible gateway.",
@@ -336,6 +345,22 @@ def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int = 3_600_
 DEFAULT_RESPONSE_TIMEOUT_MS = _env_int("DEEPSEEK_WEB_RESPONSE_TIMEOUT_MS", 600_000, minimum=30_000)
 DEFAULT_MAX_CONTINUE_CLICKS = _env_int("DEEPSEEK_WEB_MAX_CONTINUE_CLICKS", 12, minimum=0, maximum=50)
 DEFAULT_COPY_PROBE_MAX_MS = _env_int("DEEPSEEK_WEB_COPY_PROBE_MAX_MS", 500, minimum=0, maximum=10_000)
+# Hard ceiling for the post-response copy probe in submit_prompt.
+#
+# Measured 2026-09-11 over 862 live turns. Two distinct populations:
+#   * successful probes: 29 turns at 28-202ms, 8 at ~1.1s, 1 at 1505ms, 1 at 1798ms,
+#     then a clear gap, then 15 older-era turns at 3655-4506ms;
+#   * failing probes: 808 turns, of which 62 burned their whole budget and returned
+#     nothing (137s of pure waste); on the current benchmark workload every single
+#     turn failed after 0.9-5.8s against the 4500ms budget.
+# When the probe returns nothing submit_prompt keeps the DOM text, so capping is
+# behaviour-preserving for failing turns. 2000ms sits inside the measured gap: it
+# keeps every fast/mid success (39/54, 72%) and only drops the 15 older slow ones.
+# Raise DEEPSEEK_WEB_COPY_PROBE_HARD_CAP_MS to 4600 if finalisation from the copy
+# button must never be given up.
+DEFAULT_COPY_PROBE_HARD_CAP_MS = _env_int(
+    "DEEPSEEK_WEB_COPY_PROBE_HARD_CAP_MS", 2000, minimum=0, maximum=10_000
+)
 DEFAULT_COPY_CANDIDATE_MAX_DISTANCE = _env_int("DEEPSEEK_WEB_COPY_CANDIDATE_MAX_DISTANCE", 900, minimum=0)
 DEFAULT_PLAIN_NO_COPY_STABLE_ROUNDS = _env_int(
     "DEEPSEEK_WEB_PLAIN_NO_COPY_STABLE_ROUNDS",
@@ -1844,6 +1869,7 @@ def is_suspicious_incomplete_command_text(text: str) -> bool:
         return True
     return False
 
+
 def is_transient_thinking_text(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
@@ -2647,7 +2673,7 @@ class DeepSeekWebBridge:
             return
         with self._response_preview_lock:
             previous_text = str(self._response_preview.get("text") or "")
-            # Thinking can collapse / switch to a short answer: don't freeze preview on shrink.
+            # 长思考后正文可能突然变短（thinking 折叠/换正文）：不能因 shrink 就冻结预览
             if (
                 not done
                 and not error
@@ -2914,7 +2940,9 @@ class DeepSeekWebBridge:
 
             self.ensure_chat_ready(page)
             if self.force_new_chat:
-                self.best_effort_start_new_chat(page)
+                # The goto above already landed on the new-chat home, so there is
+                # nothing to reset. Probing for the site's "new chat" entry here
+                # only burned ~7.2s of dead selector timeouts per prewarm.
                 self._clear_session_runtime_state()
             self.select_preferred_model(page)
             self.sync_web_search_mode(page, False)
@@ -2950,47 +2978,6 @@ class DeepSeekWebBridge:
         except Exception:
             return False
         return encoded in prompt or encoded.strip('\"') in prompt
-
-    def _has_active_prompt_overlap(self, text: str) -> bool:
-        stripped = (text or "").strip()
-        prompt = (self._active_request_prompt or "").strip()
-        if len(stripped) < 400 or len(prompt) < 400:
-            return False
-
-        compact_text = re.sub(r"\s+", "", stripped)
-        compact_prompt = re.sub(r"\s+", "", prompt)
-        if len(compact_text) < 400 or len(compact_prompt) < 400:
-            return False
-
-        if compact_text in compact_prompt or compact_prompt in compact_text:
-            return True
-
-        chunk_size = 220
-        step = 900
-        matches = 0
-        for start in range(0, max(1, len(compact_prompt) - chunk_size + 1), step):
-            chunk = compact_prompt[start : start + chunk_size]
-            if len(chunk) < chunk_size:
-                continue
-            if chunk in compact_text:
-                matches += 1
-                if matches >= 2:
-                    return True
-
-        latest_user = re.sub(r"\s+", "", self._latest_active_user_text())
-        if len(latest_user) >= 40 and latest_user in compact_text and len(compact_text) > max(2500, len(latest_user) * 20):
-            return True
-        return False
-
-    def _is_contaminated_response_candidate(self, text: str) -> bool:
-        stripped = (text or "").strip()
-        if not stripped:
-            return False
-        return (
-            is_prompt_replay_text(stripped)
-            or self._is_active_request_echo_text(stripped)
-            or self._has_active_prompt_overlap(stripped)
-        )
 
     def _latest_active_user_text(self) -> str:
         for message in reversed(self._active_request_messages):
@@ -3135,6 +3122,15 @@ class DeepSeekWebBridge:
         parse_started = time.perf_counter()
         payload = self.parse_model_payload(raw_text, output_protocol=output_protocol)
         trace.set("parse_model_payload_ms", int((time.perf_counter() - parse_started) * 1000))
+        try:
+            page = self.ensure_page(visible=False)
+            thinking_text = self.read_last_thinking_text(page)
+            if thinking_text:
+                payload["reasoning_content"] = thinking_text
+                if isinstance(payload.get("content"), str) and payload["content"]:
+                    pass
+        except Exception:
+            logger.debug("Failed to read thinking content", exc_info=True)
         trace.mark("payload_parsed")
         trace.set("mark_count", len(trace.marks))
         trace.set("mark_names", list(trace.marks.keys()))
@@ -3146,6 +3142,27 @@ class DeepSeekWebBridge:
         if include_debug:
             payload["debug"] = {"timing": timing}
         return payload
+
+    def read_last_thinking_text(self, page: Page) -> str:
+        """从最后一条 assistant 消息的 .ds-think-content 提取深度思考正文。"""
+        try:
+            text = page.evaluate(
+                r"""() => {
+                    const nodes = [...document.querySelectorAll('.ds-think-content')];
+                    const node = nodes[nodes.length - 1];
+                    if (!node) return '';
+                    return (node.innerText || node.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+                }"""
+            )
+        except Exception:
+            return ""
+        text = str(text or "").strip()
+        if not text or len(text) < 8:
+            return ""
+        # 过滤 UI 噪声
+        if is_web_ui_noise_text(text):
+            return ""
+        return text[:20000]
 
     def ensure_chat_ready(self, page: Page, *, trace: DeepSeekTrace | None = None) -> None:
         preferred_url = self._persisted_chat_url if self.reuse_persisted_chat else None
@@ -3323,7 +3340,9 @@ class DeepSeekWebBridge:
 
                     const candidates = [];
                     let candidateId = 0;
-                    for (const node of document.querySelectorAll('button,[role="button"],div[role="button"]')) {
+                    for (const node of document.querySelectorAll(
+                        'button,[role="button"],div[role="button"],.ds-toggle-button,[class*="ds-toggle" i],[class*="toggle-button" i]'
+                    )) {
                         if (!(node instanceof HTMLElement) || !isVisible(node)) {
                             continue;
                         }
@@ -3716,6 +3735,111 @@ class DeepSeekWebBridge:
             "candidates": candidates,
         }
 
+    def dump_input_controls(self, page: Page, limit: int = 40) -> dict[str, Any]:
+        """只读诊断：列出输入框附近可见控件，便于核对思考/专家开关选择器。"""
+        try:
+            controls = page.evaluate(
+                """({ limit }) => {
+                    const out = [];
+                    const nodes = [...document.querySelectorAll(
+                        'button, [role="button"], [role="switch"], [role="checkbox"], [role="option"], label, [class*="toggle" i], [class*="switch" i], [class*="model" i], [class*="mode" i]'
+                    )];
+                    for (const n of nodes) {
+                        const text = (n.innerText || n.getAttribute('aria-label') || n.getAttribute('title') || '')
+                            .replace(/\\s+/g, ' ').trim();
+                        if (!text || text.length > 120) continue;
+                        const style = window.getComputedStyle(n);
+                        if (style.display === 'none' || style.visibility === 'hidden') continue;
+                        out.push({
+                            tag: n.tagName,
+                            text: text.slice(0, 100),
+                            cls: (n.className || '').toString().slice(0, 160),
+                            aria: n.getAttribute('aria-label'),
+                            title: n.getAttribute('title'),
+                            ariaPressed: n.getAttribute('aria-pressed'),
+                            ariaChecked: n.getAttribute('aria-checked'),
+                            dataState: n.getAttribute('data-state'),
+                            dataModelType: n.getAttribute('data-model-type'),
+                            id: n.id || null,
+                        });
+                        if (out.length >= limit) break;
+                    }
+                    return {
+                        url: location.href,
+                        title: document.title,
+                        hasInput: !!(document.querySelector('textarea') || document.querySelector('[contenteditable="true"]')),
+                        controls: out,
+                    };
+                }""",
+                {"limit": limit},
+            )
+        except Exception as exc:
+            return {"error": str(exc)}
+        return controls if isinstance(controls, dict) else {"error": "invalid"}
+
+    def dump_assistant_thinking_dom(self, page: Page) -> dict[str, Any]:
+        """只读诊断：列出最后一条 assistant 消息里疑似思考区的 DOM。"""
+        try:
+            info = page.evaluate(
+                r"""() => {
+                    const roots = [...document.querySelectorAll(
+                        '[data-message-author-role="assistant"], [data-role="assistant"], .ds-markdown, [class*="message" i]'
+                    )];
+                    const root = roots[roots.length - 1];
+                    if (!root) return { error: 'no-assistant' };
+                    // walk up to message container to include sibling thinking panel
+                    let scope = root;
+                    for (let i = 0; i < 5 && scope.parentElement; i++) {
+                        const t = (scope.parentElement.innerText || '');
+                        if (t && t.length < (root.innerText || '').length + 4000) scope = scope.parentElement;
+                    }
+                    const hits = [];
+                    const seen = new Set();
+                    const walk = (node, depth) => {
+                        if (depth > 8 || hits.length > 40) return;
+                        if (!(node instanceof HTMLElement)) return;
+                        const cls = (node.className || '').toString();
+                        const testid = node.getAttribute('data-testid') || '';
+                        const text = (node.innerText || '').replace(/\s+/g, ' ').trim();
+                        const blob = cls + ' ' + testid;
+                        const matched = /think|reason|思考|推理|chain|trace|cot/i.test(blob) ||
+                            /^深度思考|^思考中|^Thinking/i.test(text);
+                        if (matched && text && text.length < 6000) {
+                            const key = cls + '|' + text.slice(0, 80);
+                            if (!seen.has(key)) {
+                                seen.add(key);
+                                hits.push({
+                                    tag: node.tagName,
+                                    cls: cls.slice(0, 180),
+                                    testid,
+                                    text: text.slice(0, 800),
+                                    depth,
+                                });
+                            }
+                        }
+                        for (const child of node.children) walk(child, depth + 1);
+                    };
+                    walk(scope, 0);
+                    // also scan top-level message containers
+                    const topHits = [];
+                    for (const n of document.querySelectorAll('[class*="think" i], [class*="reason" i], [data-testid*="think" i]')) {
+                        const text = (n.innerText || '').replace(/\s+/g, ' ').trim();
+                        if (text) topHits.push({ tag: n.tagName, cls: (n.className||'').toString().slice(0,160), text: text.slice(0,200) });
+                        if (topHits.length >= 15) break;
+                    }
+                    return {
+                        rootCls: (root.className||'').toString().slice(0, 180),
+                        scopeCls: (scope.className||'').toString().slice(0, 180),
+                        rootTextHead: (root.innerText||'').replace(/\s+/g,' ').trim().slice(0, 250),
+                        hits,
+                        topHits,
+                    };
+                }"""
+            )
+        except Exception as exc:
+            return {"error": str(exc)}
+        return info if isinstance(info, dict) else {"error": "invalid"}
+
     def inspect_web_search_mode(self, page: Page) -> dict[str, Any]:
         candidates = self.inspect_web_search_toggle_candidates(page)
         selected_candidate = candidates[0] if candidates else None
@@ -3809,8 +3933,30 @@ class DeepSeekWebBridge:
 
         try:
             button = page.locator(f'[data-deerflow-thinking-candidate-id="{probe_id}"]').first
-            button.click(timeout=1500)
-            page.wait_for_timeout(500)
+            button.click(timeout=1500, force=True)
+            page.wait_for_timeout(700)
+            after = self.inspect_thinking_mode(page)
+            if after.get("thinking_enabled") != desired:
+                # React 控件有时不吃 Playwright 普通 click，补一次 JS 鼠标事件
+                try:
+                    page.evaluate(
+                        """(probeId) => {
+                            const el = document.querySelector(`[data-deerflow-thinking-candidate-id="${probeId}"]`);
+                            if (!el) return false;
+                            const target = el instanceof HTMLElement ? el : null;
+                            if (!target) return false;
+                            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                                const Ctor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+                                target.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, composed: true, button: 0 }));
+                            }
+                            return true;
+                        }""",
+                        probe_id,
+                    )
+                    page.wait_for_timeout(700)
+                except Exception:
+                    pass
+                after = self.inspect_thinking_mode(page)
         except Exception as exc:
             return {
                 "changed": False,
@@ -3820,7 +3966,6 @@ class DeepSeekWebBridge:
                 "error": f"Failed to click thinking toggle: {exc}",
             }
 
-        after = self.inspect_thinking_mode(page)
         current = after.get("thinking_enabled")
         changed = before.get("thinking_enabled") != current
         if current is desired:
@@ -4052,17 +4197,18 @@ class DeepSeekWebBridge:
 
     def build_full_prompt(self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]], output_protocol: str = "openai") -> str:
         if output_protocol == "plain":
-            parts = [
-                PLAIN_BASH_FORMAT_PROMPT,
-                "You are acting as the backend LLM for a local bash-only coding runner.",
-                "Continue this conversation naturally and follow the system/user messages.",
-            ]
-        else:
-            parts = [
-                STRUCTURED_YAML_FORMAT_PROMPT,
-                "You are acting as the backend LLM for a local OpenAI-compatible chat gateway.",
-                "Continue this conversation naturally and follow the system/user/tool messages.",
-            ]
+            # AgentQt 已拼好「系统 + 历史 + 当前指令」；网页只发正文，不再包 runner/协议外壳
+            parts: list[str] = []
+            for message in messages:
+                content = normalize_text_content(message.get("content", "")).strip()
+                if content:
+                    parts.append(content)
+            return "\n\n".join(parts)
+        parts = [
+            STRUCTURED_YAML_FORMAT_PROMPT,
+            "You are acting as the backend LLM for a local OpenAI-compatible chat gateway.",
+            "Continue this conversation naturally and follow the system/user/tool messages.",
+        ]
         if output_protocol in {"anthropic", "openai"}:
             parts.extend(STRUCTURED_YAML_RECALL_LINES)
         if self.sticky_marker:
@@ -4076,10 +4222,7 @@ class DeepSeekWebBridge:
         parts.append("Conversation:")
         for message in messages:
             role = message.get("role", "user").upper()
-            if output_protocol == "plain":
-                parts.append(f"[{role}]\n{normalize_text_content(message.get('content', ''))}")
-            else:
-                parts.append(f"[{role}]\n{dump_yaml_value(message)}")
+            parts.append(f"[{role}]\n{dump_yaml_value(message)}")
 
         return "\n\n".join(parts)
 
@@ -4091,17 +4234,17 @@ class DeepSeekWebBridge:
         output_protocol: str = "openai",
     ) -> str:
         if output_protocol == "plain":
-            parts = [
-                PLAIN_BASH_FORMAT_PROMPT,
-                "Continue the existing plain bash agent session already initialized in this chat.",
-                "- Follow the previously established bash-only runner instructions already present in this conversation.",
-            ]
-        else:
-            parts = [
-                STRUCTURED_YAML_FORMAT_PROMPT,
-                "Continue the existing DeerFlow session already initialized in this chat.",
-                "- Follow the previously established DeerFlow system instructions already present in this conversation.",
-            ]
+            parts: list[str] = []
+            for message in messages:
+                content = normalize_text_content(message.get("content", "")).strip()
+                if content:
+                    parts.append(content)
+            return "\n\n".join(parts)
+        parts = [
+            STRUCTURED_YAML_FORMAT_PROMPT,
+            "Continue the existing DeerFlow session already initialized in this chat.",
+            "- Follow the previously established DeerFlow system instructions already present in this conversation.",
+        ]
         if output_protocol in {"anthropic", "openai"}:
             parts[1:1] = STRUCTURED_YAML_RECALL_LINES
         if self.sticky_marker:
@@ -4112,10 +4255,7 @@ class DeepSeekWebBridge:
         parts.append("New conversation events since the previous request:")
         for message in messages:
             role = message.get("role", "user").upper()
-            if output_protocol == "plain":
-                parts.append(f"[{role}]\n{normalize_text_content(message.get('content', ''))}")
-            else:
-                parts.append(f"[{role}]\n{dump_yaml_value(message)}")
+            parts.append(f"[{role}]\n{dump_yaml_value(message)}")
         return "\n\n".join(parts)
 
     def _dump_prompt_for_audit(self, *, prompt: str, output_protocol: str, prompt_builder_name: str) -> None:
@@ -4388,7 +4528,21 @@ class DeepSeekWebBridge:
                         trace.set("new_chat_selector", None)
                 self.ensure_chat_ready(page, trace=trace)
                 if self.force_new_chat:
-                    self.best_effort_start_new_chat(page, trace=trace)
+                    fresh_by_construction = not reused_page_for_new_chat
+                    if fresh_by_construction or not self._page_shows_existing_conversation(page):
+                        # The page is already a brand new conversation: either we
+                        # created it a moment ago (ensure_chat_ready then navigated
+                        # it to the new-chat home), or it holds no assistant output.
+                        # Probing for the site's "new chat" entry in that state only
+                        # cost 9 x 800ms of dead selector timeouts on every turn.
+                        if trace is not None:
+                            trace.set(
+                                "new_chat_reset_skipped",
+                                "fresh_by_construction" if fresh_by_construction
+                                else "no_existing_conversation",
+                            )
+                    else:
+                        self.best_effort_start_new_chat(page, trace=trace)
                     self._clear_session_runtime_state()
                 model_select_result = self.select_preferred_model(page, trace=trace)
                 if trace is not None:
@@ -4586,6 +4740,12 @@ class DeepSeekWebBridge:
                             # External structured protocols should also finalize from
                             # the copy button instead of intermediate DOM previews.
                             copy_probe_budget_ms = max(copy_probe_budget_ms * 3, 4500)
+                        # Cap it. A probe that cannot capture anything just burns the
+                        # whole budget and returns "" (measured: 0.9-5.8s per turn
+                        # with copy_probe_used=False), and submit_prompt then keeps
+                        # the DOM text anyway -- so the cap is behaviour-preserving
+                        # for failing turns. See DEFAULT_COPY_PROBE_HARD_CAP_MS.
+                        copy_probe_budget_ms = min(copy_probe_budget_ms, DEFAULT_COPY_PROBE_HARD_CAP_MS)
                         if trace is not None:
                             trace.mark("copy_probe_started")
                             trace.set("copy_probe_budget_ms", copy_probe_budget_ms)
@@ -4667,9 +4827,6 @@ class DeepSeekWebBridge:
             return {"content": "", "tool_calls": [], "raw_text": raw_text, "parse_error": "ui_noise_payload"}
 
         if output_protocol == "plain":
-            if self._is_contaminated_response_candidate(stripped):
-                logger.warning("DeepSeek parse_model_payload suppressed contaminated plain response candidate.")
-                return {"content": "", "tool_calls": [], "raw_text": raw_text, "parse_error": "contaminated_response"}
             return {"content": stripped, "tool_calls": [], "raw_text": raw_text}
 
         yaml_payload = parse_yaml_assistant_payload(raw_text)
@@ -4921,7 +5078,7 @@ class DeepSeekWebBridge:
 
             text = choose_best_assistant_text(texts)
             text = clean_plain_visible_assistant_text(text)
-            if text and not self._is_contaminated_response_candidate(text):
+            if text and not is_prompt_replay_text(text) and not self._is_active_request_echo_text(text):
                 candidates.append({"index": index, "text": text})
 
         return candidates
@@ -4962,7 +5119,7 @@ class DeepSeekWebBridge:
         if candidate is None:
             return {"source": "assistant", "index": -1, "text": ""}
         text = candidate.get("text", "") or ""
-        if is_schema_example_payload_text(text) or self._is_contaminated_response_candidate(text):
+        if is_schema_example_payload_text(text) or is_prompt_replay_text(text):
             return {"source": "assistant", "index": -1, "text": ""}
         return {
             "source": "assistant",
@@ -5512,10 +5669,10 @@ class DeepSeekWebBridge:
             deadline_local = time.perf_counter() + (max(0, max_wait_ms) / 1000.0)
             while True:
                 event_text = self.read_latest_copy_capture(page)
-                if event_text and event_text != previous_clipboard and not self._is_contaminated_response_candidate(event_text):
+                if event_text and event_text != previous_clipboard and not is_prompt_replay_text(event_text):
                     return event_text
                 clipboard_text = self.read_system_clipboard_text(page)
-                if clipboard_text and clipboard_text != previous_clipboard and not self._is_contaminated_response_candidate(clipboard_text):
+                if clipboard_text and clipboard_text != previous_clipboard and not is_prompt_replay_text(clipboard_text):
                     return clipboard_text
                 if time.perf_counter() >= deadline_local or timed_out():
                     return ""
@@ -5556,7 +5713,7 @@ class DeepSeekWebBridge:
                 copied = normalize_copied_assistant_text(
                     read_copied_text_fast(max_wait_ms=120, previous_clipboard=clipboard_before)
                 )
-                if copied and not self._is_contaminated_response_candidate(copied) and self._matches_current_request_response_candidate(copied):
+                if copied and not is_prompt_replay_text(copied) and self._matches_current_request_response_candidate(copied):
                     logger.warning(
                         "DeepSeek bottom copy capture fast path succeeded probe_id=%s copied_chars=%d copy_read_ms=%d plain_protocol=%s",
                         probe_id,
@@ -5600,9 +5757,9 @@ class DeepSeekWebBridge:
             copied = normalize_copied_assistant_text(read_copied_text_fast(previous_clipboard=clipboard_before))
             if not copied:
                 continue
-            if self._is_contaminated_response_candidate(copied):
+            if is_prompt_replay_text(copied):
                 logger.warning(
-                    "DeepSeek bottom copy capture rejected contaminated response candidate probe_id=%s copied_chars=%d plain_protocol=%s",
+                    "DeepSeek bottom copy capture rejected prompt replay probe_id=%s copied_chars=%d plain_protocol=%s",
                     probe_id,
                     len(copied),
                     plain_protocol,
@@ -5632,7 +5789,8 @@ class DeepSeekWebBridge:
             if isinstance(assistant_text, str) and assistant_text.strip():
                 locator_seen = True
             if isinstance(assistant_text, str) and (
-                self._is_contaminated_response_candidate(assistant_text)
+                is_prompt_replay_text(assistant_text)
+                or self._is_active_request_echo_text(assistant_text)
                 or is_transient_thinking_text(assistant_text)
             ):
                 continue
@@ -5756,9 +5914,9 @@ class DeepSeekWebBridge:
                     continue
                 copied = normalize_copied_assistant_text(read_copied_text_fast(previous_clipboard=clipboard_before))
                 if copied:
-                    if self._is_contaminated_response_candidate(copied):
+                    if is_prompt_replay_text(copied):
                         logger.warning(
-                            "DeepSeek copy capture rejected contaminated response candidate assistant_kind=%s assistant_index=%s probe_id=%s copied_chars=%d",
+                            "DeepSeek copy capture rejected prompt replay assistant_kind=%s assistant_index=%s probe_id=%s copied_chars=%d",
                             assistant_candidate.get("kind"),
                             assistant_candidate.get("index"),
                             probe_id,
@@ -5821,7 +5979,9 @@ class DeepSeekWebBridge:
         replay_tail = self._assistant_tail_after_active_prompt(fallback)
         if replay_tail:
             return replay_tail
-        if self._is_contaminated_response_candidate(fallback):
+        if is_prompt_replay_text(fallback):
+            return ""
+        if self._is_active_request_echo_text(fallback):
             return ""
         return fallback
 
@@ -5852,18 +6012,40 @@ class DeepSeekWebBridge:
             return [messages[-1]]
         return []
 
-    def best_effort_start_new_chat(self, page: Page, *, trace: DeepSeekTrace | None = None) -> bool:
+    def _page_shows_existing_conversation(self, page: Page) -> bool:
+        """True when the page already holds assistant output, i.e. a reset is needed.
+
+        Returns True on any uncertainty so the caller keeps the old behaviour.
+        """
+        try:
+            return int(self.assistant_locator(page).count()) > 0
+        except Exception:
+            return True
+
+    def best_effort_start_new_chat(
+        self,
+        page: Page,
+        *,
+        trace: DeepSeekTrace | None = None,
+        probe_timeout_ms: int = 150,
+    ) -> bool:
         """Try to reset the DeepSeek page to a fresh conversation.
 
         The bridge is intended to be stateless: DeerFlow sends the effective
         transcript every request. Reusing an existing DeepSeek web thread can
         duplicate context or leak cross-thread memory, so we best-effort click
         the site's "new chat" entry before submitting.
+
+        probe_timeout_ms defaults to 150ms. It used to be a hardcoded 800ms per
+        selector, so the 9 stale entries in DEFAULT_NEW_CHAT_SELECTORS burned
+        ~7.2s on every single turn (measured: new_chat_ready was 7234-7295ms on
+        12/12 turns). Callers should prefer skipping this entirely when the page
+        is already a brand new chat -- see submit_prompt.
         """
         for selector in self.new_chat_selectors:
             locator = page.locator(selector).last
             try:
-                locator.wait_for(state="visible", timeout=800)
+                locator.wait_for(state="visible", timeout=probe_timeout_ms)
                 locator.click(timeout=1200)
                 page.wait_for_timeout(500)
                 if trace is not None:
@@ -6636,14 +6818,29 @@ class DeepSeekWebBridge:
                     };
                     const inputCandidates = [];
                     for (const selector of inputSelectors) {
-                        for (const node of document.querySelectorAll(selector)) {
+                        let inputNodes;
+                        try {
+                            inputNodes = document.querySelectorAll(selector);
+                        } catch (err) {
+                            continue;
+                        }
+                        for (const node of inputNodes) {
                             if (node instanceof HTMLElement && isVisible(node)) inputCandidates.push({ selector, node });
                         }
                     }
                     const input = inputCandidates[inputCandidates.length - 1] || null;
                     const buttons = [];
                     for (const selector of sendSelectors) {
-                        for (const node of document.querySelectorAll(selector)) {
+                        let sendNodes;
+                        try {
+                            sendNodes = document.querySelectorAll(selector);
+                        } catch (err) {
+                            // Playwright-only syntax such as :has-text() is not valid CSS.
+                            // Report it instead of aborting the whole diagnostic.
+                            buttons.push({ selector, error: String((err && err.message) || err).slice(0, 120) });
+                            continue;
+                        }
+                        for (const node of sendNodes) {
                             if (!(node instanceof HTMLElement)) continue;
                             const disabled = Boolean(node.disabled) || node.getAttribute('aria-disabled') === 'true';
                             buttons.push({
@@ -6964,7 +7161,7 @@ class DeepSeekWebBridge:
                     transport_text = ""
                 else:
                     generation_busy_seen = True
-            if transport_text and self._is_contaminated_response_candidate(transport_text):
+            if transport_text and is_prompt_replay_text(transport_text):
                 # Transport channel can occasionally include echoed request-side prompt;
                 # skip these candidates and continue waiting for real assistant content.
                 transport_text = ""
@@ -7053,7 +7250,6 @@ class DeepSeekWebBridge:
                 and current
                 and len(current) > len(best_seen_text)
                 and not is_suppressed_assistant_payload_text(current)
-                and not self._is_contaminated_response_candidate(current)
             ):
                 best_seen_text = current
             if (
@@ -7075,7 +7271,7 @@ class DeepSeekWebBridge:
                     )
                     best_seen_empty_copy_retry_done = True
                 candidate = copied or best_seen_text
-                if candidate and not self._is_contaminated_response_candidate(candidate) and self._matches_current_request_response_candidate(candidate):
+                if candidate and self._matches_current_request_response_candidate(candidate):
                     if plain_protocol and is_likely_truncated_plain_text(candidate):
                         logger.warning(
                             "DeepSeek wait_for_response refused likely truncated best-seen text after assistant DOM disappeared best_chars=%d copied_chars=%d empty_rounds=%d",
@@ -7110,6 +7306,33 @@ class DeepSeekWebBridge:
                 page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
                 continue
             if current:
+                if has_advanced and plain_protocol:
+                    # 生成一结束就立刻收尾：不等 stable_seen，不被 UI「复制/下载」噪声拖死
+                    early_status = self.plain_generation_status(page)
+                    early_done = (
+                        bool(early_status.get("has_copy"))
+                        and not bool(early_status.get("has_stop"))
+                        and not bool(early_status.get("has_continue"))
+                    )
+                    if early_done and len(current) >= 80:
+                        early_copy = self.try_copy_last_assistant_text(
+                            page,
+                            max_total_ms=max(self.copy_probe_max_ms, 1200),
+                            plain_protocol=plain_protocol,
+                        )
+                        chosen = early_copy if early_copy and len(early_copy) >= 80 else current
+                        if chosen and self._matches_current_request_response_candidate(chosen):
+                            if trace is not None:
+                                trace.set("response_chars", len(chosen))
+                                trace.set("response_ready_reason", "plain_generation_complete_fast")
+                                trace.mark("response_stable")
+                            logger.warning(
+                                "DeepSeek wait_for_response fast-return on generation complete chars=%d copied=%s stable_seen=%d",
+                                len(chosen),
+                                "yes" if early_copy else "no",
+                                stable_seen,
+                            )
+                            return chosen
                 if has_advanced:
                     payload_candidate = self.best_visible_payload_candidate(page, locator=locator)
                     if (
@@ -7228,7 +7451,7 @@ class DeepSeekWebBridge:
                 )
                 last_progress_log = now
             if transport_text and not plain_protocol and stable_transport_seen >= self.stable_rounds:
-                if self._is_contaminated_response_candidate(transport_text):
+                if is_prompt_replay_text(transport_text):
                     page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
                     continue
                 if is_empty_assistant_payload_text(transport_text):
@@ -7418,7 +7641,7 @@ class DeepSeekWebBridge:
                     else:
                         stable_copy_text = ""
                         stable_copy_seen = 0
-                    copied_is_reliable = bool(copied) and not self._is_contaminated_response_candidate(copied)
+                    copied_is_reliable = bool(copied) and not self._is_active_request_echo_text(copied)
                     if copied_is_reliable and stable_copy_seen >= 2:
                         if trace is not None:
                             trace.set("response_chars", len(copied))
@@ -7432,7 +7655,7 @@ class DeepSeekWebBridge:
                             stable_copy_seen,
                         )
                         return copied
-                    if copied and not self._is_contaminated_response_candidate(copied) and self._matches_current_request_response_candidate(copied):
+                    if copied and self._matches_current_request_response_candidate(copied):
                         if stable_copy_seen >= 3:
                             if trace is not None:
                                 trace.set("response_chars", len(copied))
@@ -7475,13 +7698,10 @@ class DeepSeekWebBridge:
                         "DeepSeek wait_for_response returning DOM text without incomplete-command postponing chars=%d",
                         len(current),
                     )
-                    if not self._is_contaminated_response_candidate(current):
-                        return current
-                    page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
-                    continue
+                    return current
                 if not plain_protocol and looks_like_assistant_payload_candidate(current):
                     copied = self.try_copy_last_assistant_text(page, plain_protocol=plain_protocol)
-                    if copied and not self._is_contaminated_response_candidate(copied) and self._matches_current_request_response_candidate(copied):
+                    if copied and self._matches_current_request_response_candidate(copied):
                         if trace is not None:
                             trace.set("response_chars", len(copied))
                             trace.set("response_ready_reason", "copy_button_stable_text")
@@ -7508,7 +7728,7 @@ class DeepSeekWebBridge:
                             max_total_ms=max(self.copy_probe_max_ms * 3, 4500),
                             plain_protocol=plain_protocol,
                         )
-                    if copied and not self._is_contaminated_response_candidate(copied) and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
+                    if copied and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
                         if trace is not None:
                             trace.set("response_chars", len(copied))
                             trace.set("response_ready_reason", "copy_button_truncated_stable_retry")
@@ -7519,7 +7739,7 @@ class DeepSeekWebBridge:
                             len(copied),
                         )
                         return copied
-                    # Generation complete + stable: if still misclassified as truncated, release after N rounds.
+                    # 生成已完成且文本已稳定：若仍被误判截断，超过一定轮次后放行，避免长思考正文把请求卡死到超时
                     if plain_generation_complete and stable_seen >= max(self.stable_rounds * 3, 9) and len(current) >= 80:
                         if trace is not None:
                             trace.set("response_chars", len(current))
@@ -7544,7 +7764,7 @@ class DeepSeekWebBridge:
                     trace.set("response_chars", len(current))
                     trace.set("response_ready_reason", "stable_text")
                     trace.mark("response_stable")
-                if not self._is_contaminated_response_candidate(current) and self._matches_current_request_response_candidate(current):
+                if self._matches_current_request_response_candidate(current):
                     return current
             if plain_protocol and has_advanced and current:
                 plain_generation_status = self.plain_generation_status(page)
@@ -7559,7 +7779,7 @@ class DeepSeekWebBridge:
                         max_total_ms=max(self.copy_probe_max_ms, 1500),
                         plain_protocol=plain_protocol,
                     )
-                    if copied and not self._is_contaminated_response_candidate(copied) and not is_suspicious_incomplete_command_text(copied) and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
+                    if copied and not is_suspicious_incomplete_command_text(copied) and not is_likely_truncated_plain_text(copied) and self._matches_current_request_response_candidate(copied):
                         if trace is not None:
                             trace.set("response_chars", len(copied))
                             trace.set("response_ready_reason", "copy_button_plain_ready")
@@ -7572,7 +7792,7 @@ class DeepSeekWebBridge:
                         return copied
             page.wait_for_timeout(min(self.stable_poll_interval_ms, 200))
 
-        if best_seen_text and len(best_seen_text.strip()) >= 200 and not self._is_contaminated_response_candidate(best_seen_text):
+        if best_seen_text and len(best_seen_text.strip()) >= 200:
             if plain_protocol:
                 logger.warning(
                     "DeepSeek wait_for_response timed out with partial plain text; refusing to return incomplete assistant output chars=%d",
